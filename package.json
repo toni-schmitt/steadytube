@@ -1,0 +1,36 @@
+{
+  "name": "steadytube",
+  "version": "0.1.0",
+  "description": "Local IPv4 Invidious bridge for stock FreeTube — reliable 4K playback without IP bans or SABR loops",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "homepage": "https://github.com/toni-schmitt/steadytube",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/toni-schmitt/steadytube.git"
+  },
+  "bugs": {
+    "url": "https://github.com/toni-schmitt/steadytube/issues"
+  },
+  "bin": {
+    "steadytube": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "build": "bun build --compile src/index.ts --outfile dist/steadytube",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "bun": ">=1.2.0"
+  },
+  "dependencies": {
+    "youtubei.js": "^18.3.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8.0"
+  }
+}

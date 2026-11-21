@@ -1,0 +1,68 @@
+# Generated from packaging/steadytube.rb.tmpl in
+# toni-schmitt/steadytube by the `update-tap` job of that repo's release
+# workflow, which substitutes the version and each tarball's checksum from
+# the release being published.
+#
+# Edit the template, never this file: the next release overwrites it.
+class Steadytube < Formula
+  desc "Local IPv4 Invidious bridge for stock FreeTube"
+  homepage "https://github.com/toni-schmitt/steadytube"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/toni-schmitt/steadytube/releases/download/v@@VERSION@@/steadytube-macos-arm64.tar.gz"
+      sha256 "@@SHA_MACOS_ARM64@@"
+    end
+    on_intel do
+      url "https://github.com/toni-schmitt/steadytube/releases/download/v@@VERSION@@/steadytube-macos-x64.tar.gz"
+      sha256 "@@SHA_MACOS_X64@@"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "https://github.com/toni-schmitt/steadytube/releases/download/v@@VERSION@@/steadytube-linux-x64.tar.gz"
+      sha256 "@@SHA_LINUX_X64@@"
+    end
+    on_arm do
+      url "https://github.com/toni-schmitt/steadytube/releases/download/v@@VERSION@@/steadytube-linux-arm64.tar.gz"
+      sha256 "@@SHA_LINUX_ARM64@@"
+    end
+  end
+
+  depends_on "deno"
+  depends_on "ffmpeg"
+  depends_on "yt-dlp"
+
+  def install
+    bin.install "steadytube"
+  end
+
+  service do
+    run [opt_bin/"steadytube"]
+    keep_alive crashed: true
+    environment_variables PATH: std_service_path_env
+    log_path var/"log/steadytube.log"
+    error_log_path var/"log/steadytube.log"
+  end
+
+  def caveats
+    <<~EOS
+      Start SteadyTube in the background (starts automatically on login):
+
+        brew services start steadytube
+
+      Then open FreeTube -> Settings -> General Settings:
+        - Preferred API Backend: Invidious API
+        - Invidious Instance:    http://127.0.0.1:8787
+        - Revert to non-preferred backend on failure: ON
+
+      Optional config file: ~/.config/steadytube/config.json
+    EOS
+  end
+
+  test do
+    assert_match "steadytube", shell_output("#{bin}/steadytube --version")
+  end
+end

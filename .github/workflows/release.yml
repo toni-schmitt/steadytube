@@ -1,0 +1,204 @@
+name: Release
+
+# Builds standalone native binaries with `bun build --compile` for macOS
+# (arm64, x64) and Linux (x64, arm64), publishes a GitHub Release with
+# SHA256SUMS, and updates Formula/steadytube.rb in toni-schmitt/homebrew-tap.
+#
+# Third-party actions are pinned to commit SHAs; the version is in the comment.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck & test
+        run: |
+          bun run typecheck
+          bun test
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: bun-darwin-arm64
+            asset: steadytube-macos-arm64
+            smoke: true
+          - runner: macos-latest
+            target: bun-darwin-x64
+            asset: steadytube-macos-x64
+            smoke: false
+          - runner: ubuntu-latest
+            target: bun-linux-x64
+            asset: steadytube-linux-x64
+            smoke: true
+          - runner: ubuntu-24.04-arm
+            target: bun-linux-arm64
+            asset: steadytube-linux-arm64
+            smoke: true
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Compile ${{ matrix.asset }}
+        run: |
+          mkdir -p dist
+          bun build --compile --target=${{ matrix.target }} src/index.ts --outfile dist/steadytube
+          chmod +x dist/steadytube
+          file dist/steadytube
+
+      - name: Smoke test
+        if: matrix.smoke
+        run: ./scripts/smoke-test.sh dist
+
+      - name: Package tarball
+        run: |
+          tar -czf "${{ matrix.asset }}.tar.gz" -C dist steadytube
+          tar -tzf "${{ matrix.asset }}.tar.gz"
+          test "$(tar -tzf "${{ matrix.asset }}.tar.gz" | wc -l)" -eq 1
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify all assets & checksums
+        working-directory: dist
+        run: |
+          for f in \
+            steadytube-macos-arm64.tar.gz \
+            steadytube-macos-x64.tar.gz \
+            steadytube-linux-x64.tar.gz \
+            steadytube-linux-arm64.tar.gz; do
+            test -f "$f" || { echo "missing release asset: $f" >&2; exit 1; }
+          done
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            dist/steadytube-macos-arm64.tar.gz
+            dist/steadytube-macos-x64.tar.gz
+            dist/steadytube-linux-x64.tar.gz
+            dist/steadytube-linux-arm64.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  update-tap:
+    name: Update Homebrew tap
+    needs: release
+    # Pre-release tags (e.g. v0.1.0-rc.1) never overwrite the live tap formula.
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check out the tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: toni-schmitt/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Render Formula/steadytube.rb
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          sha_macos_arm64=$(sha256sum dist/steadytube-macos-arm64.tar.gz | awk '{print $1}')
+          sha_macos_x64=$(sha256sum dist/steadytube-macos-x64.tar.gz | awk '{print $1}')
+          sha_linux_x64=$(sha256sum dist/steadytube-linux-x64.tar.gz | awk '{print $1}')
+          sha_linux_arm64=$(sha256sum dist/steadytube-linux-arm64.tar.gz | awk '{print $1}')
+
+          mkdir -p tap/Formula
+          sed \
+            -e "s|@@VERSION@@|${version}|g" \
+            -e "s|@@SHA_MACOS_ARM64@@|${sha_macos_arm64}|g" \
+            -e "s|@@SHA_MACOS_X64@@|${sha_macos_x64}|g" \
+            -e "s|@@SHA_LINUX_X64@@|${sha_linux_x64}|g" \
+            -e "s|@@SHA_LINUX_ARM64@@|${sha_linux_arm64}|g" \
+            packaging/steadytube.rb.tmpl > tap/Formula/steadytube.rb
+
+          if grep -qE '@@[A-Z0-9_]+@@' tap/Formula/steadytube.rb; then
+            echo "template left unreplaced placeholders" >&2
+            exit 1
+          fi
+          ruby -c tap/Formula/steadytube.rb
+
+      - name: Commit & push tap update
+        working-directory: tap
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/steadytube.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "steadytube ${TAG#v}"
+          git push
