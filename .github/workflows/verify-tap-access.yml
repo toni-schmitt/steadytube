@@ -59,7 +59,7 @@ jobs:
           ruby -c /tmp/steadytube.rb
           echo "Template renders to syntactically valid Ruby."
 
-      - name: Prove the token can push (dry-run)
+      - name: Prove the token can reach and push to main (dry-run)
         working-directory: tap
         run: |
           set -euo pipefail
@@ -67,7 +67,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -q --allow-empty -m "tap access check (never pushed)"
           git push --dry-run origin HEAD:main
-          echo "TAP_TOKEN can write to toni-schmitt/homebrew-tap."
+          echo "TAP_TOKEN authenticated and dry-run push to toni-schmitt/homebrew-tap succeeded (server-side branch protection rules are evaluated on actual push)."
 
       - name: Confirm tap is unchanged
         working-directory: tap

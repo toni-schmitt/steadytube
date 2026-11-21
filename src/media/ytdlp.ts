@@ -1,8 +1,26 @@
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { AppConfig } from "../config.ts";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
 import { ipv4Fetch } from "../net/ipv4-fetch.ts";
+
+export const VALID_VIDEO_ID_RE = /^[A-Za-z0-9_-]{6,20}$/;
+
+export function assertValidVideoId(videoId: string): string {
+  if (!VALID_VIDEO_ID_RE.test(videoId)) {
+    throw new Error(`Invalid video ID: ${videoId}`);
+  }
+  return videoId;
+}
+
+export function buildWatchUrl(videoId: string): string {
+  assertValidVideoId(videoId);
+  const url = new URL("https://www.youtube.com/watch");
+  url.searchParams.set("v", videoId);
+  return url.toString();
+}
 
 export interface YtDlpFormat {
   format_id: string;
@@ -145,6 +163,61 @@ export function classifyYtDlpError(stderr: string): YtDlpErrorKind {
   return "unknown";
 }
 
+/**
+ * Resolve a logical Firefox profile name (e.g. "yt-fallback") via Firefox's
+ * profiles.ini into its actual salted profile directory path, since yt-dlp
+ * expects a directory name/path rather than the logical Name= field.
+ */
+export function resolveFirefoxProfileFromIni(
+  profileSpec: string,
+  firefoxRootDirs?: string[],
+): string {
+  const trimmed = profileSpec.trim();
+  if (!trimmed) return trimmed;
+
+  // Already an explicit path
+  const expanded = trimmed.startsWith("~/") ? path.join(os.homedir(), trimmed.slice(2)) : trimmed;
+  if (expanded.includes("/") || fs.existsSync(expanded)) {
+    return expanded;
+  }
+
+  const roots = firefoxRootDirs ?? [
+    path.join(os.homedir(), "Library", "Application Support", "Firefox"),
+    path.join(os.homedir(), ".mozilla", "firefox"),
+  ];
+
+  for (const root of roots) {
+    const iniPath = path.join(root, "profiles.ini");
+    if (!fs.existsSync(iniPath)) continue;
+    try {
+      const content = fs.readFileSync(iniPath, "utf8");
+      const sections = content.split(/\r?\n(?=\[)/);
+      for (const section of sections) {
+        if (!/^\[Profile/i.test(section.trim())) continue;
+        let name = "";
+        let relPath = "";
+        let isRelative = true;
+        for (const line of section.split(/\r?\n/)) {
+          const idx = line.indexOf("=");
+          if (idx === -1) continue;
+          const k = line.slice(0, idx).trim();
+          const v = line.slice(idx + 1).trim();
+          if (k === "Name") name = v;
+          else if (k === "Path") relPath = v;
+          else if (k === "IsRelative") isRelative = v !== "0";
+        }
+        if (name === trimmed && relPath) {
+          return isRelative ? path.join(root, relPath) : relPath;
+        }
+      }
+    } catch {
+      // Ignore unreadable profiles.ini
+    }
+  }
+
+  return trimmed;
+}
+
 export interface YtDlpArgOptions {
   useAuth: boolean;
   bgutilAvailable: boolean;
@@ -181,7 +254,11 @@ export function buildYtDlpBaseArgs(config: AppConfig, opts: YtDlpArgOptions): st
     if (!auth.enabled || !auth.firefoxProfile) {
       throw new Error("Auth fallback requested but not configured");
     }
-    const browserSpec = `${auth.cookiesFromBrowser}:${auth.firefoxProfile}`;
+    const resolvedProfile =
+      auth.cookiesFromBrowser.toLowerCase() === "firefox"
+        ? resolveFirefoxProfileFromIni(auth.firefoxProfile)
+        : auth.firefoxProfile;
+    const browserSpec = `${auth.cookiesFromBrowser}:${resolvedProfile}`;
     args.push("--cookies-from-browser", browserSpec);
   } else {
     args.push("--no-cookies-from-browser");
@@ -301,11 +378,12 @@ export function createYtDlpRunner(
     isBgutilAvailable,
 
     async extractVideoInfo(videoId: string, opts: { useAuth: boolean }): Promise<YtDlpVideoInfo> {
+      const watchUrl = buildWatchUrl(videoId);
       const bgutilAvailable = await isBgutilAvailable();
       const args = buildYtDlpBaseArgs(config, {
         useAuth: opts.useAuth,
         bgutilAvailable,
-        extraArgs: ["-J", "--skip-download", "--", `https://www.youtube.com/watch?v=${videoId}`],
+        extraArgs: ["-J", "--skip-download", "--", watchUrl],
       });
 
       const startMs = Date.now();
@@ -346,18 +424,16 @@ export function createYtDlpRunner(
       outputPath: string,
       opts: { useAuth: boolean; timeoutMs?: number },
     ): Promise<string> {
+      const watchUrl = buildWatchUrl(videoId);
       const bgutilAvailable = await isBgutilAvailable();
-      // Keep the container extension (.mp4/.webm/.m4a) at the end so ffmpeg/yt-dlp never choke on unknown extensions
+
+      // Keep container extension (.mp4/.webm/.m4a) at the end and include unique suffix to avoid collisions
       const dotIdx = outputPath.lastIndexOf(".");
+      const uniq = `${process.pid}-${Date.now()}`;
       const tmpPath =
         dotIdx > outputPath.lastIndexOf("/")
-          ? `${outputPath.slice(0, dotIdx)}.tmp${outputPath.slice(dotIdx)}`
-          : `${outputPath}.tmp.bin`;
-      try {
-        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-      } catch {
-        // Ignore
-      }
+          ? `${outputPath.slice(0, dotIdx)}.${uniq}.tmp${outputPath.slice(dotIdx)}`
+          : `${outputPath}.${uniq}.tmp.bin`;
 
       const args = buildYtDlpBaseArgs(config, {
         useAuth: opts.useAuth,
@@ -373,38 +449,47 @@ export function createYtDlpRunner(
           "-o",
           tmpPath,
           "--",
-          `https://www.youtube.com/watch?v=${videoId}`,
+          watchUrl,
         ],
       });
 
       const timeoutMs = opts.timeoutMs ?? 180_000;
       const startMs = Date.now();
-      const { stderr, exitCode } = await spawnYtDlp(args, timeoutMs);
-      const elapsedMs = Date.now() - startMs;
+      let promoted = false;
 
-      if (exitCode !== 0 || !fs.existsSync(tmpPath)) {
-        try {
-          if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-        } catch {
-          // Ignore
+      try {
+        const { stderr, exitCode } = await spawnYtDlp(args, timeoutMs);
+        const elapsedMs = Date.now() - startMs;
+
+        if (exitCode !== 0 || !fs.existsSync(tmpPath)) {
+          const kind = classifyYtDlpError(stderr);
+          throw new YtDlpError(
+            stderr.trim().split("\n").pop() || `yt-dlp download exited with code ${exitCode}`,
+            kind,
+            stderr,
+            exitCode,
+          );
         }
-        const kind = classifyYtDlpError(stderr);
-        throw new YtDlpError(
-          stderr.trim().split("\n").pop() || `yt-dlp download exited with code ${exitCode}`,
-          kind,
-          stderr,
-          exitCode,
-        );
-      }
 
-      fs.renameSync(tmpPath, outputPath);
-      logger.info("Tier 3 ephemeral buffer download completed", {
-        videoId,
-        formatSelector,
-        outputPath,
-        elapsedMs,
-      });
-      return outputPath;
+        fs.renameSync(tmpPath, outputPath);
+        promoted = true;
+        logger.info("Tier 3 ephemeral buffer download completed", {
+          videoId,
+          formatSelector,
+          outputPath,
+          elapsedMs,
+        });
+        return outputPath;
+      } finally {
+        // Always clean up partial/staging file on failure or timeout
+        if (!promoted) {
+          try {
+            if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+          } catch {
+            // Ignore
+          }
+        }
+      }
     },
   };
 }

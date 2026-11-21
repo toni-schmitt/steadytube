@@ -31,6 +31,8 @@ jobs:
           persist-credentials: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.11"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -44,15 +46,27 @@ jobs:
       - name: Build standalone binary
         run: |
           mkdir -p dist
-          bun build --compile src/index.ts --outfile dist/steadytube
+          bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/index.ts --outfile dist/steadytube
 
       - name: Smoke test binary
         run: ./scripts/smoke-test.sh dist
+
+      - name: Verify Homebrew formula template syntax
+        run: |
+          fake=$(printf '0%.0s' $(seq 1 64))
+          sed \
+            -e "s|@@VERSION@@|0.1.0|g" \
+            -e "s|@@SHA_MACOS_ARM64@@|${fake}|g" \
+            -e "s|@@SHA_MACOS_X64@@|${fake}|g" \
+            -e "s|@@SHA_LINUX_X64@@|${fake}|g" \
+            -e "s|@@SHA_LINUX_ARM64@@|${fake}|g" \
+            packaging/steadytube.rb.tmpl > /tmp/steadytube.rb
+          ruby -c /tmp/steadytube.rb
 
       - name: Verify macOS x64 cross-compile
         if: runner.os == 'macOS'
         run: |
           mkdir -p dist-x64
-          bun build --compile --target=bun-darwin-x64 src/index.ts --outfile dist-x64/steadytube
+          bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --target=bun-darwin-x64 src/index.ts --outfile dist-x64/steadytube
           file dist-x64/steadytube
           file dist-x64/steadytube | grep -q 'x86_64' || { echo "missing x86_64 binary" >&2; exit 1; }

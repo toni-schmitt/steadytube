@@ -1,8 +1,10 @@
+import fs from "node:fs";
 import type { AppConfig } from "../config.ts";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
 import type { EphemeralStore } from "../cache/ephemeral-store.ts";
 import type { StreamTarget, StreamTargetRemote, VideoResolver } from "../media/video-resolver.ts";
+import { VALID_VIDEO_ID_RE } from "../media/ytdlp.ts";
 import { ipv4FetchRaw, type FetchLike } from "../net/ipv4-fetch.ts";
 
 const ALLOWED_GOOGLEVIDEO_HOST = /^[a-z0-9-]+\.googlevideo\.com$/i;
@@ -13,8 +15,8 @@ function isRecoverableStatus(status: number): boolean {
 
 /**
  * Wraps an upstream ReadableStream with a per-chunk stall watchdog so that if
- * googlevideo.com stops sending bytes mid-segment, we abort cleanly instead of
- * hanging Shaka Player indefinitely.
+ * googlevideo.com stops sending bytes mid-segment, we abort cleanly and mark
+ * the cached target stale for recovery on retry.
  */
 function withStallWatchdog(
   source: ReadableStream<Uint8Array>,
@@ -58,6 +60,7 @@ function withStallWatchdog(
       } catch (err) {
         clearTimer();
         if (!stalled) {
+          onStall();
           controller.error(err);
         }
       }
@@ -89,13 +92,17 @@ export class VideoPlaybackRoute {
     const itag = itagParam && /^\d+$/.test(itagParam) ? Number(itagParam) : 0;
 
     // Case 1: Standard daemon-issued proxy URL (?v=<id>&fid=<fid>&itag=<itag>...)
-    if (videoId) {
+    if (videoId !== null) {
+      if (!VALID_VIDEO_ID_RE.test(videoId)) {
+        return Response.json({ error: "Invalid video id" }, { status: 400 });
+      }
+
       let target = this.resolver.getStreamTarget(videoId, formatId, itag);
       if (!target) {
-        // Cache expired or daemon restarted mid-session — silently re-resolve!
         try {
           const rec = await this.resolver.resolveVideo(videoId, origin);
-          target = (formatId ? rec.targetsByFid.get(formatId) : undefined) ||
+          target =
+            (formatId ? rec.targetsByFid.get(formatId) : undefined) ||
             (itag > 0 ? rec.targetsByItag.get(itag) : undefined) ||
             null;
         } catch (err) {
@@ -131,27 +138,11 @@ export class VideoPlaybackRoute {
   private async serveTarget(req: Request, target: StreamTarget, origin: string): Promise<Response> {
     // Tier 3 local ephemeral buffer file
     if (target.kind === "local") {
-      const entry = this.ephemeralStore.get(target.videoId, target.formatId);
-      if (entry) {
-        return this.ephemeralStore.serveFile(entry, req);
-      }
-      // Fallback if file was evicted
-      return this.ephemeralStore.serveFile(
-        {
-          key: `${target.videoId}:${target.formatId}`,
-          filePath: target.filePath,
-          size: target.size,
-          mimeType: target.mimeType,
-          createdAt: Date.now(),
-          lastAccessedAt: Date.now(),
-        },
-        req,
-      );
+      return this.serveLocalTargetOr503(target, req);
     }
 
     // Fast path for HEAD when we already know content length
-    const rangeHeader = req.headers.get("range");
-    if (req.method === "HEAD" && !rangeHeader && target.clen > 0) {
+    if (req.method === "HEAD" && target.clen > 0) {
       return new Response(null, {
         status: 200,
         headers: {
@@ -164,8 +155,25 @@ export class VideoPlaybackRoute {
       });
     }
 
-    // Try current remote target over IPv4; transparently recover on 403/410/429/5xx/network error
+    // If a previous body stalled on this target, immediately escalate before trying it again
     let current: StreamTargetRemote = target;
+    if (current.stale) {
+      const preRecovered = await this.resolver.recoverFormatMidPlayback(
+        current.videoId,
+        current.formatId,
+        current.itag,
+        origin,
+        current,
+      );
+      if (preRecovered) {
+        if (preRecovered.kind === "local") {
+          return this.serveLocalTargetOr503(preRecovered, req);
+        }
+        current = preRecovered;
+      }
+    }
+
+    // Try current remote target over IPv4; transparently recover on 403/410/429/5xx/network error
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const res = await this.fetchUpstreamSegment(req, current);
@@ -205,7 +213,6 @@ export class VideoPlaybackRoute {
         });
       }
 
-      // Trigger silent mid-playback recovery (Tier 1 refresh -> Tier 2 cookies -> Tier 3 disk buffer)
       const recovered = await this.resolver.recoverFormatMidPlayback(
         current.videoId,
         current.formatId,
@@ -215,29 +222,36 @@ export class VideoPlaybackRoute {
       );
 
       if (!recovered) {
-        return new Response("Upstream stream unavailable", { status: 502 });
+        return new Response("Upstream stream unavailable", { status: 503 });
       }
       if (recovered.kind === "local") {
-        const entry = this.ephemeralStore.get(recovered.videoId, recovered.formatId);
-        if (entry) {
-          return this.ephemeralStore.serveFile(entry, req);
-        }
-        return this.ephemeralStore.serveFile(
-          {
-            key: `${recovered.videoId}:${recovered.formatId}`,
-            filePath: recovered.filePath,
-            size: recovered.size,
-            mimeType: recovered.mimeType,
-            createdAt: Date.now(),
-            lastAccessedAt: Date.now(),
-          },
-          req,
-        );
+        return this.serveLocalTargetOr503(recovered, req);
       }
       current = recovered;
     }
 
     return new Response("Upstream stream exhausted", { status: 502 });
+  }
+
+  private serveLocalTargetOr503(
+    target: Extract<StreamTarget, { kind: "local" }>,
+    req: Request,
+  ): Response {
+    const entry = this.ephemeralStore.get(target.videoId, target.formatId);
+    if (entry) {
+      return this.ephemeralStore.serveFile(entry, req);
+    }
+    if (fs.existsSync(target.filePath)) {
+      const reRegistered = this.ephemeralStore.register(
+        target.videoId,
+        target.formatId,
+        target.filePath,
+        target.mimeType,
+      );
+      return this.ephemeralStore.serveFile(reRegistered, req);
+    }
+    this.resolver.invalidateVideo(target.videoId);
+    return new Response("Cached stream expired; reload required", { status: 503 });
   }
 
   private async fetchUpstreamSegment(req: Request, target: StreamTargetRemote): Promise<Response> {
@@ -253,6 +267,9 @@ export class VideoPlaybackRoute {
       method: req.method,
       headers,
       signal: req.signal,
+      httpsOnly: true,
+      publicIpv4Only: true,
+      allowedHost: (h) => ALLOWED_GOOGLEVIDEO_HOST.test(h),
     });
   }
 
@@ -282,7 +299,8 @@ export class VideoPlaybackRoute {
       upstream.body,
       this.config.playback.streamStallTimeoutMs,
       () => {
-        this.logger.warn("Upstream stream stalled mid-chunk", {
+        this.resolver.markTargetStale(target.videoId, target.formatId);
+        this.logger.warn("Upstream stream stalled/errored mid-chunk; marked stale for recovery", {
           videoId: target.videoId,
           formatId: target.formatId,
           tier: target.tier,
@@ -315,6 +333,9 @@ export class VideoPlaybackRoute {
         method: req.method,
         headers,
         signal: req.signal,
+        httpsOnly: true,
+        publicIpv4Only: true,
+        allowedHost: (h) => ALLOWED_GOOGLEVIDEO_HOST.test(h),
       });
       const outHeaders = new Headers();
       outHeaders.set("Content-Type", upstream.headers.get("content-type") || fallbackMime);
@@ -325,7 +346,19 @@ export class VideoPlaybackRoute {
       if (cr) outHeaders.set("Content-Range", cr);
       outHeaders.set("X-SteadyTube-Tier", String(tier));
 
-      return new Response(req.method === "HEAD" ? null : upstream.body, {
+      if (req.method === "HEAD" || !upstream.body) {
+        return new Response(null, { status: upstream.status, headers: outHeaders });
+      }
+
+      const guardedBody = withStallWatchdog(
+        upstream.body,
+        this.config.playback.streamStallTimeoutMs,
+        () => {
+          this.logger.warn("Direct ?host= upstream stream stalled mid-chunk");
+        },
+      );
+
+      return new Response(guardedBody, {
         status: upstream.status,
         headers: outHeaders,
       });

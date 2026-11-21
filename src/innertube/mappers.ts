@@ -343,6 +343,36 @@ export function mapYoutubeiVideoNode(
   const node = rawNode as Record<string, any>;
   const nodeType = String(node.type || "");
 
+  // Handle modern ShortsLockupView nodes (channel Shorts tab / playlists)
+  if (nodeType === "ShortsLockupView") {
+    const videoId = String(
+      node.on_tap_endpoint?.payload?.videoId ||
+      (typeof node.entity_id === "string" ? node.entity_id.replace(/^shorts-shelf-item-/, "") : ""),
+    );
+    if (!videoId || videoId.length < 6) return null;
+    const title = textOf(node.overlay_metadata?.primary_text || node.accessibility_text);
+    const viewText = textOf(node.overlay_metadata?.secondary_text);
+    return {
+      type: "video",
+      title,
+      videoId,
+      author: fallbackChannel?.author || "",
+      authorId: fallbackChannel?.authorId || "",
+      authorUrl: fallbackChannel?.authorId ? `/channel/${fallbackChannel.authorId}` : "",
+      videoThumbnails: buildVideoThumbnails(videoId, origin),
+      description: "",
+      descriptionHtml: "",
+      viewCount: parseCompactNumber(viewText),
+      viewCountText: viewText,
+      published: Math.floor(Date.now() / 1000),
+      publishedText: "",
+      lengthSeconds: 0,
+      liveNow: false,
+      premium: false,
+      isUpcoming: false,
+    };
+  }
+
   // Handle newer LockupView nodes (youtubei.js v14+)
   if (nodeType === "LockupView") {
     if (node.content_type && node.content_type !== "VIDEO") return null;
@@ -702,7 +732,7 @@ export function mapChannelHeaderAndMeta(
     else if (tab === "releases") tabs.push("releases");
     else if (tab === "courses") tabs.push("courses");
     else if (tab === "playlists") tabs.push("playlists");
-    else if (tab === "posts" || tab === "community") tabs.push("posts");
+    // Omit "posts"/"community" until community post fetching is implemented
   }
   if (!tabs.includes("videos")) tabs.unshift("videos");
 

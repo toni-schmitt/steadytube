@@ -20,6 +20,7 @@ export interface EphemeralBufferConfig {
 export interface AppConfig {
   host: string;
   port: number;
+  allowRemoteBind: boolean;
   logLevel: LogLevel;
   configPath: string;
   cacheDir: string;
@@ -53,6 +54,7 @@ export interface AppConfig {
 export interface PartialAppConfig {
   host?: string;
   port?: number;
+  allowRemoteBind?: boolean;
   logLevel?: LogLevel;
   cacheDir?: string;
   logDir?: string;
@@ -183,6 +185,17 @@ export function loadConfig(overridePath?: string): AppConfig {
   }
 
   const host = process.env.STEADYTUBE_HOST || fileConfig.host || "127.0.0.1";
+  const allowRemoteBind =
+    process.env.STEADYTUBE_ALLOW_REMOTE_BIND === "1" ||
+    process.env.STEADYTUBE_ALLOW_REMOTE_BIND === "true" ||
+    Boolean(fileConfig.allowRemoteBind);
+  const isLoopbackHost =
+    host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+  if (!isLoopbackHost && !allowRemoteBind) {
+    throw new Error(
+      `Refusing non-loopback bind host "${host}". Set allowRemoteBind: true in config.json or STEADYTUBE_ALLOW_REMOTE_BIND=1 to override.`,
+    );
+  }
   const envPort = process.env.STEADYTUBE_PORT ? Number(process.env.STEADYTUBE_PORT) : undefined;
   const port = envPort && Number.isInteger(envPort) && envPort > 0 && envPort <= 65535
     ? envPort
@@ -217,6 +230,7 @@ export function loadConfig(overridePath?: string): AppConfig {
   return {
     host,
     port,
+    allowRemoteBind,
     logLevel,
     configPath,
     cacheDir,

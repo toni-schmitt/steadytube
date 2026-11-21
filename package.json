@@ -19,7 +19,7 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch src/index.ts",
-    "build": "bun build --compile src/index.ts --outfile dist/steadytube",
+    "build": "bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/index.ts --outfile dist/steadytube",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

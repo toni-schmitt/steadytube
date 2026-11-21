@@ -102,7 +102,7 @@ Tier 2 is **off by default** — most videos play completely anonymously on Tier
    ```
 3. *(Recommended)* Visit [myactivity.google.com/product/youtube](https://myactivity.google.com/product/youtube) in that window and turn **YouTube History → OFF**. *(SteadyTube also always passes `--no-mark-watched`.)*
 4. Quit that Firefox window and don't use it for daily browsing.
-5. Enable it in `~/.config/steadytube/config.json`:
+5. Enable it in `~/.config/steadytube/config.json` *(SteadyTube automatically resolves logical profile names like `"yt-fallback"` via Firefox's `profiles.ini`, or you can paste the full profile directory path from `about:profiles`)*:
    ```json
    {
      "playback": {
@@ -124,7 +124,7 @@ Tier 2 is **off by default** — most videos play completely anonymously on Tier
 <details>
 <summary><strong>Optional: PO-token helper (bgutil-ytdlp-pot-provider)</strong></summary>
 
-If you run a local [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) HTTP server on `http://127.0.0.1:4416`, SteadyTube automatically detects it and passes it to `yt-dlp`. If it isn't running, SteadyTube skips it with zero delay.
+If you install the [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) `yt-dlp` plugin and run its local HTTP server on `http://127.0.0.1:4416`, SteadyTube automatically detects the server and passes its address to `yt-dlp`. If the server isn't running, SteadyTube skips it with zero delay.
 
 </details>
 
@@ -160,6 +160,7 @@ brew uninstall steadytube
 {
   "host": "127.0.0.1",
   "port": 8787,
+  "allowRemoteBind": false,
   "logLevel": "info",
   "playback": {
     "videoCacheTtlSec": 1800,

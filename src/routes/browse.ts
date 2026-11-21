@@ -46,7 +46,7 @@ interface ChannelTabContinuation {
 }
 
 interface CommentContinuation {
-  kind: "comments" | "replies";
+  kind: "comments" | "replies" | "replies_page";
   source: any;
 }
 
@@ -324,11 +324,36 @@ export class BrowseRoutes {
       if (tab === "search") {
         const q = (url.searchParams.get("q") || "").trim();
         if (!q) return Response.json([]);
-        const searchFeed: any = await channel.search(q);
-        const items = (searchFeed.videos || searchFeed.posts || [])
-          .map((n: unknown) => mapYoutubeiVideoNode(n, origin, { author: channelAuthor, authorId: channelId }))
-          .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
-        return Response.json(items);
+        const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+        const sessionKey = `chsearch:${channelId}:${q}`;
+        let session = this.searchSessions.get(sessionKey);
+
+        if (!session || page === 1) {
+          const searchFeed: any = await channel.search(q);
+          const items = (searchFeed.videos || searchFeed.posts || [])
+            .map((n: unknown) =>
+              mapYoutubeiVideoNode(n, origin, { author: channelAuthor, authorId: channelId }),
+            )
+            .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
+          session = { pages: [items], lastResult: searchFeed };
+          this.searchSessions.set(sessionKey, session);
+        }
+
+        while (session.pages.length < page) {
+          if (!session.lastResult?.has_continuation) {
+            return Response.json([]);
+          }
+          const next: any = await session.lastResult.getContinuation();
+          const more = (next.videos || next.posts || [])
+            .map((n: unknown) =>
+              mapYoutubeiVideoNode(n, origin, { author: channelAuthor, authorId: channelId }),
+            )
+            .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
+          session.pages.push(more);
+          session.lastResult = next;
+        }
+
+        return Response.json(session.pages[page - 1] || []);
       }
 
       const isPlaylistTab =
@@ -420,14 +445,17 @@ export class BrowseRoutes {
           return Response.json({ comments: [], continuation: null });
         }
 
-        if (state.kind === "replies") {
-          const repliesObj: any = await state.source.getReplies();
+        if (state.kind === "replies" || state.kind === "replies_page") {
+          const repliesObj: any =
+            state.kind === "replies"
+              ? await state.source.getReplies()
+              : await state.source.getContinuation();
           const replyItems: unknown[] = repliesObj?.replies || repliesObj?.contents || [];
           const comments = replyItems
             .map((r: unknown) => mapCommentThreadToInvidious(r as Record<string, any>, origin))
             .filter((x): x is NonNullable<typeof x> => x !== null);
           const nextToken = repliesObj?.has_continuation
-            ? this.commentContinuations.put({ kind: "comments", source: repliesObj })
+            ? this.commentContinuations.put({ kind: "replies_page", source: repliesObj })
             : null;
           return Response.json({ comments, continuation: nextToken });
         }

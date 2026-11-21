@@ -18,6 +18,11 @@ export interface ParsedByteRange {
   isPartial: boolean;
 }
 
+/**
+ * Parse HTTP Range header per RFC 9110 §14.2:
+ * - Unknown range units or unsupported multi-range specs are ignored (returns full 200).
+ * - Invalid/out-of-bounds single byte range returns "unsatisfiable" (416).
+ */
 export function parseHttpRangeHeader(
   rangeHeader: string | null,
   totalSize: number,
@@ -25,7 +30,12 @@ export function parseHttpRangeHeader(
   if (!rangeHeader || !rangeHeader.trim()) {
     return { start: 0, end: Math.max(0, totalSize - 1), isPartial: false };
   }
-  const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader.trim());
+  const trimmed = rangeHeader.trim();
+  // RFC 9110 §14.1.2: ignore unknown range units; ignore multi-range lists (serve full 200)
+  if (!/^bytes=/i.test(trimmed) || trimmed.includes(",")) {
+    return { start: 0, end: Math.max(0, totalSize - 1), isPartial: false };
+  }
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(trimmed);
   if (!match) {
     return "unsatisfiable";
   }
@@ -40,7 +50,6 @@ export function parseHttpRangeHeader(
   if (rawStart === "" && rawEnd === "") {
     return "unsatisfiable";
   } else if (rawStart === "") {
-    // Suffix byte range: bytes=-500
     const suffixLen = Number(rawEnd);
     if (!Number.isFinite(suffixLen) || suffixLen <= 0) return "unsatisfiable";
     start = Math.max(0, totalSize - suffixLen);
@@ -57,11 +66,20 @@ export function parseHttpRangeHeader(
   return { start, end, isPartial: true };
 }
 
-function sanitizeSegment(input: string): string {
-  return input.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 80);
+function sanitizeSegment(input: string, label: string): string {
+  // Explicitly reject path separators and traversal sequences
+  if (input.includes("/") || input.includes("\\") || input.includes("..")) {
+    throw new Error(`Invalid ephemeral cache ${label} segment`);
+  }
+  const cleaned = input.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
+  if (!cleaned || /^_+$/.test(cleaned)) {
+    throw new Error(`Invalid ephemeral cache ${label} segment`);
+  }
+  return cleaned;
 }
 
 export class EphemeralStore {
+  private readonly resolvedBaseDir: string;
   private readonly entries = new Map<string, EphemeralFileEntry>();
   private readonly pinnedKeys = new Set<string>();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -73,6 +91,7 @@ export class EphemeralStore {
     private readonly logger: Logger = noopLogger,
   ) {
     fs.mkdirSync(this.baseDir, { recursive: true });
+    this.resolvedBaseDir = path.resolve(this.baseDir);
     this.scanExistingFiles();
   }
 
@@ -91,13 +110,21 @@ export class EphemeralStore {
     }
   }
 
+  private assertContainedPath(candidatePath: string): string {
+    const resolved = path.resolve(candidatePath);
+    if (!resolved.startsWith(this.resolvedBaseDir + path.sep)) {
+      throw new Error(`Refusing cache path outside base directory: ${candidatePath}`);
+    }
+    return resolved;
+  }
+
   getPathFor(videoId: string, formatId: string, ext: string): string {
-    const safeVideo = sanitizeSegment(videoId);
-    const safeFormat = sanitizeSegment(formatId);
-    const safeExt = sanitizeSegment(ext.replace(/^\./, "")) || "bin";
-    const videoDir = path.join(this.baseDir, safeVideo);
+    const safeVideo = sanitizeSegment(videoId, "videoId");
+    const safeFormat = sanitizeSegment(formatId, "formatId");
+    const safeExt = ext.replace(/^\./, "").replace(/[^A-Za-z0-9]/g, "").slice(0, 12) || "bin";
+    const videoDir = this.assertContainedPath(path.join(this.resolvedBaseDir, safeVideo));
     fs.mkdirSync(videoDir, { recursive: true });
-    return path.join(videoDir, `${safeFormat}.${safeExt}`);
+    return this.assertContainedPath(path.join(videoDir, `${safeFormat}.${safeExt}`));
   }
 
   makeKey(videoId: string, formatId: string): string {
@@ -113,12 +140,13 @@ export class EphemeralStore {
   }
 
   register(videoId: string, formatId: string, filePath: string, mimeType: string): EphemeralFileEntry {
-    const stat = fs.statSync(filePath);
+    const safePath = this.assertContainedPath(filePath);
+    const stat = fs.statSync(safePath);
     const now = Date.now();
     const key = this.makeKey(videoId, formatId);
     const entry: EphemeralFileEntry = {
       key,
-      filePath,
+      filePath: safePath,
       size: stat.size,
       mimeType,
       createdAt: now,
@@ -143,18 +171,30 @@ export class EphemeralStore {
 
   serveFile(entry: EphemeralFileEntry, req: Request): Response {
     entry.lastAccessedAt = Date.now();
-    const file = Bun.file(entry.filePath);
     const totalSize = entry.size;
-    const rangeHeader = req.headers.get("range");
-    const parsed = parseHttpRangeHeader(rangeHeader, totalSize);
 
     const commonHeaders: Record<string, string> = {
       "Content-Type": entry.mimeType,
       "Accept-Ranges": "bytes",
       "Cache-Control": "private, max-age=300",
-      "Access-Control-Allow-Origin": "*",
       "X-SteadyTube-Tier": "3-buffer",
     };
+
+    // RFC 9110 §14.2: HEAD returns full metadata (200) rather than 206
+    if (req.method === "HEAD") {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          ...commonHeaders,
+          "Content-Length": String(totalSize),
+        },
+      });
+    }
+
+    // If-Range: if client sends an If-Range validator we don't match, fall back to full 200
+    const ifRange = req.headers.get("if-range");
+    const effectiveRangeHeader = ifRange ? null : req.headers.get("range");
+    const parsed = parseHttpRangeHeader(effectiveRangeHeader, totalSize);
 
     if (parsed === "unsatisfiable") {
       return new Response(null, {
@@ -168,32 +208,52 @@ export class EphemeralStore {
 
     const contentLength = parsed.end - parsed.start + 1;
 
-    if (req.method === "HEAD") {
-      return new Response(null, {
-        status: parsed.isPartial ? 206 : 200,
-        headers: {
-          ...commonHeaders,
-          "Content-Length": String(contentLength),
-          ...(parsed.isPartial
-            ? { "Content-Range": `bytes ${parsed.start}-${parsed.end}/${totalSize}` }
-            : {}),
-        },
-      });
-    }
-
     if (parsed.isPartial) {
+      // Backpressure-aware bounded ReadStream so slow players never pull huge files into RAM
       const nodeStream = fs.createReadStream(entry.filePath, {
         start: parsed.start,
         end: parsed.end,
+        highWaterMark: 64 * 1024,
       });
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
+          let closed = false;
           nodeStream.on("data", (chunk: string | Buffer) => {
+            if (closed) return;
             const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-            controller.enqueue(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+            try {
+              controller.enqueue(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+              if (controller.desiredSize !== null && controller.desiredSize <= 0) {
+                nodeStream.pause();
+              }
+            } catch {
+              closed = true;
+              nodeStream.destroy();
+            }
           });
-          nodeStream.on("end", () => controller.close());
-          nodeStream.on("error", (err) => controller.error(err));
+          nodeStream.on("end", () => {
+            if (!closed) {
+              closed = true;
+              try {
+                controller.close();
+              } catch {
+                // Already closed
+              }
+            }
+          });
+          nodeStream.on("error", (err) => {
+            if (!closed) {
+              closed = true;
+              try {
+                controller.error(err);
+              } catch {
+                // Already closed
+              }
+            }
+          });
+        },
+        pull() {
+          nodeStream.resume();
         },
         cancel() {
           nodeStream.destroy();
@@ -209,7 +269,7 @@ export class EphemeralStore {
       });
     }
 
-    return new Response(file, {
+    return new Response(Bun.file(entry.filePath), {
       status: 200,
       headers: {
         ...commonHeaders,
@@ -223,7 +283,6 @@ export class EphemeralStore {
     let removedCount = 0;
     let freedBytes = 0;
 
-    // 1. Remove expired unpinned entries
     for (const [key, entry] of this.entries) {
       if (this.pinnedKeys.has(key)) continue;
       if (now - entry.lastAccessedAt >= this.ttlMs) {
@@ -232,7 +291,6 @@ export class EphemeralStore {
       }
     }
 
-    // 2. Enforce max disk size by LRU
     let totalBytes = 0;
     for (const entry of this.entries.values()) {
       totalBytes += entry.size;
@@ -268,7 +326,7 @@ export class EphemeralStore {
     return {
       fileCount: this.entries.size,
       totalBytes,
-      baseDir: this.baseDir,
+      baseDir: this.resolvedBaseDir,
     };
   }
 
@@ -289,19 +347,25 @@ export class EphemeralStore {
 
   private scanExistingFiles(): void {
     try {
-      const videoDirs = fs.readdirSync(this.baseDir, { withFileTypes: true });
+      const videoDirs = fs.readdirSync(this.resolvedBaseDir, { withFileTypes: true });
       const now = Date.now();
       for (const dirent of videoDirs) {
         if (!dirent.isDirectory()) continue;
-        const dirPath = path.join(this.baseDir, dirent.name);
+        const dirPath = path.join(this.resolvedBaseDir, dirent.name);
         const files = fs.readdirSync(dirPath, { withFileTypes: true });
         for (const f of files) {
           if (!f.isFile()) continue;
           const filePath = path.join(dirPath, f.name);
           try {
             const stat = fs.statSync(filePath);
-            // Delete orphaned temp/part files immediately on startup
-            if (f.name.endsWith(".part") || f.name.endsWith(".ytdl") || now - stat.mtimeMs >= this.ttlMs) {
+            // Delete orphaned staging/temp files and expired entries on startup
+            const isStaging =
+              f.name.endsWith(".part") ||
+              f.name.endsWith(".ytdl") ||
+              f.name.endsWith(".downloading") ||
+              /\.tmp\.[^.]+$/.test(f.name) ||
+              f.name.endsWith(".dash.mp4");
+            if (isStaging || now - stat.mtimeMs >= this.ttlMs) {
               fs.unlinkSync(filePath);
               continue;
             }
@@ -325,6 +389,7 @@ export class EphemeralStore {
           }
         }
       }
+      this.cleanup();
       this.pruneEmptySubdirs();
     } catch {
       // Base dir empty or inaccessible
@@ -333,10 +398,10 @@ export class EphemeralStore {
 
   private pruneEmptySubdirs(): void {
     try {
-      const dirents = fs.readdirSync(this.baseDir, { withFileTypes: true });
+      const dirents = fs.readdirSync(this.resolvedBaseDir, { withFileTypes: true });
       for (const d of dirents) {
         if (!d.isDirectory()) continue;
-        const full = path.join(this.baseDir, d.name);
+        const full = path.join(this.resolvedBaseDir, d.name);
         try {
           if (fs.readdirSync(full).length === 0) {
             fs.rmdirSync(full);

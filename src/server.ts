@@ -65,6 +65,7 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
     playbackRoute,
     browseRoutes,
     startedAtSec,
+    allowRemoteBind: config.allowRemoteBind,
     logger,
   });
 

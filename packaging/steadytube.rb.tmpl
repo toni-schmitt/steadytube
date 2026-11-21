@@ -9,6 +9,10 @@ class Steadytube < Formula
   homepage "https://github.com/toni-schmitt/steadytube"
   license "MIT"
 
+  depends_on "deno"
+  depends_on "ffmpeg"
+  depends_on "yt-dlp"
+
   on_macos do
     on_arm do
       url "https://github.com/toni-schmitt/steadytube/releases/download/v@@VERSION@@/steadytube-macos-arm64.tar.gz"
@@ -31,12 +35,9 @@ class Steadytube < Formula
     end
   end
 
-  depends_on "deno"
-  depends_on "ffmpeg"
-  depends_on "yt-dlp"
-
   def install
     bin.install "steadytube"
+    doc.install "LICENSE", "THIRD_PARTY_NOTICES.txt"
   end
 
   service do

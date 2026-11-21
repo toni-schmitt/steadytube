@@ -20,8 +20,10 @@ interface DnsCacheEntry {
 }
 
 const DNS_TTL_MS = 60_000;
+const MAX_DNS_CACHE_ENTRIES = 500;
 const MAX_REDIRECTS = 8;
 const dnsCache = new Map<string, DnsCacheEntry>();
+const inflightDns = new Map<string, Promise<string[]>>();
 
 const httpAgent = new http.Agent({
   keepAlive: true,
@@ -37,6 +39,24 @@ const httpsAgent = new https.Agent({
 
 export function clearIpv4DnsCache(): void {
   dnsCache.clear();
+  inflightDns.clear();
+}
+
+export function isPrivateOrReservedIpv4(ip: string): boolean {
+  const parts = ip.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) {
+    return true;
+  }
+  const [a, b] = parts as [number, number, number, number];
+  if (a === 0) return true; // 0.0.0.0/8
+  if (a === 10) return true; // 10.0.0.0/8
+  if (a === 127) return true; // 127.0.0.0/8
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+  if (a >= 224) return true; // Multicast & reserved
+  return false;
 }
 
 /**
@@ -51,13 +71,34 @@ function rotateIpv4OnError(hostname: string, failedIp: string): void {
   }
 }
 
-export async function resolveIpv4(hostname: string): Promise<string> {
+function pruneDnsCache(now: number): void {
+  for (const [k, v] of dnsCache) {
+    if (now >= v.expiresAt) dnsCache.delete(k);
+  }
+  while (dnsCache.size >= MAX_DNS_CACHE_ENTRIES) {
+    const oldest = dnsCache.keys().next().value;
+    if (oldest === undefined) break;
+    dnsCache.delete(oldest);
+  }
+}
+
+export async function resolveIpv4(
+  hostname: string,
+  options: { publicIpv4Only?: boolean } = {},
+): Promise<string> {
   const cleanHost = hostname.replace(/^\[|\]$/g, "");
+  const checkPublic = (ip: string): string => {
+    if (options.publicIpv4Only && isPrivateOrReservedIpv4(ip)) {
+      throw new Error(`Refusing private/reserved IPv4 address ${ip} for host: ${cleanHost}`);
+    }
+    return ip;
+  };
+
   if (net.isIPv4(cleanHost)) {
-    return cleanHost;
+    return checkPublic(cleanHost);
   }
   if (cleanHost === "localhost") {
-    return "127.0.0.1";
+    return checkPublic("127.0.0.1");
   }
   if (net.isIPv6(cleanHost)) {
     throw new Error(`Refusing IPv6 literal host in IPv4-only client: ${hostname}`);
@@ -67,30 +108,40 @@ export async function resolveIpv4(hostname: string): Promise<string> {
   const cached = dnsCache.get(cleanHost);
   if (cached && now < cached.expiresAt && cached.ips.length > 0) {
     // Sticky IPv4 per hostname so keep-alive TLS sockets are reused across bursts (e.g. 200+ RSS feeds)
-    return cached.ips[cached.activeIndex % cached.ips.length]!;
+    const ip = cached.ips[cached.activeIndex % cached.ips.length]!;
+    return checkPublic(ip);
   }
 
-  let ips: string[] = [];
-  try {
-    ips = await dns.resolve4(cleanHost);
-  } catch {
-    // Fallback to OS resolver for /etc/hosts or split-horizon DNS, strictly IPv4
-    const looked = await dns.lookup(cleanHost, { family: 4, all: true });
-    ips = looked.map((item) => item.address).filter((addr) => net.isIPv4(addr));
+  // Coalesce concurrent cold lookups for the same hostname
+  let lookupPromise = inflightDns.get(cleanHost);
+  if (!lookupPromise) {
+    lookupPromise = (async () => {
+      let ips: string[] = [];
+      try {
+        ips = await dns.resolve4(cleanHost);
+      } catch {
+        const looked = await dns.lookup(cleanHost, { family: 4, all: true });
+        ips = looked.map((item) => item.address).filter((addr) => net.isIPv4(addr));
+      }
+      const validIps = ips.filter((ip) => net.isIPv4(ip));
+      if (validIps.length === 0) {
+        throw new Error(`No IPv4 A records found for host: ${cleanHost}`);
+      }
+      pruneDnsCache(Date.now());
+      dnsCache.set(cleanHost, {
+        ips: validIps,
+        expiresAt: Date.now() + DNS_TTL_MS,
+        activeIndex: 0,
+      });
+      return validIps;
+    })().finally(() => {
+      inflightDns.delete(cleanHost);
+    });
+    inflightDns.set(cleanHost, lookupPromise);
   }
 
-  const validIps = ips.filter((ip) => net.isIPv4(ip));
-  if (validIps.length === 0) {
-    throw new Error(`No IPv4 A records found for host: ${cleanHost}`);
-  }
-
-  dnsCache.set(cleanHost, {
-    ips: validIps,
-    expiresAt: now + DNS_TTL_MS,
-    activeIndex: 0,
-  });
-
-  return validIps[0]!;
+  const validIps = await lookupPromise;
+  return checkPublic(validIps[0]!);
 }
 
 async function normalizeBody(body: BodyInit | null | undefined): Promise<Buffer | null> {
@@ -126,16 +177,37 @@ function buildHeadersRecord(input: Headers): Record<string, string> {
 }
 
 export interface Ipv4FetchOptions extends RequestInit {
-  /** Timeout for receiving response headers (ms). Default: 20000 */
+  /** Timeout for DNS resolution + receiving response headers (ms). Default: 20000 */
   timeoutMs?: number;
   /** Disable automatic gzip/deflate/br decompression & keep raw Content-Length/Content-Encoding. */
   raw?: boolean;
+  /** Refuse loopback / RFC1918 / link-local / CGNAT IPv4 destinations on every hop. */
+  publicIpv4Only?: boolean;
+  /** Require HTTPS on initial request and every redirect hop. */
+  httpsOnly?: boolean;
+  /** Optional allowlist validator invoked on the initial URL and every redirect hop. */
+  allowedHost?: (hostname: string) => boolean;
 }
 
 export type FetchLike = (
   input: string | URL | Request,
-  init?: RequestInit,
+  init?: Ipv4FetchOptions,
 ) => Promise<Response>;
+
+function validateUrlPolicy(
+  url: URL,
+  opts: { httpsOnly?: boolean; allowedHost?: (hostname: string) => boolean },
+): void {
+  if (opts.httpsOnly && url.protocol !== "https:") {
+    throw new Error(`Refusing non-HTTPS URL: ${url.protocol}//${url.host}`);
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error(`Unsupported protocol for ipv4Fetch: ${url.protocol}`);
+  }
+  if (opts.allowedHost && !opts.allowedHost(url.hostname)) {
+    throw new Error(`Refusing disallowed upstream host: ${url.hostname}`);
+  }
+}
 
 async function doSingleIpv4Request(
   url: URL,
@@ -146,6 +218,9 @@ async function doSingleIpv4Request(
     signal?: AbortSignal | null;
     timeoutMs: number;
     raw: boolean;
+    publicIpv4Only: boolean;
+    httpsOnly: boolean;
+    allowedHost?: (hostname: string) => boolean;
   },
 ): Promise<{
   status: number;
@@ -154,14 +229,26 @@ async function doSingleIpv4Request(
   stream: ReadableStream<Uint8Array> | null;
   location: string | null;
 }> {
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
-    throw new Error(`Unsupported protocol for ipv4Fetch: ${url.protocol}`);
-  }
+  validateUrlPolicy(url, options);
 
+  const deadlineAt = Date.now() + options.timeoutMs;
   const isHttps = url.protocol === "https:";
   const defaultPort = isHttps ? 443 : 80;
   const port = url.port ? Number(url.port) : defaultPort;
-  const ipv4 = await resolveIpv4(url.hostname);
+
+  // Enforce deadline across DNS resolution as well as socket headers
+  const ipv4 = await Promise.race([
+    resolveIpv4(url.hostname, { publicIpv4Only: options.publicIpv4Only }),
+    new Promise<never>((_, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`IPv4 DNS resolution timed out after ${options.timeoutMs}ms: ${url.hostname}`)),
+        options.timeoutMs,
+      );
+      timer.unref?.();
+    }),
+  ]);
+
+  const remainingMs = Math.max(100, deadlineAt - Date.now());
 
   const reqHeaders = buildHeadersRecord(headers);
   reqHeaders["host"] = url.port ? `${url.hostname}:${url.port}` : url.hostname;
@@ -214,13 +301,15 @@ async function doSingleIpv4Request(
     }
 
     const headerTimer = setTimeout(() => {
-      const timeoutErr = new Error(`IPv4 request timed out after ${options.timeoutMs}ms: ${url.host}${url.pathname}`);
+      const timeoutErr = new Error(
+        `IPv4 request timed out after ${options.timeoutMs}ms: ${url.host}${url.pathname}`,
+      );
       req.destroy(timeoutErr);
       if (!settled) {
         settled = true;
         reject(timeoutErr);
       }
-    }, options.timeoutMs);
+    }, remainingMs);
 
     req.on("error", (err) => {
       clearTimeout(headerTimer);
@@ -249,7 +338,6 @@ async function doSingleIpv4Request(
 
       const location = resHeaders.get("location");
 
-      // Null-body statuses or HEAD or redirect we are about to follow
       if (method === "HEAD" || status === 204 || status === 304) {
         res.resume();
         options.signal?.removeEventListener("abort", onAbort);
@@ -369,6 +457,9 @@ export async function ipv4Fetch(
   const signal = init.signal ?? (isRequest ? input.signal : undefined);
   const timeoutMs = init.timeoutMs ?? 20_000;
   const raw = init.raw ?? false;
+  const publicIpv4Only = init.publicIpv4Only ?? false;
+  const httpsOnly = init.httpsOnly ?? false;
+  const allowedHost = init.allowedHost;
 
   const headers = new Headers(isRequest ? input.headers : undefined);
   if (init.headers) {
@@ -390,6 +481,9 @@ export async function ipv4Fetch(
       signal,
       timeoutMs,
       raw,
+      publicIpv4Only,
+      httpsOnly,
+      allowedHost,
     });
 
     const isRedirect =
@@ -401,7 +495,6 @@ export async function ipv4Fetch(
       result.location !== null;
 
     if (isRedirect && redirectMode === "follow") {
-      // Drain/cancel redirect body before following
       if (result.stream) {
         await result.stream.cancel().catch(() => {});
       }
@@ -409,6 +502,7 @@ export async function ipv4Fetch(
         throw new Error(`Too many redirects (>${MAX_REDIRECTS}) fetching ${currentUrl.toString()}`);
       }
       const nextUrl = new URL(result.location!, currentUrl);
+      validateUrlPolicy(nextUrl, { httpsOnly, allowedHost });
       if (nextUrl.origin !== currentUrl.origin) {
         headers.delete("authorization");
         headers.delete("cookie");

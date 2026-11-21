@@ -16,25 +16,31 @@ export interface RouterDeps {
   playbackRoute: VideoPlaybackRoute;
   browseRoutes: BrowseRoutes;
   startedAtSec: number;
+  allowRemoteBind?: boolean;
   logger?: Logger;
 }
 
-function addCorsHeaders(res: Response): Response {
+const LOOPBACK_HOST_RE = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i;
+
+function isAllowedOrigin(origin: string): boolean {
+  if (origin === "null") return true; // Electron file:// / FreeTube renderer
+  if (origin.startsWith("file://") || origin.startsWith("app://")) return true;
   try {
-    if (!res.headers.has("Access-Control-Allow-Origin")) {
-      res.headers.set("Access-Control-Allow-Origin", "*");
-    }
-    res.headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-    res.headers.set("Access-Control-Allow-Headers", "Range, Content-Type, Authorization");
-    res.headers.set(
-      "Access-Control-Expose-Headers",
-      "Content-Length, Content-Range, Accept-Ranges, X-SteadyTube-Tier",
+    const parsed = new URL(origin);
+    return (
+      (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "[::1]")
     );
-    return res;
   } catch {
-    const headers = new Headers(res.headers);
-    if (!headers.has("Access-Control-Allow-Origin")) {
-      headers.set("Access-Control-Allow-Origin", "*");
+    return false;
+  }
+}
+
+function addCorsHeaders(res: Response, allowedOrigin: string | null): Response {
+  const apply = (headers: Headers) => {
+    if (allowedOrigin) {
+      headers.set("Access-Control-Allow-Origin", allowedOrigin);
+      headers.append("Vary", "Origin");
     }
     headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
     headers.set("Access-Control-Allow-Headers", "Range, Content-Type, Authorization");
@@ -42,6 +48,14 @@ function addCorsHeaders(res: Response): Response {
       "Access-Control-Expose-Headers",
       "Content-Length, Content-Range, Accept-Ranges, X-SteadyTube-Tier",
     );
+  };
+
+  try {
+    apply(res.headers);
+    return res;
+  } catch {
+    const headers = new Headers(res.headers);
+    apply(headers);
     return new Response(res.body, {
       status: res.status,
       statusText: res.statusText,
@@ -59,6 +73,7 @@ export function normalizePathname(pathname: string): string {
 
 export function createRequestHandler(deps: RouterDeps) {
   const logger = deps.logger ?? noopLogger;
+  const enforceLoopbackHost = !deps.allowRemoteBind;
 
   return async function handleRequest(req: Request): Promise<Response> {
     const startMs = Date.now();
@@ -67,8 +82,24 @@ export function createRequestHandler(deps: RouterDeps) {
     const method = req.method.toUpperCase();
     const pathname = normalizePathname(url.pathname);
 
+    // Block DNS rebinding when bound to loopback
+    const hostHeader = req.headers.get("host");
+    if (enforceLoopbackHost && hostHeader && !LOOPBACK_HOST_RE.test(hostHeader.trim())) {
+      return Response.json({ error: "Forbidden Host header" }, { status: 403 });
+    }
+
+    // Block arbitrary cross-site browser webpages from calling localhost SteadyTube
+    const reqOrigin = req.headers.get("origin");
+    let corsOrigin: string | null = null;
+    if (reqOrigin !== null) {
+      if (!isAllowedOrigin(reqOrigin)) {
+        return Response.json({ error: "Forbidden Origin" }, { status: 403 });
+      }
+      corsOrigin = reqOrigin;
+    }
+
     if (method === "OPTIONS") {
-      return addCorsHeaders(new Response(null, { status: 204 }));
+      return addCorsHeaders(new Response(null, { status: 204 }), corsOrigin);
     }
 
     let response: Response;
@@ -91,7 +122,7 @@ export function createRequestHandler(deps: RouterDeps) {
       });
     }
 
-    return addCorsHeaders(response);
+    return addCorsHeaders(response, corsOrigin);
   };
 }
 

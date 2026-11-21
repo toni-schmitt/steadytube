@@ -1,6 +1,12 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import zlib from "node:zlib";
-import { clearIpv4DnsCache, ipv4Fetch, ipv4FetchRaw, resolveIpv4 } from "../src/net/ipv4-fetch.ts";
+import {
+  clearIpv4DnsCache,
+  ipv4Fetch,
+  ipv4FetchRaw,
+  isPrivateOrReservedIpv4,
+  resolveIpv4,
+} from "../src/net/ipv4-fetch.ts";
 
 describe("ipv4-fetch", () => {
   let server: ReturnType<typeof Bun.serve>;
@@ -103,5 +109,30 @@ describe("ipv4-fetch", () => {
     const head = await ipv4FetchRaw(`${baseUrl}/range`, { method: "HEAD" });
     expect(head.status).toBe(200);
     expect(head.headers.get("content-length")).toBe("20");
+  });
+
+  test("classifies private/reserved IPv4 addresses and blocks SSRF targets when enforced", async () => {
+    expect(isPrivateOrReservedIpv4("127.0.0.1")).toBe(true);
+    expect(isPrivateOrReservedIpv4("10.0.0.1")).toBe(true);
+    expect(isPrivateOrReservedIpv4("172.16.5.1")).toBe(true);
+    expect(isPrivateOrReservedIpv4("192.168.1.1")).toBe(true);
+    expect(isPrivateOrReservedIpv4("169.254.169.254")).toBe(true);
+    expect(isPrivateOrReservedIpv4("100.64.0.1")).toBe(true);
+    expect(isPrivateOrReservedIpv4("8.8.8.8")).toBe(false);
+    expect(isPrivateOrReservedIpv4("142.250.185.78")).toBe(false);
+
+    await expect(
+      ipv4Fetch(`${baseUrl}/echo-host`, { publicIpv4Only: true }),
+    ).rejects.toThrow(/private\/reserved IPv4/);
+
+    await expect(
+      ipv4Fetch(`${baseUrl}/echo-host`, { httpsOnly: true }),
+    ).rejects.toThrow(/non-HTTPS/);
+
+    await expect(
+      ipv4Fetch(`${baseUrl}/echo-host`, {
+        allowedHost: (h) => /^(?:www\.)?youtube\.com$/i.test(h),
+      }),
+    ).rejects.toThrow(/disallowed upstream host/);
   });
 });

@@ -13,7 +13,26 @@ describe("EphemeralStore & HTTP Range parsing", () => {
     expect(parseHttpRangeHeader("bytes=500-5000", 1000)).toEqual({ start: 500, end: 999, isPartial: true });
     expect(parseHttpRangeHeader("bytes=1000-1200", 1000)).toBe("unsatisfiable");
     expect(parseHttpRangeHeader("bytes=500-200", 1000)).toBe("unsatisfiable");
-    expect(parseHttpRangeHeader("items=0-10", 1000)).toBe("unsatisfiable");
+    // RFC 9110 §14.2: unknown range units and multi-range lists are ignored -> full representation
+    expect(parseHttpRangeHeader("items=0-10", 1000)).toEqual({ start: 0, end: 999, isPartial: false });
+    expect(parseHttpRangeHeader("bytes=0-10, 20-30", 1000)).toEqual({
+      start: 0,
+      end: 999,
+      isPartial: false,
+    });
+  });
+
+  test("rejects path traversal segments and enforces baseDir containment", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-ephem-path-"));
+    try {
+      const store = new EphemeralStore(tmpDir, 2500, 60_000);
+      expect(() => store.getPathFor("../../../etc", "137", "mp4")).toThrow();
+      expect(() => store.getPathFor("..", "137", "mp4")).toThrow();
+      const safe = store.getPathFor("abc123XYZ99", "140-drc", "m4a");
+      expect(safe.startsWith(path.resolve(tmpDir) + path.sep)).toBe(true);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 
   test("serves GET/HEAD 206 Partial Content and evicts old unpinned files past size cap", async () => {
@@ -42,14 +61,28 @@ describe("EphemeralStore & HTTP Range parsing", () => {
       expect(slice[0]).toBe(100);
       expect(slice[99]).toBe(199);
 
-      // HEAD
+      // HEAD (even with Range header) returns 200 per RFC 9110
       const headRes = store.serveFile(
         e1,
-        new Request("http://127.0.0.1/videoplayback", { method: "HEAD" }),
+        new Request("http://127.0.0.1/videoplayback", {
+          method: "HEAD",
+          headers: { Range: "bytes=0-99" },
+        }),
       );
       expect(headRes.status).toBe(200);
       expect(headRes.headers.get("content-length")).toBe("1000");
       expect(headRes.headers.get("accept-ranges")).toBe("bytes");
+
+      // If-Range without matching validator falls back cleanly to 200 full body
+      const ifRangeRes = store.serveFile(
+        e1,
+        new Request("http://127.0.0.1/videoplayback", {
+          method: "GET",
+          headers: { Range: "bytes=0-99", "If-Range": '"stale-etag"' },
+        }),
+      );
+      expect(ifRangeRes.status).toBe(200);
+      expect((await ifRangeRes.arrayBuffer()).byteLength).toBe(1000);
 
       // Pin vid1, then add 2 more 1000-byte files (total 3000 > 2500 cap) -> vid1 stays, vid2 evicted
       store.pin(store.makeKey("vid1", "137"));

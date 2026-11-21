@@ -1,11 +1,21 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { AppConfig } from "../src/config.ts";
-import { buildYtDlpBaseArgs, classifyYtDlpError } from "../src/media/ytdlp.ts";
+import {
+  assertValidVideoId,
+  buildWatchUrl,
+  buildYtDlpBaseArgs,
+  classifyYtDlpError,
+  resolveFirefoxProfileFromIni,
+} from "../src/media/ytdlp.ts";
 
 function makeTestConfig(overrides?: Partial<AppConfig["playback"]["authFallback"]>): AppConfig {
   return {
     host: "127.0.0.1",
     port: 8787,
+    allowRemoteBind: false,
     logLevel: "error",
     configPath: "/tmp/config.json",
     cacheDir: "/tmp/cache",
@@ -106,5 +116,45 @@ describe("ytdlp arg builder & error classifier", () => {
     expect(
       classifyYtDlpError("ERROR: [youtube] abc: Video unavailable. This video has been removed."),
     ).toBe("unavailable");
+  });
+
+  test("validates video IDs and builds watch URLs safely", () => {
+    expect(assertValidVideoId("dQw4w9WgXcQ")).toBe("dQw4w9WgXcQ");
+    expect(buildWatchUrl("dQw4w9WgXcQ")).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    expect(() => assertValidVideoId("../../etc/passwd")).toThrow();
+    expect(() => buildWatchUrl("abc&list=evil")).toThrow();
+  });
+
+  test("resolves logical Firefox profile names from profiles.ini to salted directories", () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "steadytube-ff-"));
+    try {
+      fs.writeFileSync(
+        path.join(tmpRoot, "profiles.ini"),
+        [
+          "[Profile0]",
+          "Name=default-release",
+          "IsRelative=1",
+          "Path=Profiles/1111aaaa.default-release",
+          "",
+          "[Profile1]",
+          "Name=yt-fallback",
+          "IsRelative=1",
+          "Path=Profiles/abcd1234.yt-fallback",
+          "",
+          "[Profile2]",
+          "Name=custom-abs",
+          "IsRelative=0",
+          "Path=/opt/ff-profiles/custom",
+        ].join("\n"),
+      );
+      expect(resolveFirefoxProfileFromIni("yt-fallback", [tmpRoot])).toBe(
+        path.join(tmpRoot, "Profiles/abcd1234.yt-fallback"),
+      );
+      expect(resolveFirefoxProfileFromIni("custom-abs", [tmpRoot])).toBe("/opt/ff-profiles/custom");
+      expect(resolveFirefoxProfileFromIni("/explicit/path", [tmpRoot])).toBe("/explicit/path");
+      expect(resolveFirefoxProfileFromIni("unknown-profile", [tmpRoot])).toBe("unknown-profile");
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
   });
 });

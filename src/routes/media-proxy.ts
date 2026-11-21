@@ -18,6 +18,8 @@ interface CachedFeed {
 
 const VALID_VI_PATH = /^\/vi\/[A-Za-z0-9_-]{6,20}\/[A-Za-z0-9_.-]+\.(jpg|jpeg|webp|png)$/i;
 const VALID_FEED_ID = /^[A-Za-z0-9_-]{8,64}$/;
+const ALLOWED_IMAGE_HOST = /^(?:i\d*\.ytimg\.com|yt\d+\.ggpht\.com|yt\d+\.googleusercontent\.com|lh\d+\.googleusercontent\.com)$/i;
+const ALLOWED_FEED_HOST = /^(?:www\.)?youtube\.com$/i;
 
 export class MediaProxyRoutes {
   private readonly thumbCache: TtlLruCache<string, CachedBinary>;
@@ -99,6 +101,9 @@ export class MediaProxyRoutes {
             try {
               const res = await this.fetchFn(upstreamUrl, {
                 method: "GET",
+                httpsOnly: true,
+                publicIpv4Only: true,
+                allowedHost: (h) => ALLOWED_FEED_HOST.test(h),
                 headers: {
                   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
                   Accept: "application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
@@ -181,6 +186,9 @@ export class MediaProxyRoutes {
           for (const url of candidateUrls) {
             const res = await this.fetchRawFn(url, {
               method: "GET",
+              httpsOnly: true,
+              publicIpv4Only: true,
+              allowedHost: (h) => ALLOWED_IMAGE_HOST.test(h),
               headers: {
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
                 Accept: "image/webp,image/apng,image/*,*/*;q=0.8",

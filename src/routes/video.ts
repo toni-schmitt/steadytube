@@ -2,9 +2,10 @@ import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
 import { buildStaticDashMpdXml } from "../innertube/mappers.ts";
 import type { VideoResolver } from "../media/video-resolver.ts";
+import { VALID_VIDEO_ID_RE } from "../media/ytdlp.ts";
 import { ipv4Fetch, type FetchLike } from "../net/ipv4-fetch.ts";
 
-const VALID_VIDEO_ID = /^[A-Za-z0-9_-]{6,20}$/;
+const ALLOWED_CAPTION_HOST = /^(?:www\.)?youtube\.com$/i;
 
 export class VideoRoutes {
   constructor(
@@ -14,7 +15,7 @@ export class VideoRoutes {
   ) {}
 
   async handleVideo(videoId: string, origin: string): Promise<Response> {
-    if (!VALID_VIDEO_ID.test(videoId)) {
+    if (!VALID_VIDEO_ID_RE.test(videoId)) {
       return Response.json({ error: "Invalid video id" }, { status: 400 });
     }
 
@@ -35,7 +36,7 @@ export class VideoRoutes {
   }
 
   async handleDashManifest(videoId: string, origin: string): Promise<Response> {
-    if (!VALID_VIDEO_ID.test(videoId)) {
+    if (!VALID_VIDEO_ID_RE.test(videoId)) {
       return Response.json({ error: "Invalid video id" }, { status: 400 });
     }
 
@@ -55,8 +56,8 @@ export class VideoRoutes {
     }
   }
 
-  async handleCaptions(videoId: string, url: URL, origin: string): Promise<Response> {
-    if (!VALID_VIDEO_ID.test(videoId)) {
+  async handleCaptions(videoId: string, url: URL, _origin: string): Promise<Response> {
+    if (!VALID_VIDEO_ID_RE.test(videoId)) {
       return new Response("WEBVTT\n\n", {
         status: 400,
         headers: { "Content-Type": "text/vtt; charset=utf-8" },
@@ -67,11 +68,15 @@ export class VideoRoutes {
     const lang = url.searchParams.get("lang") || "";
 
     try {
-      const record = this.resolver.getCached(videoId) || (await this.resolver.resolveVideo(videoId, origin));
+      // Never trigger Tier 2 cookies or Tier 3 downloads just to read captions
+      const captions =
+        this.resolver.getCached(videoId)?.captions ??
+        (await this.resolver.getCaptionsAnonymous(videoId));
+
       const track =
-        record.captions.find((c) => label && c.label === label) ||
-        record.captions.find((c) => lang && c.languageCode === lang) ||
-        record.captions[0];
+        captions.find((c) => label && c.label === label) ||
+        captions.find((c) => lang && c.languageCode === lang) ||
+        captions[0];
 
       if (!track) {
         return new Response("WEBVTT\n\n", {
@@ -85,8 +90,14 @@ export class VideoRoutes {
         upstream.searchParams.set("fmt", "vtt");
       }
 
-      const res = await this.fetchFn(upstream.toString(), { method: "GET" });
+      const res = await this.fetchFn(upstream.toString(), {
+        method: "GET",
+        httpsOnly: true,
+        publicIpv4Only: true,
+        allowedHost: (h) => ALLOWED_CAPTION_HOST.test(h),
+      });
       if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
         return new Response("WEBVTT\n\n", {
           status: res.status,
           headers: { "Content-Type": "text/vtt; charset=utf-8" },
@@ -106,15 +117,15 @@ export class VideoRoutes {
         videoId,
         error: err instanceof Error ? err.message : String(err),
       });
-      return new Response("WEBVTT\n\n", {
-        status: 200,
-        headers: { "Content-Type": "text/vtt; charset=utf-8" },
+      return new Response("Upstream caption fetch failed", {
+        status: 502,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
       });
     }
   }
 
   async handleStoryboards(videoId: string, url: URL, origin: string): Promise<Response> {
-    if (!VALID_VIDEO_ID.test(videoId)) {
+    if (!VALID_VIDEO_ID_RE.test(videoId)) {
       return new Response("WEBVTT\n\n", {
         status: 400,
         headers: { "Content-Type": "text/vtt; charset=utf-8" },

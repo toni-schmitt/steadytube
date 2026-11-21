@@ -33,6 +33,7 @@ function makeTestConfig(cacheDir: string, authEnabled = true): AppConfig {
   return {
     host: "127.0.0.1",
     port: 8787,
+    allowRemoteBind: false,
     logLevel: "error",
     configPath: "/tmp/test-config.json",
     cacheDir,
@@ -419,6 +420,72 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
       expect(bytes.byteLength).toBe(100);
       expect(bytes[8]).toBe(4); // mdat payload byte
       expect(downloadCalls).toBe(1);
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("enforces loopback Host guard, Origin allowlist, videoId validation, and anonymous-only cold captions", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-sec-"));
+    try {
+      let ytDlpExtractCalls = 0;
+      const app = createApp(makeTestConfig(tmpDir, true), {
+        logger: noopLogger,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo() {
+            ytDlpExtractCalls++;
+            throw new Error("should not be called for cold captions");
+          },
+          async downloadFormat() {
+            throw new Error("should not be called for cold captions");
+          },
+        },
+      });
+
+      // DNS rebinding Host header rejected
+      const badHost = await app.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/stats", {
+          headers: { Host: "evil.example.com:8787" },
+        }),
+      );
+      expect(badHost.status).toBe(403);
+
+      // Remote web origin rejected
+      const badOrigin = await app.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/stats", {
+          headers: { Origin: "https://evil.example.com" },
+        }),
+      );
+      expect(badOrigin.status).toBe(403);
+
+      // Electron / FreeTube null and file:// origins allowed and echoed (no wildcard *)
+      const nullOrigin = await app.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/stats", {
+          headers: { Origin: "null" },
+        }),
+      );
+      expect(nullOrigin.status).toBe(200);
+      expect(nullOrigin.headers.get("access-control-allow-origin")).toBe("null");
+      expect(nullOrigin.headers.get("vary")).toContain("Origin");
+
+      // Invalid video IDs rejected with 400
+      const badVideo = await app.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/bad!id"));
+      expect(badVideo.status).toBe(400);
+      const badPlayback = await app.fetch(
+        new Request("http://127.0.0.1:8787/videoplayback?v=..%2F..%2Fetc&fid=137"),
+      );
+      expect(badPlayback.status).toBe(400);
+
+      // Cold captions must stay anonymous and never invoke yt-dlp / Tier 2 cookies
+      const capRes = await app.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/captions/dQw4w9WgXcQ?lang=en"),
+      );
+      expect(capRes.status).toBe(404);
+      expect(ytDlpExtractCalls).toBe(0);
 
       app.stop();
     } finally {

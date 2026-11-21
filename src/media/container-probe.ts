@@ -325,9 +325,35 @@ export function probeLocalFileDashRanges(
   }
 }
 
+async function readBoundedBytes(res: Response, maxBytes: number): Promise<Uint8Array> {
+  if (!res.body) return new Uint8Array(0);
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      const remaining = maxBytes - total;
+      const slice = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+      chunks.push(slice);
+      total += slice.byteLength;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+}
+
 /**
  * Probe DASH init/index byte ranges from an upstream HTTP(S) URL over IPv4
- * using a tiny byte-range GET (bytes=0-16383).
+ * using a strictly bounded byte-range GET (bytes=0-16383).
  */
 export async function probeRemoteDashRanges(
   url: string,
@@ -335,17 +361,34 @@ export async function probeRemoteDashRanges(
   fetchFn: FetchLike,
   extraHeaders?: Record<string, string>,
 ): Promise<DashByteRanges | null> {
+  const MAX_HEADER_PROBE = 16384;
   const headers: Record<string, string> = {
     ...(extraHeaders || {}),
-    Range: "bytes=0-16383",
+    Range: `bytes=0-${MAX_HEADER_PROBE - 1}`,
     "Accept-Encoding": "identity",
   };
 
-  const res = await fetchFn(url, { method: "GET", headers });
-  if (!res.ok && res.status !== 206) {
+  const res = await fetchFn(url, {
+    method: "GET",
+    headers,
+    timeoutMs: 8_000,
+    signal: AbortSignal.timeout(8_000),
+  });
+
+  // Only parse partial responses (or bounded byte 0 prefix); always cancel unread body on errors
+  if (res.status !== 206 && res.status !== 200) {
+    await res.body?.cancel().catch(() => {});
     return null;
   }
-  const buf = new Uint8Array(await res.arrayBuffer());
+  if (res.status === 206) {
+    const cr = res.headers.get("content-range") || "";
+    if (cr && !cr.startsWith("bytes 0-")) {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
+  }
+
+  const buf = await readBoundedBytes(res, MAX_HEADER_PROBE);
   if (buf.byteLength < 16) return null;
 
   if (mimeType.includes("webm")) {
@@ -359,11 +402,17 @@ export async function probeRemoteDashRanges(
           Range: `bytes=${parsed.cuesOffset}-${parsed.cuesOffset + 31}`,
           "Accept-Encoding": "identity",
         },
+        timeoutMs: 8_000,
+        signal: AbortSignal.timeout(8_000),
       });
-      if (cuesRes.ok || cuesRes.status === 206) {
-        const hdrBuf = new Uint8Array(await cuesRes.arrayBuffer());
-        return parseCuesElementHeaderAt(hdrBuf, parsed.cuesOffset, parsed.initEnd);
+      if (cuesRes.status === 206) {
+        const cr = cuesRes.headers.get("content-range") || "";
+        if (!cr || cr.startsWith(`bytes ${parsed.cuesOffset}-`)) {
+          const hdrBuf = await readBoundedBytes(cuesRes, 32);
+          return parseCuesElementHeaderAt(hdrBuf, parsed.cuesOffset, parsed.initEnd);
+        }
       }
+      await cuesRes.body?.cancel().catch(() => {});
     }
     return null;
   }

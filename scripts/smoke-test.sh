@@ -51,4 +51,40 @@ grep -q '"name":"steadytube"' "${TMP_DIR}/stats.json" || {
   exit 1
 }
 
+# Verify trailing-slash route normalization
+STATUS_SLASH="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/api/v1/stats/")"
+[[ "${STATUS_SLASH}" == "200" ]] || {
+  echo "Expected 200 on /api/v1/stats/, got ${STATUS_SLASH}" >&2
+  exit 1
+}
+
+# Verify invalid video ID & path traversal return 400
+STATUS_BAD_VID="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/api/v1/videos/bad!id")"
+[[ "${STATUS_BAD_VID}" == "400" ]] || {
+  echo "Expected 400 on invalid video id, got ${STATUS_BAD_VID}" >&2
+  exit 1
+}
+STATUS_BAD_PB="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/videoplayback?v=..%2F..%2Fetc%2Fpasswd&fid=137")"
+[[ "${STATUS_BAD_PB}" == "400" ]] || {
+  echo "Expected 400 on traversal videoplayback v param, got ${STATUS_BAD_PB}" >&2
+  exit 1
+}
+
+# Verify DNS-rebinding Host guard and cross-origin guard
+STATUS_BAD_HOST="$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example.com' "http://127.0.0.1:${PORT}/api/v1/stats")"
+[[ "${STATUS_BAD_HOST}" == "403" ]] || {
+  echo "Expected 403 on non-loopback Host header, got ${STATUS_BAD_HOST}" >&2
+  exit 1
+}
+STATUS_BAD_ORIGIN="$(curl -s -o /dev/null -w '%{http_code}' -H 'Origin: https://evil.example.com' "http://127.0.0.1:${PORT}/api/v1/stats")"
+[[ "${STATUS_BAD_ORIGIN}" == "403" ]] || {
+  echo "Expected 403 on remote web Origin, got ${STATUS_BAD_ORIGIN}" >&2
+  exit 1
+}
+STATUS_NULL_ORIGIN="$(curl -s -o /dev/null -w '%{http_code}' -H 'Origin: null' "http://127.0.0.1:${PORT}/api/v1/stats")"
+[[ "${STATUS_NULL_ORIGIN}" == "200" ]] || {
+  echo "Expected 200 on Electron/FreeTube Origin: null, got ${STATUS_NULL_ORIGIN}" >&2
+  exit 1
+}
+
 echo "Smoke test passed: $(cat "${TMP_DIR}/stats.json")"
