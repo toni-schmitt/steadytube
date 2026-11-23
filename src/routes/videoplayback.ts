@@ -3,7 +3,12 @@ import type { AppConfig } from "../config.ts";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
 import { parseHttpRangeHeader, type EphemeralStore } from "../cache/ephemeral-store.ts";
-import type { StreamTarget, StreamTargetRemote, VideoResolver } from "../media/video-resolver.ts";
+import {
+  findStreamTargetInRecord,
+  type StreamTarget,
+  type StreamTargetRemote,
+  type VideoResolver,
+} from "../media/video-resolver.ts";
 import { VALID_VIDEO_ID_RE } from "../media/ytdlp.ts";
 import { ipv4FetchRaw, type FetchLike } from "../net/ipv4-fetch.ts";
 
@@ -211,6 +216,11 @@ export class VideoPlaybackRoute {
     const formatId = url.searchParams.get("fid");
     const itagParam = url.searchParams.get("itag");
     const itag = itagParam && /^\d+$/.test(itagParam) ? Number(itagParam) : 0;
+    const clenParam = url.searchParams.get("clen");
+    const urlClen = clenParam && /^\d+$/.test(clenParam) ? Number(clenParam) : 0;
+    const urlLayout = url.searchParams.get("layout") || null;
+    const expectedIdentity =
+      urlClen > 0 || urlLayout ? { clen: urlClen > 0 ? urlClen : undefined, layout: urlLayout } : undefined;
 
     // Case 1: Standard daemon-issued proxy URL (?v=<id>&fid=<fid>&itag=<itag>...)
     if (videoId !== null) {
@@ -218,14 +228,17 @@ export class VideoPlaybackRoute {
         return Response.json({ error: "Invalid video id" }, { status: 400 });
       }
 
-      let target = this.resolver.getStreamTarget(videoId, formatId, itag);
-      if (!target) {
+      const cachedRecord = this.resolver.getCached(videoId);
+      let target = cachedRecord
+        ? findStreamTargetInRecord(cachedRecord, formatId, itag, expectedIdentity)
+        : null;
+      let resolvedAfterMiss = false;
+
+      if (!target && !cachedRecord) {
         try {
           const rec = await raceWithAbort(this.resolver.resolveVideo(videoId, origin), req.signal);
-          target =
-            (formatId ? rec.targetsByFid.get(formatId) : undefined) ||
-            (itag > 0 ? rec.targetsByItag.get(itag) : undefined) ||
-            null;
+          resolvedAfterMiss = true;
+          target = findStreamTargetInRecord(rec, formatId, itag, expectedIdentity);
         } catch (err) {
           if (req.signal.aborted) {
             return new Response(null, { status: 499 });
@@ -238,6 +251,10 @@ export class VideoPlaybackRoute {
       }
 
       if (!target) {
+        // Distinguish a stale/mismatched representation from a missing video so Shaka reloads cleanly
+        if ((cachedRecord || resolvedAfterMiss) && (expectedIdentity || formatId?.startsWith("tier3-"))) {
+          return new Response("Stream representation changed; reload required", { status: 410 });
+        }
         return Response.json({ error: "Stream format not found" }, { status: 404 });
       }
 
@@ -278,8 +295,8 @@ export class VideoPlaybackRoute {
       );
     }
 
-    // Fast path for HEAD when we already know content length
-    if (req.method === "HEAD" && target.clen > 0) {
+    // Fast path for non-ranged HEAD when we already know authoritative exact content length
+    if (req.method === "HEAD" && target.clen > 0 && !target.stale && !req.headers.get("range")) {
       return new Response(null, {
         status: 200,
         headers: {
@@ -429,7 +446,7 @@ export class VideoPlaybackRoute {
       );
       return this.ephemeralStore.serveFile(reRegistered, req);
     }
-    this.resolver.invalidateVideo(target.videoId);
+    this.resolver.invalidateVideoIfTargetMatches(target.videoId, target.formatId, target);
     return new Response("Cached stream expired; reload required", { status: 503 });
   }
 
