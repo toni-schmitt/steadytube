@@ -8,9 +8,40 @@ import { VALID_VIDEO_ID_RE } from "../media/ytdlp.ts";
 import { ipv4FetchRaw, type FetchLike } from "../net/ipv4-fetch.ts";
 
 const ALLOWED_GOOGLEVIDEO_HOST = /^[a-z0-9-]+\.googlevideo\.com$/i;
+const MAX_RECOVERY_ATTEMPTS = 4;
 
 function isRecoverableStatus(status: number): boolean {
   return status === 403 || status === 404 || status === 410 || status === 429 || status >= 500;
+}
+
+function getSignalAbortError(signal: AbortSignal | undefined): Error {
+  return signal?.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The operation was aborted.", "AbortError");
+}
+
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(getSignalAbortError(signal));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      reject(getSignalAbortError(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (val) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(val);
+      },
+      (err) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
 }
 
 /**
@@ -171,12 +202,15 @@ export class VideoPlaybackRoute {
       let target = this.resolver.getStreamTarget(videoId, formatId, itag);
       if (!target) {
         try {
-          const rec = await this.resolver.resolveVideo(videoId, origin);
+          const rec = await raceWithAbort(this.resolver.resolveVideo(videoId, origin), req.signal);
           target =
             (formatId ? rec.targetsByFid.get(formatId) : undefined) ||
             (itag > 0 ? rec.targetsByItag.get(itag) : undefined) ||
             null;
         } catch (err) {
+          if (req.signal.aborted) {
+            return new Response(null, { status: 499 });
+          }
           this.logger.warn("Failed to re-resolve video on /videoplayback cache miss", {
             videoId,
             error: err instanceof Error ? err.message : String(err),
@@ -207,6 +241,10 @@ export class VideoPlaybackRoute {
   }
 
   private async serveTarget(req: Request, target: StreamTarget, origin: string): Promise<Response> {
+    if (req.signal.aborted) {
+      return new Response(null, { status: 499 });
+    }
+
     // Tier 3 local ephemeral buffer file
     if (target.kind === "local") {
       return this.serveLocalTargetOr503(target, req);
@@ -229,13 +267,26 @@ export class VideoPlaybackRoute {
     // If a previous body stalled on this target, immediately escalate before trying it again
     let current: StreamTargetRemote = target;
     if (current.stale) {
-      const preRecovered = await this.resolver.recoverFormatMidPlayback(
-        current.videoId,
-        current.formatId,
-        current.itag,
-        origin,
-        current,
-      );
+      let preRecovered: StreamTarget | null = null;
+      try {
+        preRecovered = await raceWithAbort(
+          this.resolver.recoverFormatMidPlayback(
+            current.videoId,
+            current.formatId,
+            current.itag,
+            origin,
+            current,
+          ),
+          req.signal,
+        );
+      } catch {
+        if (req.signal.aborted) {
+          return new Response(null, { status: 499 });
+        }
+      }
+      if (req.signal.aborted) {
+        return new Response(null, { status: 499 });
+      }
       if (preRecovered) {
         if (preRecovered.kind === "local") {
           return this.serveLocalTargetOr503(preRecovered, req);
@@ -245,7 +296,7 @@ export class VideoPlaybackRoute {
     }
 
     // Try current remote target over IPv4; transparently recover on 403/410/429/5xx/network error
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < MAX_RECOVERY_ATTEMPTS; attempt++) {
       try {
         const res = await this.fetchUpstreamSegment(req, current);
         if (res.status === 200 || res.status === 206 || res.status === 416) {
@@ -254,7 +305,7 @@ export class VideoPlaybackRoute {
 
         await res.body?.cancel().catch(() => {});
 
-        if (!isRecoverableStatus(res.status) || attempt === 2) {
+        if (!isRecoverableStatus(res.status) || attempt === MAX_RECOVERY_ATTEMPTS - 1) {
           return new Response(null, { status: res.status });
         }
 
@@ -269,7 +320,7 @@ export class VideoPlaybackRoute {
         if (req.signal.aborted) {
           return new Response(null, { status: 499 });
         }
-        if (attempt === 2) {
+        if (attempt === MAX_RECOVERY_ATTEMPTS - 1) {
           this.logger.error("Upstream /videoplayback failed after recovery attempts", {
             videoId: current.videoId,
             formatId: current.formatId,
@@ -284,14 +335,27 @@ export class VideoPlaybackRoute {
         });
       }
 
-      const recovered = await this.resolver.recoverFormatMidPlayback(
-        current.videoId,
-        current.formatId,
-        current.itag,
-        origin,
-        current,
-      );
+      let recovered: StreamTarget | null = null;
+      try {
+        recovered = await raceWithAbort(
+          this.resolver.recoverFormatMidPlayback(
+            current.videoId,
+            current.formatId,
+            current.itag,
+            origin,
+            current,
+          ),
+          req.signal,
+        );
+      } catch {
+        if (req.signal.aborted) {
+          return new Response(null, { status: 499 });
+        }
+      }
 
+      if (req.signal.aborted) {
+        return new Response(null, { status: 499 });
+      }
       if (!recovered) {
         return new Response("Upstream stream unavailable", { status: 503 });
       }

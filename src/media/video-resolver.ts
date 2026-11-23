@@ -46,7 +46,9 @@ export interface StreamTargetRemote {
   expireSec: number;
   httpHeaders: Record<string, string>;
   tier: 1 | 2;
+  resolvedAt: number;
   stale?: boolean;
+  tier3CooldownUntil?: number;
 }
 
 export interface StreamTargetLocal {
@@ -195,6 +197,38 @@ function makeRangeKey(itag: number, isDrc: boolean, lang?: string | null): strin
   return `${itag}:${isDrc ? "drc" : "std"}:${(lang || "").toLowerCase()}`;
 }
 
+function isVisionOsClientUrl(url?: string): boolean {
+  if (!url) return false;
+  try {
+    return new URL(url).searchParams.get("c")?.toUpperCase() === "VISIONOS";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * When yt-dlp runs with multiple player clients (e.g. `visionos,default,-tv_samsung`),
+ * multiple clients can emit entries with the same `format_id`. Prefer the first
+ * entry — upgrading only if a later duplicate comes from `VISIONOS` while the
+ * earlier one did not — so `default` client URLs never clobber `VISIONOS` URLs.
+ */
+export function deduplicateYtDlpFormats(formats: YtDlpFormat[]): YtDlpFormat[] {
+  const byId = new Map<string, number>();
+  const out: YtDlpFormat[] = [];
+
+  for (const fmt of formats) {
+    const existingIdx = byId.get(fmt.format_id);
+    if (existingIdx === undefined) {
+      byId.set(fmt.format_id, out.length);
+      out.push(fmt);
+    } else if (isVisionOsClientUrl(fmt.url) && !isVisionOsClientUrl(out[existingIdx]?.url)) {
+      out[existingIdx] = fmt;
+    }
+  }
+
+  return out;
+}
+
 export class VideoResolver {
   private readonly cache: TtlLruCache<string, ResolvedVideoRecord>;
   private readonly recoveryInflight = new Map<string, Promise<StreamTarget | null>>();
@@ -246,6 +280,15 @@ export class VideoResolver {
     const t = rec.targetsByFid.get(formatId);
     if (t && t.kind === "remote") {
       t.stale = true;
+    }
+  }
+
+  clearTargetStale(videoId: string, formatId: string): void {
+    const rec = this.cache.get(videoId);
+    if (!rec) return;
+    const t = rec.targetsByFid.get(formatId);
+    if (t && t.kind === "remote") {
+      t.stale = false;
     }
   }
 
@@ -364,124 +407,221 @@ export class VideoResolver {
       });
 
       const currentRec = this.cache.get(videoId);
-      const ageMs = currentRec ? Date.now() - currentRec.resolvedAt : Infinity;
+      const targetResolvedAt = failedTarget.resolvedAt || currentRec?.resolvedAt || 0;
+      const ageMs = targetResolvedAt > 0 ? Date.now() - targetResolvedAt : Infinity;
 
-      // Step 1: If Tier 1 and entry was cached for > 20s (or came from fast InnerTube), try yt-dlp Tier 1 refresh once
-      if (failedTarget.tier === 1 && (ageMs > 20_000 || currentRec?.resolvedBy === "innertube")) {
-        try {
-          const fresh = await this.singleFlightRefresh(videoId, 1, () =>
-            this.resolveVideo(videoId, origin, {
-              forceRefresh: true,
-              minTier: 1,
-              skipFastInnertube: true,
-            }),
-          );
-          const nextTarget = findByteCompatibleTarget(fresh);
-          if (nextTarget && (nextTarget.kind === "local" || nextTarget.url !== failedTarget.url)) {
-            this.logger.info("Mid-playback recovery succeeded via Tier 1 yt-dlp refresh", { videoId, formatId });
-            return nextTarget;
-          }
-        } catch (err) {
-          this.logger.warn("Tier 1 refresh failed during mid-playback recovery", {
-            videoId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-
-      // Step 2: Escalate silently to Tier 2 (Firefox cookies) if configured and not already Tier 2
-      if (failedTarget.tier < 2 && this.config.playback.authFallback.enabled) {
-        try {
-          const tier2Rec = await this.singleFlightRefresh(videoId, 2, () =>
-            this.resolveVideo(videoId, origin, { forceRefresh: true, minTier: 2 }),
-          );
-          const nextTarget = findByteCompatibleTarget(tier2Rec);
-          if (nextTarget) {
-            this.logger.info("Mid-playback recovery escalated to Tier 2", { videoId, formatId });
-            return nextTarget;
-          }
-        } catch (err) {
-          this.logger.warn("Tier 2 escalation failed during mid-playback recovery", {
-            videoId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-
-      // Step 3: Escalate silently to Tier 3 (download exact formatId into ephemeral disk buffer)
-      if (this.config.playback.ephemeralBuffer.enabled) {
-        const selector = formatId || String(itag);
-        const existingLocal = this.ephemeralStore.get(videoId, selector);
-        if (existingLocal) {
-          return this.promoteToLocalTarget(videoId, selector, itag, existingLocal.filePath, existingLocal.mimeType);
-        }
-
-        return await this.tier3Semaphore.run(async () => {
-          const recheck = this.ephemeralStore.get(videoId, selector);
-          if (recheck) {
-            return this.promoteToLocalTarget(videoId, selector, itag, recheck.filePath, recheck.mimeType);
-          }
-
-          const ext = failedTarget.mimeType.includes("webm")
-            ? "webm"
-            : failedTarget.mimeType.startsWith("audio/")
-              ? "m4a"
-              : "mp4";
-          const outPath = this.ephemeralStore.getPathFor(videoId, selector, ext);
-          const pinKey = this.ephemeralStore.makeKey(videoId, selector);
-          this.ephemeralStore.pin(pinKey);
-
+      try {
+        // Step 1a: If Tier 1 came from fast InnerTube and has been running > 20s, try a fast
+        // InnerTube (VISIONOS) refresh first (~1s) before falling back to slower yt-dlp.
+        if (
+          failedTarget.tier === 1 &&
+          currentRec?.resolvedBy === "innertube" &&
+          ageMs > 20_000
+        ) {
           try {
-            const useAuth = failedTarget.tier === 2 && this.config.playback.authFallback.enabled;
-            try {
-              await this.ytDlp.downloadFormat(videoId, selector, outPath, { useAuth });
-            } catch (firstErr) {
-              if (!useAuth && this.config.playback.authFallback.enabled) {
-                await this.ytDlp.downloadFormat(videoId, selector, outPath, { useAuth: true });
-              } else {
-                throw firstErr;
-              }
-            }
-
-            const entry = this.ephemeralStore.register(videoId, selector, outPath, failedTarget.mimeType);
-            // Verify byte compatibility with Shaka's already-parsed segment index
-            if (failedTarget.clen > 0 && entry.size !== failedTarget.clen) {
-              this.logger.warn("Tier 3 downloaded size differs from original stream; forcing player reload", {
+            const fresh = await this.singleFlightRefresh(
+              videoId,
+              1,
+              () =>
+                this.resolveVideo(videoId, origin, {
+                  forceRefresh: true,
+                  minTier: 1,
+                  skipFastInnertube: false,
+                }),
+              "innertube",
+            );
+            const nextTarget = findByteCompatibleTarget(fresh);
+            if (nextTarget && (nextTarget.kind !== "remote" || nextTarget.url !== failedTarget.url)) {
+              this.logger.info("Mid-playback recovery succeeded via Tier 1 fast refresh", {
                 videoId,
-                formatId: selector,
-                expectedClen: failedTarget.clen,
-                actualSize: entry.size,
+                formatId,
+                resolvedBy: fresh.resolvedBy,
               });
-              this.invalidateVideo(videoId);
-              return null;
+              return nextTarget;
             }
-            const localTarget = this.promoteToLocalTarget(
+          } catch (err) {
+            this.logger.warn("Tier 1 fast refresh failed during mid-playback recovery", {
+              videoId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        // Step 1b: If Tier 1 and entry was cached > 20s (or came from fast InnerTube), try yt-dlp Tier 1 refresh
+        if (failedTarget.tier === 1 && (ageMs > 20_000 || currentRec?.resolvedBy === "innertube")) {
+          try {
+            const fresh = await this.singleFlightRefresh(
+              videoId,
+              1,
+              () =>
+                this.resolveVideo(videoId, origin, {
+                  forceRefresh: true,
+                  minTier: 1,
+                  skipFastInnertube: true,
+                }),
+              "ytdlp",
+            );
+            const nextTarget = findByteCompatibleTarget(fresh);
+            if (nextTarget && (nextTarget.kind !== "remote" || nextTarget.url !== failedTarget.url)) {
+              this.logger.info("Mid-playback recovery succeeded via Tier 1 yt-dlp refresh", {
+                videoId,
+                formatId,
+              });
+              return nextTarget;
+            }
+          } catch (err) {
+            this.logger.warn("Tier 1 yt-dlp refresh failed during mid-playback recovery", {
+              videoId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        // Step 2: Escalate silently to Tier 2 (Firefox cookies), OR refresh an older Tier 2 URL once
+        if (
+          this.config.playback.authFallback.enabled &&
+          (failedTarget.tier < 2 || (failedTarget.tier === 2 && ageMs > 20_000))
+        ) {
+          const isTier2Refresh = failedTarget.tier === 2;
+          try {
+            const tier2Rec = await this.singleFlightRefresh(
+              videoId,
+              2,
+              () => this.resolveVideo(videoId, origin, { forceRefresh: true, minTier: 2 }),
+              isTier2Refresh ? "refresh" : "escalate",
+            );
+            const nextTarget = findByteCompatibleTarget(tier2Rec);
+            if (
+              nextTarget &&
+              (!isTier2Refresh || nextTarget.kind !== "remote" || nextTarget.url !== failedTarget.url)
+            ) {
+              this.logger.info(
+                isTier2Refresh
+                  ? "Mid-playback recovery succeeded via Tier 2 refresh"
+                  : "Mid-playback recovery escalated to Tier 2",
+                { videoId, formatId },
+              );
+              return nextTarget;
+            }
+          } catch (err) {
+            this.logger.warn(
+              isTier2Refresh
+                ? "Tier 2 refresh failed during mid-playback recovery"
+                : "Tier 2 escalation failed during mid-playback recovery",
+              {
+                videoId,
+                error: err instanceof Error ? err.message : String(err),
+              },
+            );
+          }
+        }
+
+        // Step 3: Escalate silently to Tier 3 (ephemeral disk buffer)
+        if (this.config.playback.ephemeralBuffer.enabled) {
+          const selector = formatId || String(itag);
+          const existingLocal = this.ephemeralStore.get(videoId, selector);
+          if (existingLocal) {
+            return this.promoteToLocalTarget(
               videoId,
               selector,
               itag,
-              outPath,
-              failedTarget.mimeType,
+              existingLocal.filePath,
+              existingLocal.mimeType,
             );
-            this.metrics.tier3Hits++;
-            this.logger.info("Mid-playback recovery escalated to Tier 3 ephemeral buffer", {
+          }
+
+          if (failedTarget.tier3CooldownUntil && Date.now() < failedTarget.tier3CooldownUntil) {
+            this.logger.debug("Skipping Tier 3 mid-playback buffer during cooldown", {
               videoId,
               formatId: selector,
-            });
-            return localTarget;
-          } catch (err) {
-            this.logger.error("Tier 3 mid-playback buffer failed", {
-              videoId,
-              formatId: selector,
-              error: err instanceof Error ? err.message : String(err),
             });
             return null;
-          } finally {
-            this.ephemeralStore.unpin(pinKey);
           }
-        });
-      }
 
-      return null;
+          const maxCacheBytes = this.config.playback.ephemeralBuffer.maxCacheBytes;
+          if (failedTarget.clen > 0 && failedTarget.clen > maxCacheBytes) {
+            this.logger.warn("Skipping Tier 3 mid-playback buffer: stream exceeds maxCacheBytes", {
+              videoId,
+              formatId: selector,
+              clen: failedTarget.clen,
+              maxCacheBytes,
+            });
+            failedTarget.tier3CooldownUntil = Date.now() + 5 * 60_000;
+            return null;
+          }
+
+          return await this.tier3Semaphore.run(async () => {
+            const recheck = this.ephemeralStore.get(videoId, selector);
+            if (recheck) {
+              return this.promoteToLocalTarget(videoId, selector, itag, recheck.filePath, recheck.mimeType);
+            }
+
+            const ext = failedTarget.mimeType.includes("webm")
+              ? "webm"
+              : failedTarget.mimeType.startsWith("audio/")
+                ? "m4a"
+                : "mp4";
+            const outPath = this.ephemeralStore.getPathFor(videoId, selector, ext);
+            const pinKey = this.ephemeralStore.makeKey(videoId, selector);
+            this.ephemeralStore.pin(pinKey);
+
+            try {
+              const useAuth = failedTarget.tier === 2 && this.config.playback.authFallback.enabled;
+              try {
+                await this.ytDlp.downloadFormat(videoId, selector, outPath, { useAuth });
+              } catch (firstErr) {
+                if (!useAuth && this.config.playback.authFallback.enabled) {
+                  await this.ytDlp.downloadFormat(videoId, selector, outPath, { useAuth: true });
+                } else {
+                  throw firstErr;
+                }
+              }
+
+              const entry = this.ephemeralStore.register(videoId, selector, outPath, failedTarget.mimeType);
+              // Verify byte compatibility with Shaka's already-parsed segment index
+              if (failedTarget.clen > 0 && entry.size !== failedTarget.clen) {
+                this.logger.warn("Tier 3 downloaded size differs from original stream; forcing player reload", {
+                  videoId,
+                  formatId: selector,
+                  expectedClen: failedTarget.clen,
+                  actualSize: entry.size,
+                });
+                this.invalidateVideo(videoId);
+                return null;
+              }
+              const localTarget = this.promoteToLocalTarget(
+                videoId,
+                selector,
+                itag,
+                outPath,
+                failedTarget.mimeType,
+              );
+              this.metrics.tier3Hits++;
+              this.logger.info("Mid-playback recovery escalated to Tier 3 ephemeral buffer", {
+                videoId,
+                formatId: selector,
+              });
+              return localTarget;
+            } catch (err) {
+              failedTarget.tier3CooldownUntil = Date.now() + 60_000;
+              this.logger.error("Tier 3 mid-playback buffer failed", {
+                videoId,
+                formatId: selector,
+                error: err instanceof Error ? err.message : String(err),
+              });
+              return null;
+            } finally {
+              this.ephemeralStore.unpin(pinKey);
+            }
+          });
+        }
+
+        return null;
+      } finally {
+        // Always clear `stale` on the failed target so a failed/skipped recovery
+        // never traps subsequent requests in an infinite recovery loop.
+        failedTarget.stale = false;
+      }
     })();
 
     this.recoveryInflight.set(inflightKey, promise);
@@ -502,8 +642,9 @@ export class VideoResolver {
     videoId: string,
     tier: PlaybackTier,
     fn: () => Promise<ResolvedVideoRecord>,
+    variant = "default",
   ): Promise<ResolvedVideoRecord> {
-    const key = `${videoId}:t${tier}`;
+    const key = `${videoId}:t${tier}:${variant}`;
     const existing = this.videoRefreshInflight.get(key);
     if (existing) return existing;
     const p = fn().finally(() => {
@@ -789,6 +930,7 @@ export class VideoResolver {
         expireSec: meta.expireSec,
         httpHeaders: {},
         tier: 1,
+        resolvedAt: Date.now(),
       };
       targetsByFid.set(formatId, target);
       if (!targetsByItag.has(itag) || !fmt.is_drc) {
@@ -841,6 +983,7 @@ export class VideoResolver {
         expireSec: meta.expireSec,
         httpHeaders: {},
         tier: 1,
+        resolvedAt: Date.now(),
       };
       targetsByFid.set(formatId, target);
       targetsByItag.set(itag, target);
@@ -1096,8 +1239,8 @@ export class VideoResolver {
   ): Promise<ResolvedVideoRecord> {
     const durationSec = Math.max(1, Math.round(ytInfo.duration || 0));
     const allFormats = ytInfo.formats || [];
-    const directDash = allFormats.filter(isDirectDashFormat);
-    const directMuxed = allFormats.filter(isDirectMuxedFormat);
+    const directDash = deduplicateYtDlpFormats(allFormats.filter(isDirectDashFormat));
+    const directMuxed = deduplicateYtDlpFormats(allFormats.filter(isDirectMuxedFormat));
 
     const targetsByFid = new Map<string, StreamTarget>();
     const targetsByItag = new Map<number, StreamTarget>();
@@ -1212,6 +1355,7 @@ export class VideoResolver {
         expireSec: meta.expireSec,
         httpHeaders: fmt.http_headers || {},
         tier,
+        resolvedAt: Date.now(),
       };
       targetsByFid.set(fmt.format_id, target);
       if (itag > 0 && (!targetsByItag.has(itag) || !fmt.format_id.includes("drc"))) {
@@ -1263,6 +1407,7 @@ export class VideoResolver {
         expireSec: meta.expireSec,
         httpHeaders: fmt.http_headers || {},
         tier,
+        resolvedAt: Date.now(),
       };
       targetsByFid.set(fmt.format_id, target);
       if (itag > 0) targetsByItag.set(itag, target);
@@ -1563,8 +1708,26 @@ export class VideoResolver {
       ],
       { stdout: "ignore", stderr: "pipe" },
     );
-    const code = await proc.exited;
-    if (code === 0 && fs.existsSync(remuxPath) && probeLocalFileDashRanges(remuxPath, "video/mp4")) {
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // Ignore
+      }
+    }, 60_000);
+    let code = -1;
+    try {
+      const [, exitCode] = await Promise.all([
+        new Response(proc.stderr).text().catch(() => ""),
+        proc.exited,
+      ]);
+      code = exitCode;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!timedOut && code === 0 && fs.existsSync(remuxPath) && probeLocalFileDashRanges(remuxPath, "video/mp4")) {
       fs.renameSync(remuxPath, filePath);
       return filePath;
     }

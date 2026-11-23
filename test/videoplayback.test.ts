@@ -6,6 +6,7 @@ import type { AppConfig } from "../src/config.ts";
 import { noopLogger } from "../src/logger.ts";
 import type { AnonymousInnertubeProvider } from "../src/innertube/client.ts";
 import type { YtDlpRunner, YtDlpVideoInfo } from "../src/media/ytdlp.ts";
+import { deduplicateYtDlpFormats } from "../src/media/video-resolver.ts";
 import { withStallWatchdog } from "../src/routes/videoplayback.ts";
 import { createApp } from "../src/server.ts";
 
@@ -283,6 +284,331 @@ describe("withStallWatchdog & client-abort isolation", () => {
       }
       expect(app.resolver.getMetrics().midPlaybackRecoveries).toBe(0);
       expect(extractCalls).toBe(1);
+      expect(downloadCalls).toBe(0);
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Mid-playback recovery state machine", () => {
+  test("deduplicateYtDlpFormats prefers VISIONOS client URLs and prevents default client overwrite", () => {
+    const deduped1 = deduplicateYtDlpFormats([
+      {
+        format_id: "313",
+        url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=313&c=VISIONOS",
+      },
+      {
+        format_id: "313",
+        url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=313&c=WEB",
+      },
+      {
+        format_id: "251",
+        url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=251&c=WEB",
+      },
+      {
+        format_id: "251",
+        url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=251&c=VISIONOS",
+      },
+    ]);
+
+    expect(deduped1.length).toBe(2);
+    expect(deduped1[0]!.url).toContain("c=VISIONOS");
+    expect(deduped1[1]!.url).toContain("c=VISIONOS");
+  });
+
+  test("clears stale flag after failed/skipped Tier 3 and skips oversized streams exceeding maxCacheBytes", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-oversize-"));
+    try {
+      const mp4Bytes = makeMp4StreamBytes();
+      const oversizedClen = 3 * 1024 * 1024; // 3 MiB > 1 MiB maxCacheBytes
+      let downloadCalls = 0;
+
+      const mockYtDlp: YtDlpRunner = {
+        async isBgutilAvailable() { return false; },
+        async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+          return {
+            id: videoId,
+            title: "Oversized 4K Video",
+            duration: 600,
+            channel: "Creator",
+            channel_id: "UC1234567890123456789012",
+            formats: [
+              {
+                format_id: "313",
+                ext: "webm",
+                protocol: "https",
+                container: "webm_dash",
+                vcodec: "vp9",
+                acodec: "none",
+                width: 3840,
+                height: 2160,
+                fps: 30,
+                tbr: 15000,
+                filesize: oversizedClen,
+                url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=313&dur=600.000&expire=1999999999&clen=${oversizedClen}`,
+              },
+            ],
+          };
+        },
+        async downloadFormat() {
+          downloadCalls++;
+          throw new Error("should not download oversized format");
+        },
+      };
+
+      const fakeInnertube = {
+        async getClient() {
+          return {
+            async getInfo() {
+              return {
+                streaming_data: {
+                  adaptive_formats: [
+                    {
+                      itag: 313,
+                      content_length: oversizedClen,
+                      init_range: { start: 0, end: 231 },
+                      index_range: { start: 232, end: 303 },
+                    },
+                  ],
+                },
+                basic_info: {},
+                watch_next_feed: [],
+              };
+            },
+          };
+        },
+        reset() {},
+      } as unknown as AnonymousInnertubeProvider;
+
+      const mockFetchRaw = async () =>
+        new Response(mp4Bytes.slice(0, 100), {
+          status: 206,
+          headers: {
+            "Content-Type": "video/webm",
+            "Content-Range": `bytes 0-99/${oversizedClen}`,
+            "Content-Length": "100",
+          },
+        });
+
+      const app = createApp(
+        makeTestConfig(tmpDir, { authEnabled: false, maxCacheBytes: 1024 * 1024 }),
+        {
+          logger: noopLogger,
+          ytDlp: mockYtDlp,
+          innertube: fakeInnertube,
+          fetchRawFn: mockFetchRaw,
+        },
+      );
+
+      const vidRes = await app.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/RzHlHrz58oA"));
+      expect(vidRes.status).toBe(200);
+      const vidJson = (await vidRes.json()) as any;
+      const playUrl = vidJson.adaptiveFormats[0].url as string;
+
+      // Mark target stale as if a genuine upstream stall occurred
+      app.resolver.markTargetStale("RzHlHrz58oA", "313");
+
+      // Next request triggers recovery -> skips oversized Tier 3 -> clears stale -> serves upstream 206!
+      const res1 = await app.fetch(new Request(playUrl, { headers: { Range: "bytes=0-99" } }));
+      expect(res1.status).toBe(206);
+      expect(downloadCalls).toBe(0);
+
+      // Stale flag MUST be cleared so a second request does not re-enter recovery
+      const target = app.resolver.getStreamTarget("RzHlHrz58oA", "313", 313);
+      expect(target?.kind).toBe("remote");
+      if (target?.kind === "remote") {
+        expect(target.stale).toBe(false);
+      }
+      const recoveriesBefore = app.resolver.getMetrics().midPlaybackRecoveries;
+      const res2 = await app.fetch(new Request(playUrl, { headers: { Range: "bytes=0-99" } }));
+      expect(res2.status).toBe(206);
+      expect(app.resolver.getMetrics().midPlaybackRecoveries).toBe(recoveriesBefore);
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("returns 499 immediately when client aborts while waiting on slow mid-playback recovery", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-race-abort-"));
+    try {
+      const mp4Bytes = makeMp4StreamBytes();
+      let releaseSlowRecovery!: () => void;
+
+      const mockYtDlp: YtDlpRunner = {
+        async isBgutilAvailable() { return false; },
+        async extractVideoInfo(videoId, { useAuth }): Promise<YtDlpVideoInfo> {
+          if (useAuth) {
+            await new Promise<void>((resolve) => {
+              releaseSlowRecovery = resolve;
+            });
+          }
+          return {
+            id: videoId,
+            title: "Slow Recovery Test",
+            duration: 60,
+            channel: "Creator",
+            channel_id: "UC1234567890123456789012",
+            formats: [
+              {
+                format_id: "137",
+                ext: "mp4",
+                protocol: "https",
+                container: "mp4_dash",
+                vcodec: "avc1.640028",
+                acodec: "none",
+                width: 1920,
+                height: 1080,
+                fps: 30,
+                tbr: 2000,
+                filesize: mp4Bytes.byteLength,
+                url: `https://rr1---${useAuth ? "tier2" : "tier1"}.googlevideo.com/videoplayback?itag=137&dur=60.000&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+              },
+            ],
+          };
+        },
+        async downloadFormat() {
+          throw new Error("unused");
+        },
+      };
+
+      const mockFetchRaw = async (input: string | URL | Request) => {
+        if (input.toString().includes("tier1")) {
+          return new Response("Forbidden", { status: 403 });
+        }
+        return new Response(mp4Bytes.slice(0, 100), {
+          status: 206,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Range": `bytes 0-99/${mp4Bytes.byteLength}`,
+            "Content-Length": "100",
+          },
+        });
+      };
+
+      const app = createApp(makeTestConfig(tmpDir, { authEnabled: true }), {
+        logger: noopLogger,
+        ytDlp: mockYtDlp,
+        innertube: makeMockInnertube(),
+        fetchRawFn: mockFetchRaw,
+      });
+
+      const vidRes = await app.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"));
+      const vidJson = (await vidRes.json()) as any;
+      const playUrl = vidJson.adaptiveFormats[0].url as string;
+
+      // Request 1 hits 403 on Tier 1 and blocks in slow Tier 2 extraction; abort it after 30ms
+      const ctrl = new AbortController();
+      setTimeout(() => ctrl.abort(), 30);
+      const startMs = Date.now();
+      const abortedRes = await app.fetch(
+        new Request(playUrl, { headers: { Range: "bytes=0-99" }, signal: ctrl.signal }),
+      );
+      const elapsedMs = Date.now() - startMs;
+
+      expect(abortedRes.status).toBe(499);
+      expect(elapsedMs).toBeLessThan(300);
+
+      // Now finish the background Tier 2 recovery -> subsequent retry immediately gets 206 on Tier 2!
+      releaseSlowRecovery();
+      await new Promise((r) => setTimeout(r, 20));
+      const retryRes = await app.fetch(
+        new Request(playUrl, { headers: { Range: "bytes=0-99" } }),
+      );
+      expect(retryRes.status).toBe(206);
+      expect(retryRes.headers.get("x-steadytube-tier")).toBe("2");
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("refreshes aged Tier 2 URL once before escalating to Tier 3", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-tier2-refresh-"));
+    try {
+      const mp4Bytes = makeMp4StreamBytes();
+      let tier2Calls = 0;
+      let downloadCalls = 0;
+
+      const mockYtDlp: YtDlpRunner = {
+        async isBgutilAvailable() { return false; },
+        async extractVideoInfo(videoId, { useAuth }): Promise<YtDlpVideoInfo> {
+          if (!useAuth) {
+            throw new Error("tier1 blocked");
+          }
+          tier2Calls++;
+          return {
+            id: videoId,
+            title: "Tier 2 Refresh Test",
+            duration: 120,
+            channel: "Creator",
+            channel_id: "UC1234567890123456789012",
+            formats: [
+              {
+                format_id: "137",
+                ext: "mp4",
+                protocol: "https",
+                container: "mp4_dash",
+                vcodec: "avc1.640028",
+                acodec: "none",
+                width: 1920,
+                height: 1080,
+                fps: 30,
+                tbr: 2000,
+                filesize: mp4Bytes.byteLength,
+                url: `https://rr1---tier2-v${tier2Calls}.googlevideo.com/videoplayback?itag=137&dur=120.000&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+              },
+            ],
+          };
+        },
+        async downloadFormat() {
+          downloadCalls++;
+          throw new Error("should refresh Tier 2 before Tier 3");
+        },
+      };
+
+      const mockFetchRaw = async (input: string | URL | Request) => {
+        if (input.toString().includes("tier2-v1")) {
+          return new Response("Forbidden", { status: 403 });
+        }
+        return new Response(mp4Bytes.slice(0, 100), {
+          status: 206,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Range": `bytes 0-99/${mp4Bytes.byteLength}`,
+            "Content-Length": "100",
+          },
+        });
+      };
+
+      const app = createApp(makeTestConfig(tmpDir, { authEnabled: true }), {
+        logger: noopLogger,
+        ytDlp: mockYtDlp,
+        innertube: makeMockInnertube(),
+        fetchRawFn: mockFetchRaw,
+      });
+
+      const vidRes = await app.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"));
+      expect(vidRes.status).toBe(200);
+      const vidJson = (await vidRes.json()) as any;
+      const playUrl = vidJson.adaptiveFormats[0].url as string;
+
+      // Age the Tier 2 target > 20s so mid-playback 403 refreshes Tier 2 instead of jumping straight to Tier 3
+      const target = app.resolver.getStreamTarget("abc123XYZ99", "137", 137);
+      expect(target?.kind).toBe("remote");
+      if (target?.kind === "remote") {
+        target.resolvedAt = Date.now() - 30_000;
+      }
+
+      const res = await app.fetch(new Request(playUrl, { headers: { Range: "bytes=0-99" } }));
+      expect(res.status).toBe(206);
+      expect(res.headers.get("x-steadytube-tier")).toBe("2");
+      expect(tier2Calls).toBe(2);
       expect(downloadCalls).toBe(0);
 
       app.stop();
