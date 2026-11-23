@@ -76,6 +76,7 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
     resolver,
     fetch: handler,
     stop() {
+      resolver.stop();
       ephemeralStore.stopPeriodicCleanup();
     },
   };

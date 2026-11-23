@@ -5,8 +5,15 @@ import path from "node:path";
 import type { AppConfig } from "../src/config.ts";
 import { noopLogger } from "../src/logger.ts";
 import type { AnonymousInnertubeProvider } from "../src/innertube/client.ts";
-import type { YtDlpRunner, YtDlpVideoInfo } from "../src/media/ytdlp.ts";
-import { deduplicateYtDlpFormats } from "../src/media/video-resolver.ts";
+import type {
+  ProgressiveDownloadHandle,
+  YtDlpRunner,
+  YtDlpVideoInfo,
+} from "../src/media/ytdlp.ts";
+import {
+  deduplicateYtDlpFormats,
+  MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES,
+} from "../src/media/video-resolver.ts";
 import { withStallWatchdog } from "../src/routes/videoplayback.ts";
 import { createApp } from "../src/server.ts";
 
@@ -610,6 +617,255 @@ describe("Mid-playback recovery state machine", () => {
       expect(res.headers.get("x-steadytube-tier")).toBe("2");
       expect(tier2Calls).toBe(2);
       expect(downloadCalls).toBe(0);
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("streams Tier 3 progressively before full download finishes, then promotes to local buffer", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-tier3-prog-"));
+    try {
+      const mp4Bytes = makeMp4StreamBytes(1000);
+      let finishDownload!: () => void;
+      let cancelCount = 0;
+
+      const mockYtDlp: YtDlpRunner = {
+        async isBgutilAvailable() { return false; },
+        async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+          return {
+            id: videoId,
+            title: "Progressive Tier 3 Test",
+            duration: 120,
+            channel: "Creator",
+            channel_id: "UC1234567890123456789012",
+            formats: [
+              {
+                format_id: "137",
+                ext: "mp4",
+                protocol: "https",
+                container: "mp4_dash",
+                vcodec: "avc1.640028",
+                acodec: "none",
+                width: 1920,
+                height: 1080,
+                fps: 30,
+                tbr: 2000,
+                filesize: mp4Bytes.byteLength,
+                url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=137&dur=120.000&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+              },
+            ],
+          };
+        },
+        async downloadFormat() {
+          throw new Error("should use startProgressiveDownload");
+        },
+        async startProgressiveDownload(videoId, formatSelector, outputPath, opts): Promise<ProgressiveDownloadHandle> {
+          const tmpPath = `${outputPath}.prog.tmp.mp4`;
+          // Write first 450 bytes immediately, hold rest until finishDownload() is called
+          fs.writeFileSync(tmpPath, mp4Bytes.subarray(0, 450));
+          let readablePath = tmpPath;
+          let available = 450;
+          let status: "downloading" | "completed" | "failed" = "downloading";
+          const waiters: Array<() => void> = [];
+          const wake = () => {
+            for (const fn of waiters.splice(0)) fn();
+          };
+
+          const done = new Promise<{ filePath: string; size: number }>((resolve) => {
+            finishDownload = () => {
+              fs.appendFileSync(tmpPath, mp4Bytes.subarray(450));
+              fs.renameSync(tmpPath, outputPath);
+              readablePath = outputPath;
+              available = mp4Bytes.byteLength;
+              status = "completed";
+              wake();
+              resolve({ filePath: outputPath, size: mp4Bytes.byteLength });
+            };
+          });
+
+          return {
+            videoId,
+            formatId: formatSelector,
+            mimeType: opts.mimeType,
+            expectedSize: opts.expectedSize,
+            done,
+            getReadablePath: () => readablePath,
+            getAvailableBytes: () => available,
+            getStatus: () => status,
+            getError: () => null,
+            touch: () => {},
+            cancel: () => {
+              cancelCount++;
+            },
+            waitForBytes(minBytes, _sig, timeoutMs) {
+              if (status !== "downloading" || available >= minBytes) return Promise.resolve();
+              return new Promise<void>((resolve, reject) => {
+                const t = setTimeout(() => reject(new Error("timeout")), timeoutMs);
+                const check = () => {
+                  if (status !== "downloading" || available >= minBytes) {
+                    clearTimeout(t);
+                    resolve();
+                  } else {
+                    waiters.push(check);
+                  }
+                };
+                waiters.push(check);
+              });
+            },
+          };
+        },
+      };
+
+      const mockFetchRaw = async () => new Response("Forbidden", { status: 403 });
+
+      const app = createApp(makeTestConfig(tmpDir, { authEnabled: false }), {
+        logger: noopLogger,
+        ytDlp: mockYtDlp,
+        innertube: makeMockInnertube(),
+        fetchRawFn: mockFetchRaw,
+      });
+
+      const vidRes = await app.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"));
+      const vidJson = (await vidRes.json()) as any;
+      const playUrl = vidJson.adaptiveFormats[0].url as string;
+
+      // Range 304..403 is already in the first 450 bytes -> streams immediately as 3-stream BEFORE download completes!
+      const res1 = await app.fetch(new Request(playUrl, { headers: { Range: "bytes=304-403" } }));
+      expect(res1.status).toBe(206);
+      expect(res1.headers.get("x-steadytube-tier")).toBe("3-stream");
+      expect(new Uint8Array(await res1.arrayBuffer())).toEqual(mp4Bytes.subarray(304, 404));
+
+      // Now finish download -> target upgrades to local 3-buffer and serves trailing bytes!
+      finishDownload();
+      await new Promise((r) => setTimeout(r, 25));
+
+      const res2 = await app.fetch(new Request(playUrl, { headers: { Range: "bytes=900-999" } }));
+      expect(res2.status).toBe(206);
+      expect(res2.headers.get("x-steadytube-tier")).toBe("3-buffer");
+      expect(new Uint8Array(await res2.arrayBuffer())).toEqual(mp4Bytes.subarray(900, 1000));
+      expect(cancelCount).toBe(0);
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("skips mid-playback Tier 3 when requested Range offset is too far ahead without poisoning byte-0 fallback", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-far-offset-"));
+    try {
+      const totalClen = MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES + 10 * 1024 * 1024; // 74 MiB (< 100 MiB cap)
+      let progressiveStarts = 0;
+
+      const mockYtDlp: YtDlpRunner = {
+        async isBgutilAvailable() { return false; },
+        async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+          return {
+            id: videoId,
+            title: "Far Offset Video",
+            duration: 600,
+            channel: "Creator",
+            channel_id: "UC1234567890123456789012",
+            formats: [
+              {
+                format_id: "137",
+                ext: "mp4",
+                protocol: "https",
+                container: "mp4_dash",
+                vcodec: "avc1.640028",
+                acodec: "none",
+                width: 1920,
+                height: 1080,
+                fps: 30,
+                tbr: 2000,
+                filesize: totalClen,
+                url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=137&dur=600.000&expire=1999999999&clen=${totalClen}`,
+              },
+            ],
+          };
+        },
+        async downloadFormat() {
+          throw new Error("unused");
+        },
+        async startProgressiveDownload(videoId, formatSelector, outputPath, opts): Promise<ProgressiveDownloadHandle> {
+          progressiveStarts++;
+          const tmpPath = `${outputPath}.near.tmp.mp4`;
+          fs.writeFileSync(tmpPath, new Uint8Array(1024).fill(7));
+          const done = new Promise<{ filePath: string; size: number }>(() => {});
+          return {
+            videoId,
+            formatId: formatSelector,
+            mimeType: opts.mimeType,
+            expectedSize: opts.expectedSize,
+            done,
+            getReadablePath: () => tmpPath,
+            getAvailableBytes: () => 1024,
+            getStatus: () => "downloading",
+            getError: () => null,
+            touch: () => {},
+            cancel: () => {},
+            waitForBytes: () => Promise.resolve(),
+          };
+        },
+      };
+
+      const fakeInnertube = {
+        async getClient() {
+          return {
+            async getInfo() {
+              return {
+                streaming_data: {
+                  adaptive_formats: [
+                    {
+                      itag: 137,
+                      content_length: totalClen,
+                      init_range: { start: 0, end: 231 },
+                      index_range: { start: 232, end: 303 },
+                    },
+                  ],
+                },
+                basic_info: {},
+                watch_next_feed: [],
+              };
+            },
+          };
+        },
+        reset() {},
+      } as unknown as AnonymousInnertubeProvider;
+
+      const mockFetchRaw = async () => new Response("Forbidden", { status: 403 });
+
+      const app = createApp(
+        makeTestConfig(tmpDir, { authEnabled: false, maxCacheBytes: 200 * 1024 * 1024 }),
+        {
+          logger: noopLogger,
+          ytDlp: mockYtDlp,
+          innertube: fakeInnertube,
+          fetchRawFn: mockFetchRaw,
+        },
+      );
+
+      const vidRes = await app.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"));
+      const vidJson = (await vidRes.json()) as any;
+      const playUrl = vidJson.adaptiveFormats[0].url as string;
+
+      // Request far ahead (> 64 MiB): must skip Tier 3 and return 503 without starting download
+      const farStart = MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES + 1024;
+      const farRes = await app.fetch(
+        new Request(playUrl, { headers: { Range: `bytes=${farStart}-${farStart + 99}` } }),
+      );
+      expect(farRes.status).toBe(503);
+      expect(progressiveStarts).toBe(0);
+
+      // Subsequent request near byte 0: MUST NOT be blocked by cooldown -> starts progressive Tier 3!
+      const nearRes = await app.fetch(
+        new Request(playUrl, { headers: { Range: "bytes=0-99" } }),
+      );
+      expect(nearRes.status).toBe(206);
+      expect(nearRes.headers.get("x-steadytube-tier")).toBe("3-stream");
+      expect(progressiveStarts).toBe(1);
 
       app.stop();
     } finally {

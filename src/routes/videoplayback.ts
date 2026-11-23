@@ -2,7 +2,7 @@ import fs from "node:fs";
 import type { AppConfig } from "../config.ts";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
-import type { EphemeralStore } from "../cache/ephemeral-store.ts";
+import { parseHttpRangeHeader, type EphemeralStore } from "../cache/ephemeral-store.ts";
 import type { StreamTarget, StreamTargetRemote, VideoResolver } from "../media/video-resolver.ts";
 import { VALID_VIDEO_ID_RE } from "../media/ytdlp.ts";
 import { ipv4FetchRaw, type FetchLike } from "../net/ipv4-fetch.ts";
@@ -12,6 +12,24 @@ const MAX_RECOVERY_ATTEMPTS = 4;
 
 function isRecoverableStatus(status: number): boolean {
   return status === 403 || status === 404 || status === 410 || status === 429 || status >= 500;
+}
+
+function parseRequestedRangeStart(req: Request, totalSize: number): number | undefined {
+  const range = req.headers.get("range");
+  if (!range || !range.trim()) return 0;
+  if (totalSize > 0) {
+    const parsed = parseHttpRangeHeader(range, totalSize);
+    if (parsed !== "unsatisfiable") {
+      return parsed.start;
+    }
+    return undefined;
+  }
+  const m = /^bytes=(\d+)-/i.exec(range.trim());
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return undefined;
 }
 
 function getSignalAbortError(signal: AbortSignal | undefined): Error {
@@ -250,6 +268,15 @@ export class VideoPlaybackRoute {
       return this.serveLocalTargetOr503(target, req);
     }
 
+    // Tier 3 actively downloading progressive stream
+    if (target.kind === "progressive") {
+      return await this.ephemeralStore.serveProgressive(
+        target.source,
+        req,
+        this.config.playback.streamStallTimeoutMs,
+      );
+    }
+
     // Fast path for HEAD when we already know content length
     if (req.method === "HEAD" && target.clen > 0) {
       return new Response(null, {
@@ -276,6 +303,7 @@ export class VideoPlaybackRoute {
             current.itag,
             origin,
             current,
+            { requestedRangeStart: parseRequestedRangeStart(req, current.clen) },
           ),
           req.signal,
         );
@@ -290,6 +318,13 @@ export class VideoPlaybackRoute {
       if (preRecovered) {
         if (preRecovered.kind === "local") {
           return this.serveLocalTargetOr503(preRecovered, req);
+        }
+        if (preRecovered.kind === "progressive") {
+          return await this.ephemeralStore.serveProgressive(
+            preRecovered.source,
+            req,
+            this.config.playback.streamStallTimeoutMs,
+          );
         }
         current = preRecovered;
       }
@@ -344,6 +379,7 @@ export class VideoPlaybackRoute {
             current.itag,
             origin,
             current,
+            { requestedRangeStart: parseRequestedRangeStart(req, current.clen) },
           ),
           req.signal,
         );
@@ -361,6 +397,13 @@ export class VideoPlaybackRoute {
       }
       if (recovered.kind === "local") {
         return this.serveLocalTargetOr503(recovered, req);
+      }
+      if (recovered.kind === "progressive") {
+        return await this.ephemeralStore.serveProgressive(
+          recovered.source,
+          req,
+          this.config.playback.streamStallTimeoutMs,
+        );
       }
       current = recovered;
     }

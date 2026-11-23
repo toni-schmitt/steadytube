@@ -1,18 +1,28 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { ProgressiveStreamSource } from "../cache/ephemeral-store.ts";
 import type { AppConfig } from "../config.ts";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
 import { ipv4Fetch } from "../net/ipv4-fetch.ts";
 
 export const VALID_VIDEO_ID_RE = /^[A-Za-z0-9_-]{6,20}$/;
+const SAFE_FORMAT_SELECTOR_RE = /^[A-Za-z0-9][A-Za-z0-9._+/[\]<=>,-]{0,199}$/;
 
 export function assertValidVideoId(videoId: string): string {
   if (!VALID_VIDEO_ID_RE.test(videoId)) {
     throw new Error(`Invalid video ID: ${videoId}`);
   }
   return videoId;
+}
+
+export function assertSafeFormatSelector(selector: string): string {
+  const trimmed = selector.trim();
+  if (!SAFE_FORMAT_SELECTOR_RE.test(trimmed)) {
+    throw new Error(`Invalid yt-dlp format selector: ${selector}`);
+  }
+  return trimmed;
 }
 
 export function buildWatchUrl(videoId: string): string {
@@ -271,6 +281,21 @@ export function buildYtDlpBaseArgs(config: AppConfig, opts: YtDlpArgOptions): st
   return args;
 }
 
+export interface ProgressiveDownloadOptions {
+  useAuth: boolean;
+  mimeType: string;
+  expectedSize: number;
+  maxBytes: number;
+  stallTimeoutMs?: number;
+  idleTimeoutMs?: number;
+  maxTotalTimeoutMs?: number;
+}
+
+export interface ProgressiveDownloadHandle extends ProgressiveStreamSource {
+  readonly done: Promise<{ filePath: string; size: number }>;
+  cancel(reason?: string): void;
+}
+
 export interface YtDlpRunner {
   extractVideoInfo(videoId: string, opts: { useAuth: boolean }): Promise<YtDlpVideoInfo>;
   downloadFormat(
@@ -279,6 +304,12 @@ export interface YtDlpRunner {
     outputPath: string,
     opts: { useAuth: boolean; timeoutMs?: number },
   ): Promise<string>;
+  startProgressiveDownload?(
+    videoId: string,
+    formatSelector: string,
+    outputPath: string,
+    opts: ProgressiveDownloadOptions,
+  ): Promise<ProgressiveDownloadHandle>;
   isBgutilAvailable(): Promise<boolean>;
 }
 
@@ -287,6 +318,28 @@ export function createYtDlpRunner(
   logger: Logger = noopLogger,
 ): YtDlpRunner {
   let bgutilCheckCache: { available: boolean; expiresAt: number } | null = null;
+  let stagingSeq = 0;
+
+  function buildStagingPath(outputPath: string): string {
+    const dotIdx = outputPath.lastIndexOf(".");
+    const uniq = `${process.pid}-${Date.now()}-${++stagingSeq}`;
+    return dotIdx > outputPath.lastIndexOf("/")
+      ? `${outputPath.slice(0, dotIdx)}.${uniq}.tmp${outputPath.slice(dotIdx)}`
+      : `${outputPath}.${uniq}.tmp.bin`;
+  }
+
+  function buildSpawnEnv(): Record<string, string | undefined> {
+    return {
+      ...process.env,
+      PATH: [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        `${process.env.HOME || ""}/.local/bin`,
+        `${process.env.HOME || ""}/.bun/bin`,
+        process.env.PATH || "/usr/bin:/bin",
+      ].join(":"),
+    };
+  }
 
   async function isBgutilAvailable(): Promise<boolean> {
     if (!config.playback.enableBgutilPot || !config.playback.bgutilPotUrl) {
@@ -425,22 +478,16 @@ export function createYtDlpRunner(
       opts: { useAuth: boolean; timeoutMs?: number },
     ): Promise<string> {
       const watchUrl = buildWatchUrl(videoId);
+      const safeSelector = assertSafeFormatSelector(formatSelector);
       const bgutilAvailable = await isBgutilAvailable();
-
-      // Keep container extension (.mp4/.webm/.m4a) at the end and include unique suffix to avoid collisions
-      const dotIdx = outputPath.lastIndexOf(".");
-      const uniq = `${process.pid}-${Date.now()}`;
-      const tmpPath =
-        dotIdx > outputPath.lastIndexOf("/")
-          ? `${outputPath.slice(0, dotIdx)}.${uniq}.tmp${outputPath.slice(dotIdx)}`
-          : `${outputPath}.${uniq}.tmp.bin`;
+      const tmpPath = buildStagingPath(outputPath);
 
       const args = buildYtDlpBaseArgs(config, {
         useAuth: opts.useAuth,
         bgutilAvailable,
         extraArgs: [
           "-f",
-          formatSelector,
+          safeSelector,
           "--fixup",
           "never", // Keep exact untouched DASH bytes so Shaka sidx/Cues byte offsets match 1:1
           "--no-part",
@@ -490,6 +537,285 @@ export function createYtDlpRunner(
           }
         }
       }
+    },
+
+    async startProgressiveDownload(
+      videoId: string,
+      formatSelector: string,
+      outputPath: string,
+      opts: ProgressiveDownloadOptions,
+    ): Promise<ProgressiveDownloadHandle> {
+      const watchUrl = buildWatchUrl(videoId);
+      const safeSelector = assertSafeFormatSelector(formatSelector);
+      const bgutilAvailable = await isBgutilAvailable();
+      const tmpPath = buildStagingPath(outputPath);
+
+      const args = buildYtDlpBaseArgs(config, {
+        useAuth: opts.useAuth,
+        bgutilAvailable,
+        extraArgs: [
+          "-f",
+          safeSelector,
+          "--fixup",
+          "never",
+          "--no-part",
+          "--no-continue",
+          "--force-overwrites",
+          "-o",
+          tmpPath,
+          "--",
+          watchUrl,
+        ],
+      });
+
+      const stallTimeoutMs = opts.stallTimeoutMs ?? Math.max(30_000, config.playback.streamStallTimeoutMs * 2);
+      const idleTimeoutMs = opts.idleTimeoutMs ?? 60_000;
+      const maxTotalTimeoutMs = opts.maxTotalTimeoutMs ?? 10 * 60_000;
+
+      const cmd = [config.binaries.ytDlp, ...args];
+      const proc = Bun.spawn(cmd, {
+        stdout: "ignore",
+        stderr: "pipe",
+        env: buildSpawnEnv(),
+      });
+
+      let readablePath = tmpPath;
+      let availableBytes = 0;
+      let status: "downloading" | "completed" | "failed" = "downloading";
+      let failureError: Error | null = null;
+      let killReason: Error | null = null;
+      const startedAt = Date.now();
+      let lastProgressAt = startedAt;
+      let lastTouchedAt = startedAt;
+      let promoted = false;
+
+      type Waiter = {
+        minBytes: number;
+        resolve: () => void;
+        reject: (err: Error) => void;
+        cleanup: () => void;
+      };
+      const waiters = new Set<Waiter>();
+
+      const notifyWaiters = () => {
+        for (const w of [...waiters]) {
+          if (status === "failed") {
+            waiters.delete(w);
+            w.cleanup();
+            w.reject(failureError ?? new Error("Tier 3 progressive download failed"));
+          } else if (status === "completed" || availableBytes >= w.minBytes) {
+            waiters.delete(w);
+            w.cleanup();
+            w.resolve();
+          }
+        }
+      };
+
+      const terminateProc = (err: Error) => {
+        if (!killReason) killReason = err;
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // Process may have already exited
+        }
+      };
+
+      const pollTimer = setInterval(() => {
+        if (status !== "downloading") return;
+        const now = Date.now();
+        try {
+          const stat = fs.statSync(tmpPath);
+          if (stat.size > availableBytes) {
+            availableBytes = stat.size;
+            lastProgressAt = now;
+            notifyWaiters();
+          }
+        } catch {
+          // File not yet created
+        }
+
+        if (opts.maxBytes > 0 && availableBytes > opts.maxBytes) {
+          terminateProc(
+            new Error(
+              `Tier 3 progressive download exceeded maxCacheBytes (${availableBytes} > ${opts.maxBytes})`,
+            ),
+          );
+          return;
+        }
+        if (opts.expectedSize > 0 && availableBytes > opts.expectedSize) {
+          terminateProc(
+            new Error(
+              `Tier 3 progressive download exceeded expected size (${availableBytes} > ${opts.expectedSize})`,
+            ),
+          );
+          return;
+        }
+        if (now - lastProgressAt >= stallTimeoutMs) {
+          terminateProc(
+            new YtDlpError(
+              `Tier 3 progressive download stalled for ${stallTimeoutMs}ms`,
+              "timeout",
+              "",
+              null,
+            ),
+          );
+          return;
+        }
+        if (now - lastTouchedAt >= idleTimeoutMs) {
+          terminateProc(
+            new Error(`Tier 3 progressive download idle for ${idleTimeoutMs}ms; cancelling`),
+          );
+          return;
+        }
+        if (now - startedAt >= maxTotalTimeoutMs) {
+          terminateProc(
+            new YtDlpError(
+              `Tier 3 progressive download exceeded max duration (${maxTotalTimeoutMs}ms)`,
+              "timeout",
+              "",
+              null,
+            ),
+          );
+        }
+      }, 50);
+      pollTimer.unref?.();
+
+      const done = (async (): Promise<{ filePath: string; size: number }> => {
+        try {
+          const [stderr, exitCode] = await Promise.all([
+            new Response(proc.stderr).text().catch(() => ""),
+            proc.exited,
+          ]);
+          clearInterval(pollTimer);
+
+          if (killReason) {
+            throw killReason;
+          }
+
+          if (exitCode !== 0 || !fs.existsSync(tmpPath)) {
+            const kind = classifyYtDlpError(stderr);
+            throw new YtDlpError(
+              stderr.trim().split("\n").pop() || `yt-dlp download exited with code ${exitCode}`,
+              kind,
+              stderr,
+              exitCode,
+            );
+          }
+
+          const finalSize = fs.statSync(tmpPath).size;
+          if (finalSize <= 0) {
+            throw new Error("Tier 3 progressive download produced empty file");
+          }
+          if (opts.maxBytes > 0 && finalSize > opts.maxBytes) {
+            throw new Error(
+              `Tier 3 progressive download exceeded maxCacheBytes (${finalSize} > ${opts.maxBytes})`,
+            );
+          }
+          if (opts.expectedSize > 0 && finalSize !== opts.expectedSize) {
+            const mismatchErr = new Error(
+              `Tier 3 progressive download size mismatch (expected ${opts.expectedSize}, got ${finalSize})`,
+            );
+            mismatchErr.name = "SizeMismatchError";
+            throw mismatchErr;
+          }
+
+          fs.renameSync(tmpPath, outputPath);
+          promoted = true;
+          readablePath = outputPath;
+          availableBytes = finalSize;
+          status = "completed";
+          notifyWaiters();
+
+          logger.info("Tier 3 progressive download completed", {
+            videoId,
+            formatSelector: safeSelector,
+            outputPath,
+            size: finalSize,
+            elapsedMs: Date.now() - startedAt,
+          });
+          return { filePath: outputPath, size: finalSize };
+        } catch (err) {
+          clearInterval(pollTimer);
+          const errorObj = err instanceof Error ? err : new Error(String(err));
+          status = "failed";
+          failureError = errorObj;
+          if (!promoted) {
+            try {
+              if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+            } catch {
+              // Ignore
+            }
+          }
+          notifyWaiters();
+          throw errorObj;
+        }
+      })();
+
+      return {
+        videoId,
+        formatId: safeSelector,
+        mimeType: opts.mimeType,
+        expectedSize: opts.expectedSize,
+        done,
+        getReadablePath: () => readablePath,
+        getAvailableBytes: () => availableBytes,
+        getStatus: () => status,
+        getError: () => failureError,
+        touch: () => {
+          lastTouchedAt = Date.now();
+        },
+        cancel: (reason = "Cancelled") => {
+          if (status !== "downloading") return;
+          terminateProc(new Error(reason));
+        },
+        waitForBytes(minBytes: number, signal: AbortSignal | undefined, timeoutMs: number): Promise<void> {
+          lastTouchedAt = Date.now();
+          if (status === "failed") {
+            return Promise.reject(failureError ?? new Error("Tier 3 progressive download failed"));
+          }
+          if (status === "completed" || availableBytes >= minBytes) {
+            return Promise.resolve();
+          }
+          if (signal?.aborted) {
+            return Promise.reject(
+              signal.reason instanceof Error
+                ? signal.reason
+                : new DOMException("The operation was aborted.", "AbortError"),
+            );
+          }
+
+          return new Promise<void>((resolve, reject) => {
+            const onAbort = () => {
+              waiters.delete(waiter);
+              waiter.cleanup();
+              reject(
+                signal?.reason instanceof Error
+                  ? signal.reason
+                  : new DOMException("The operation was aborted.", "AbortError"),
+              );
+            };
+            const timer = setTimeout(() => {
+              waiters.delete(waiter);
+              waiter.cleanup();
+              reject(new Error(`Timed out waiting ${timeoutMs}ms for Tier 3 bytes (${minBytes})`));
+            }, timeoutMs);
+            timer.unref?.();
+
+            const waiter: Waiter = {
+              minBytes,
+              resolve,
+              reject,
+              cleanup: () => {
+                clearTimeout(timer);
+                signal?.removeEventListener("abort", onAbort);
+              },
+            };
+
+            signal?.addEventListener("abort", onAbort, { once: true });
+            waiters.add(waiter);
+          });
+        },
+      };
     },
   };
 }

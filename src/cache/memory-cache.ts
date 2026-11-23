@@ -114,12 +114,27 @@ export class Semaphore {
   }
 
   async run<T>(fn: () => Promise<T>): Promise<T> {
-    await this.acquire();
+    const release = await this.acquirePermit();
     try {
       return await fn();
     } finally {
-      this.release();
+      release();
     }
+  }
+
+  /**
+   * Acquire a semaphore permit and return an idempotent release function.
+   * Useful for background lifecycles (e.g. progressive downloads) that outlive
+   * the initial request handler.
+   */
+  async acquirePermit(): Promise<() => void> {
+    await this.acquire();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.release();
+    };
   }
 
   private acquire(): Promise<void> {

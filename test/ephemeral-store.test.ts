@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { EphemeralStore, parseHttpRangeHeader } from "../src/cache/ephemeral-store.ts";
+import {
+  EphemeralStore,
+  parseHttpRangeHeader,
+  type ProgressiveStreamSource,
+} from "../src/cache/ephemeral-store.ts";
 
 describe("EphemeralStore & HTTP Range parsing", () => {
   test("parses standard, open-ended, suffix, and unsatisfiable byte ranges", () => {
@@ -98,6 +102,152 @@ describe("EphemeralStore & HTTP Range parsing", () => {
       expect(fs.existsSync(p1)).toBe(true); // Pinned!
       expect(fs.existsSync(p2)).toBe(false); // Evicted LRU!
       expect(fs.existsSync(p3)).toBe(true);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("ref-counts concurrent pin() and unpin() calls safely", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-refpin-"));
+    try {
+      const store = new EphemeralStore(tmpDir, 1500, 60_000);
+      const p1 = store.getPathFor("vid1", "137", "mp4");
+      fs.writeFileSync(p1, new Uint8Array(1000));
+      store.register("vid1", "137", p1, "video/mp4");
+
+      const key1 = store.makeKey("vid1", "137");
+      const key2 = store.makeKey("vid2", "137");
+      store.pin(key1);
+      store.pin(key1);
+      store.unpin(key1);
+      expect(store.isPinned(key1)).toBe(true);
+
+      await new Promise((r) => setTimeout(r, 15));
+      store.pin(key2);
+      const p2 = store.getPathFor("vid2", "137", "mp4");
+      fs.writeFileSync(p2, new Uint8Array(1000));
+      store.register("vid2", "137", p2, "video/mp4");
+      // Both are pinned (total 2000 > 1500), so neither is evicted
+      expect(fs.existsSync(p1)).toBe(true);
+      expect(fs.existsSync(p2)).toBe(true);
+
+      // Second unpin on vid1 finally allows cleanup to evict oldest unpinned entry (vid1)
+      store.unpin(key1);
+      expect(store.isPinned(key1)).toBe(false);
+      store.cleanup();
+      expect(fs.existsSync(p1)).toBe(false);
+      expect(fs.existsSync(p2)).toBe(true);
+      store.unpin(key2);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("serveProgressive streams bytes live as file grows and across atomic rename", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-prog-"));
+    try {
+      const store = new EphemeralStore(tmpDir, 10 * 1024 * 1024, 60_000);
+      const finalPath = store.getPathFor("progVid1", "137", "mp4");
+      const tmpPath = `${finalPath}.1234.tmp.mp4`;
+
+      const fullData = new Uint8Array(400);
+      for (let i = 0; i < fullData.byteLength; i++) fullData[i] = i % 256;
+
+      // Start with only first 120 bytes written
+      fs.writeFileSync(tmpPath, fullData.subarray(0, 120));
+
+      let currentPath = tmpPath;
+      let available = 120;
+      let status: "downloading" | "completed" | "failed" = "downloading";
+      const waiters: Array<() => void> = [];
+
+      const wakeAll = () => {
+        for (const fn of waiters.splice(0)) fn();
+      };
+
+      const source: ProgressiveStreamSource = {
+        videoId: "progVid1",
+        formatId: "137",
+        mimeType: "video/mp4",
+        expectedSize: fullData.byteLength,
+        getReadablePath: () => currentPath,
+        getAvailableBytes: () => available,
+        getStatus: () => status,
+        getError: () => null,
+        touch: () => {},
+        waitForBytes(minBytes, signal, timeoutMs) {
+          if (status !== "downloading" || available >= minBytes) return Promise.resolve();
+          return new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("timeout")), timeoutMs);
+            const onAbort = () => {
+              clearTimeout(timer);
+              reject(new DOMException("Aborted", "AbortError"));
+            };
+            signal?.addEventListener("abort", onAbort, { once: true });
+            const check = () => {
+              if (status !== "downloading" || available >= minBytes) {
+                clearTimeout(timer);
+                signal?.removeEventListener("abort", onAbort);
+                resolve();
+              } else {
+                waiters.push(check);
+              }
+            };
+            waiters.push(check);
+          });
+        },
+      };
+
+      // HEAD returns 200 with full expected length
+      const headRes = await store.serveProgressive(
+        source,
+        new Request("http://127.0.0.1/videoplayback", { method: "HEAD" }),
+        1000,
+      );
+      expect(headRes.status).toBe(200);
+      expect(headRes.headers.get("content-length")).toBe("400");
+      expect(headRes.headers.get("x-steadytube-tier")).toBe("3-stream");
+
+      // Out-of-bounds range returns 416
+      const oobRes = await store.serveProgressive(
+        source,
+        new Request("http://127.0.0.1/videoplayback", { headers: { Range: "bytes=400-450" } }),
+        1000,
+      );
+      expect(oobRes.status).toBe(416);
+      expect(oobRes.headers.get("content-range")).toBe("bytes */400");
+
+      // Request bytes 100-299 while only 0..119 exist; append remaining bytes & rename mid-stream!
+      const resPromise = store.serveProgressive(
+        source,
+        new Request("http://127.0.0.1/videoplayback", { headers: { Range: "bytes=100-299" } }),
+        2000,
+      );
+
+      setTimeout(() => {
+        fs.appendFileSync(tmpPath, fullData.subarray(120, 260));
+        available = 260;
+        wakeAll();
+      }, 25);
+
+      setTimeout(() => {
+        fs.appendFileSync(tmpPath, fullData.subarray(260, 400));
+        fs.renameSync(tmpPath, finalPath);
+        currentPath = finalPath;
+        available = 400;
+        status = "completed";
+        wakeAll();
+      }, 60);
+
+      const rangeRes = await resPromise;
+      expect(rangeRes.status).toBe(206);
+      expect(rangeRes.headers.get("content-range")).toBe("bytes 100-299/400");
+      expect(rangeRes.headers.get("content-length")).toBe("200");
+      expect(rangeRes.headers.get("x-steadytube-tier")).toBe("3-stream");
+
+      const received = new Uint8Array(await rangeRes.arrayBuffer());
+      expect(received).toEqual(fullData.subarray(100, 300));
+      expect(store.isPinned(store.makeKey("progVid1", "137"))).toBe(false);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

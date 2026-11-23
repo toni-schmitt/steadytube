@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { AppConfig } from "../src/config.ts";
 import {
+  assertSafeFormatSelector,
   assertValidVideoId,
   buildWatchUrl,
   buildYtDlpBaseArgs,
@@ -118,11 +119,20 @@ describe("ytdlp arg builder & error classifier", () => {
     ).toBe("unavailable");
   });
 
-  test("validates video IDs and builds watch URLs safely", () => {
+  test("validates video IDs, format selectors, and builds watch URLs safely", () => {
     expect(assertValidVideoId("dQw4w9WgXcQ")).toBe("dQw4w9WgXcQ");
     expect(buildWatchUrl("dQw4w9WgXcQ")).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
     expect(() => assertValidVideoId("../../etc/passwd")).toThrow();
     expect(() => buildWatchUrl("abc&list=evil")).toThrow();
+
+    expect(assertSafeFormatSelector("313")).toBe("313");
+    expect(assertSafeFormatSelector("251-en-US")).toBe("251-en-US");
+    expect(assertSafeFormatSelector("bestvideo[height<=1080][ext=mp4]/bestvideo")).toBe(
+      "bestvideo[height<=1080][ext=mp4]/bestvideo",
+    );
+    expect(() => assertSafeFormatSelector("--exec")).toThrow();
+    expect(() => assertSafeFormatSelector("-o /tmp/pwn")).toThrow();
+    expect(() => assertSafeFormatSelector("313\n--exec")).toThrow();
   });
 
   test("resolves logical Firefox profile names from profiles.ini to salted directories", () => {
