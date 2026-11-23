@@ -17,15 +17,23 @@ function isRecoverableStatus(status: number): boolean {
  * Wraps an upstream ReadableStream with a per-chunk stall watchdog so that if
  * googlevideo.com stops sending bytes mid-segment, we abort cleanly and mark
  * the cached target stale for recovery on retry.
+ *
+ * Client-initiated aborts (`signal.aborted` or stream `cancel()`) never invoke
+ * `onStall`, avoiding false stale-marking when FreeTube/Shaka cancels a seek,
+ * quality switch, or timed-out segment fetch.
  */
-function withStallWatchdog(
+export function withStallWatchdog(
   source: ReadableStream<Uint8Array>,
   stallTimeoutMs: number,
+  signal: AbortSignal | undefined,
   onStall: () => void,
 ): ReadableStream<Uint8Array> {
   const reader = source.getReader();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stalled = false;
+  let cancelled = false;
+  let clientAborted = Boolean(signal?.aborted);
+  let stallReported = false;
 
   const clearTimer = () => {
     if (timer) {
@@ -34,12 +42,58 @@ function withStallWatchdog(
     }
   };
 
+  const reportStallOnce = () => {
+    if (stallReported || cancelled || clientAborted || signal?.aborted) return;
+    stallReported = true;
+    onStall();
+  };
+
+  const getAbortError = () =>
+    signal?.reason instanceof Error
+      ? signal.reason
+      : new DOMException("The operation was aborted.", "AbortError");
+
+  const onSignalAbort = () => {
+    clientAborted = true;
+    clearTimer();
+    reader.cancel(getAbortError()).catch(() => {});
+  };
+
+  const cleanup = () => {
+    clearTimer();
+    signal?.removeEventListener("abort", onSignalAbort);
+  };
+
+  if (signal && !signal.aborted) {
+    signal.addEventListener("abort", onSignalAbort, { once: true });
+  }
+
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
+      if (cancelled) {
+        cleanup();
+        return;
+      }
+      if (clientAborted || signal?.aborted) {
+        cleanup();
+        await reader.cancel(getAbortError()).catch(() => {});
+        try {
+          controller.error(getAbortError());
+        } catch {
+          // Already closed
+        }
+        return;
+      }
+
       clearTimer();
       timer = setTimeout(() => {
+        if (cancelled || clientAborted || signal?.aborted) {
+          cleanup();
+          return;
+        }
         stalled = true;
-        onStall();
+        cleanup();
+        reportStallOnce();
         reader.cancel(new Error("Upstream stream stalled")).catch(() => {});
         try {
           controller.error(new Error(`Upstream stream stalled for ${stallTimeoutMs}ms`));
@@ -51,22 +105,39 @@ function withStallWatchdog(
       try {
         const { done, value } = await reader.read();
         clearTimer();
-        if (stalled) return;
+        if (stalled || cancelled) return;
+        if (clientAborted || signal?.aborted) {
+          cleanup();
+          try {
+            controller.error(getAbortError());
+          } catch {
+            // Already closed
+          }
+          return;
+        }
         if (done) {
+          cleanup();
           controller.close();
         } else if (value) {
           controller.enqueue(value);
         }
       } catch (err) {
-        clearTimer();
-        if (!stalled) {
-          onStall();
-          controller.error(err);
+        cleanup();
+        if (!stalled && !cancelled) {
+          if (!clientAborted && !signal?.aborted) {
+            reportStallOnce();
+          }
+          try {
+            controller.error(clientAborted || signal?.aborted ? getAbortError() : err);
+          } catch {
+            // Already closed
+          }
         }
       }
     },
     async cancel(reason) {
-      clearTimer();
+      cancelled = true;
+      cleanup();
       await reader.cancel(reason).catch(() => {});
     },
   });
@@ -298,7 +369,9 @@ export class VideoPlaybackRoute {
     const guardedBody = withStallWatchdog(
       upstream.body,
       this.config.playback.streamStallTimeoutMs,
+      req.signal,
       () => {
+        if (req.signal.aborted) return;
         this.resolver.markTargetStale(target.videoId, target.formatId);
         this.logger.warn("Upstream stream stalled/errored mid-chunk; marked stale for recovery", {
           videoId: target.videoId,
@@ -353,7 +426,9 @@ export class VideoPlaybackRoute {
       const guardedBody = withStallWatchdog(
         upstream.body,
         this.config.playback.streamStallTimeoutMs,
+        req.signal,
         () => {
+          if (req.signal.aborted) return;
           this.logger.warn("Direct ?host= upstream stream stalled mid-chunk");
         },
       );
@@ -363,6 +438,9 @@ export class VideoPlaybackRoute {
         headers: outHeaders,
       });
     } catch {
+      if (req.signal.aborted) {
+        return new Response(null, { status: 499 });
+      }
       return new Response("Upstream proxy error", { status: 502 });
     }
   }

@@ -262,10 +262,13 @@ async function doSingleIpv4Request(
   return await new Promise((resolve, reject) => {
     let settled = false;
 
-    const onAbort = () => {
-      const abortErr = options.signal?.reason instanceof Error
+    const getAbortError = () =>
+      options.signal?.reason instanceof Error
         ? options.signal.reason
         : new DOMException("The operation was aborted.", "AbortError");
+
+    const onAbort = () => {
+      const abortErr = getAbortError();
       req.destroy(abortErr);
       if (!settled) {
         settled = true;
@@ -274,11 +277,7 @@ async function doSingleIpv4Request(
     };
 
     if (options.signal?.aborted) {
-      reject(
-        options.signal.reason instanceof Error
-          ? options.signal.reason
-          : new DOMException("The operation was aborted.", "AbortError"),
-      );
+      reject(getAbortError());
       return;
     }
 
@@ -314,10 +313,12 @@ async function doSingleIpv4Request(
     req.on("error", (err) => {
       clearTimeout(headerTimer);
       options.signal?.removeEventListener("abort", onAbort);
-      rotateIpv4OnError(url.hostname, ipv4);
+      if (!options.signal?.aborted) {
+        rotateIpv4OnError(url.hostname, ipv4);
+      }
       if (!settled) {
         settled = true;
-        reject(err);
+        reject(options.signal?.aborted ? getAbortError() : err);
       }
     });
 
@@ -405,7 +406,7 @@ async function doSingleIpv4Request(
             if (!closed) {
               closed = true;
               try {
-                controller.error(err);
+                controller.error(options.signal?.aborted ? getAbortError() : err);
               } catch {
                 // Already closed
               }
@@ -417,7 +418,11 @@ async function doSingleIpv4Request(
             if (!closed) {
               closed = true;
               try {
-                controller.error(new Error("Upstream connection aborted"));
+                controller.error(
+                  options.signal?.aborted
+                    ? getAbortError()
+                    : new Error("Upstream connection aborted"),
+                );
               } catch {
                 // Already closed
               }
