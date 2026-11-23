@@ -28,8 +28,13 @@ export interface ProgressiveStreamSource {
   getStatus(): "downloading" | "completed" | "failed";
   getError(): Error | null;
   touch(): void;
+  cancel?(reason?: string): void;
+  onReaderStart?(): void;
+  onReaderEnd?(): void;
   waitForBytes(minBytes: number, signal: AbortSignal | undefined, timeoutMs: number): Promise<void>;
 }
+
+const MAX_PROGRESSIVE_SEEK_AHEAD_BYTES = 64 * 1024 * 1024; // 64 MiB
 
 /**
  * Parse HTTP Range header per RFC 9110 §14.2:
@@ -95,6 +100,7 @@ export class EphemeralStore {
   private readonly resolvedBaseDir: string;
   private readonly entries = new Map<string, EphemeralFileEntry>();
   private readonly pinnedCounts = new Map<string, number>();
+  private readonly reservedBytesByKey = new Map<string, number>();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -141,7 +147,9 @@ export class EphemeralStore {
   }
 
   makeKey(videoId: string, formatId: string): string {
-    return `${videoId}:${formatId}`;
+    const safeVideo = videoId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
+    const safeFormat = formatId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
+    return `${safeVideo}:${safeFormat}`;
   }
 
   pin(key: string): void {
@@ -159,6 +167,75 @@ export class EphemeralStore {
 
   isPinned(key: string): boolean {
     return (this.pinnedCounts.get(key) ?? 0) > 0;
+  }
+
+  getReservedBytes(): number {
+    let sum = 0;
+    for (const bytes of this.reservedBytesByKey.values()) {
+      sum += bytes;
+    }
+    return sum;
+  }
+
+  /**
+   * Reserve space in the shared disk budget before starting a Tier 3 writer
+   * (progressive download, fallback download, or remux). Evicts unpinned
+   * completed entries first if needed to fit within `maxCacheBytes`.
+   */
+  reserveBytes(key: string, bytes: number): boolean {
+    const needed = Math.max(0, Math.ceil(bytes));
+    const existingForKey = this.reservedBytesByKey.get(key) ?? 0;
+    const otherReserved = this.getReservedBytes() - existingForKey;
+    if (otherReserved + needed > this.maxCacheBytes) {
+      return false;
+    }
+
+    // Fail before evicting unpinned entries if pinned entries already make the reservation impossible
+    let pinnedBytes = 0;
+    for (const entry of this.entries.values()) {
+      if (entry.key !== key && this.isPinned(entry.key)) {
+        pinnedBytes += entry.size;
+      }
+    }
+    if (pinnedBytes + otherReserved + needed > this.maxCacheBytes) {
+      return false;
+    }
+
+    // Evict expired/LRU unpinned completed entries to make room for reserved writers
+    this.cleanup(otherReserved + needed);
+
+    let registeredBytes = 0;
+    for (const entry of this.entries.values()) {
+      if (entry.key !== key) {
+        registeredBytes += entry.size;
+      }
+    }
+    if (registeredBytes + otherReserved + needed > this.maxCacheBytes) {
+      return false;
+    }
+
+    this.reservedBytesByKey.set(key, needed);
+    return true;
+  }
+
+  releaseReservation(key: string): void {
+    this.reservedBytesByKey.delete(key);
+  }
+
+  /**
+   * Remaining disk budget for an unknown-size writer after accounting for pinned
+   * entries and other active reservations (evicting unpinned entries as needed).
+   */
+  getAvailableBudgetFor(key: string): number {
+    const existingForKey = this.reservedBytesByKey.get(key) ?? 0;
+    const otherReserved = this.getReservedBytes() - existingForKey;
+    let pinnedBytes = 0;
+    for (const entry of this.entries.values()) {
+      if (entry.key !== key && this.isPinned(entry.key)) {
+        pinnedBytes += entry.size;
+      }
+    }
+    return Math.max(0, this.maxCacheBytes - pinnedBytes - otherReserved);
   }
 
   register(videoId: string, formatId: string, filePath: string, mimeType: string): EphemeralFileEntry {
@@ -236,75 +313,102 @@ export class EphemeralStore {
       });
     }
 
-    const contentLength = parsed.end - parsed.start + 1;
+    const contentLength = parsed.isPartial ? parsed.end - parsed.start + 1 : totalSize;
 
-    if (parsed.isPartial) {
-      // Backpressure-aware bounded ReadStream so slow players never pull huge files into RAM
-      const nodeStream = fs.createReadStream(entry.filePath, {
-        start: parsed.start,
-        end: parsed.end,
-        highWaterMark: 64 * 1024,
-      });
-      const body = new ReadableStream<Uint8Array>({
-        start(controller) {
-          let closed = false;
-          nodeStream.on("data", (chunk: string | Buffer) => {
-            if (closed) return;
-            const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-            try {
-              controller.enqueue(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
-              if (controller.desiredSize !== null && controller.desiredSize <= 0) {
-                nodeStream.pause();
-              }
-            } catch {
-              closed = true;
-              nodeStream.destroy();
-            }
-          });
-          nodeStream.on("end", () => {
-            if (!closed) {
-              closed = true;
-              try {
-                controller.close();
-              } catch {
-                // Already closed
-              }
-            }
-          });
-          nodeStream.on("error", (err) => {
-            if (!closed) {
-              closed = true;
-              try {
-                controller.error(err);
-              } catch {
-                // Already closed
-              }
-            }
-          });
-        },
-        pull() {
-          nodeStream.resume();
-        },
-        cancel() {
-          nodeStream.destroy();
-        },
-      });
-      return new Response(body, {
-        status: 206,
+    if (!parsed.isPartial && totalSize === 0) {
+      return new Response(null, {
+        status: 200,
         headers: {
           ...commonHeaders,
-          "Content-Length": String(contentLength),
-          "Content-Range": `bytes ${parsed.start}-${parsed.end}/${totalSize}`,
+          "Content-Length": "0",
         },
       });
     }
 
-    return new Response(Bun.file(entry.filePath), {
-      status: 200,
-      headers: {
-        ...commonHeaders,
-        "Content-Length": String(totalSize),
+    // Pin the entry for the lifetime of this stream so quota cleanup cannot
+    // unlink it before fs.createReadStream opens the descriptor.
+    this.pin(entry.key);
+    let unpinned = false;
+    const unpinOnce = () => {
+      if (!unpinned) {
+        unpinned = true;
+        this.unpin(entry.key);
+      }
+    };
+
+    // Backpressure-aware bounded ReadStream so slow players never pull huge files into RAM
+    const nodeStream = parsed.isPartial
+      ? fs.createReadStream(entry.filePath, {
+          start: parsed.start,
+          end: parsed.end,
+          highWaterMark: 64 * 1024,
+        })
+      : fs.createReadStream(entry.filePath, {
+          highWaterMark: 64 * 1024,
+        });
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        let closed = false;
+        nodeStream.on("data", (chunk: string | Buffer) => {
+          if (closed) return;
+          const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+          try {
+            controller.enqueue(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+            if (controller.desiredSize !== null && controller.desiredSize <= 0) {
+              nodeStream.pause();
+            }
+          } catch {
+            closed = true;
+            nodeStream.destroy();
+            unpinOnce();
+          }
+        });
+        nodeStream.on("end", () => {
+          unpinOnce();
+          if (!closed) {
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // Already closed
+            }
+          }
+        });
+        nodeStream.on("close", () => {
+          unpinOnce();
+        });
+        nodeStream.on("error", (err) => {
+          unpinOnce();
+          if (!closed) {
+            closed = true;
+            try {
+              controller.error(err);
+            } catch {
+              // Already closed
+            }
+          }
+        });
       },
+      pull() {
+        nodeStream.resume();
+      },
+      cancel() {
+        nodeStream.destroy();
+        unpinOnce();
+      },
+    });
+
+    const outHeaders: Record<string, string> = {
+      ...commonHeaders,
+      "Content-Length": String(contentLength),
+    };
+    if (parsed.isPartial) {
+      outHeaders["Content-Range"] = `bytes ${parsed.start}-${parsed.end}/${totalSize}`;
+    }
+
+    return new Response(body, {
+      status: parsed.isPartial ? 206 : 200,
+      headers: outHeaders,
     });
   }
 
@@ -354,11 +458,29 @@ export class EphemeralStore {
       });
     }
 
+    // Fail fast if a seek jumps far ahead of the active sequential download frontier
+    if (
+      source.getStatus() === "downloading" &&
+      parsed.start - source.getAvailableBytes() > MAX_PROGRESSIVE_SEEK_AHEAD_BYTES
+    ) {
+      return new Response("Requested range too far ahead of progressive download", { status: 503 });
+    }
+
     // Wait until at least the first requested byte is on disk before committing 206/200 headers
     const neededInitialBytes = parsed.start + 1;
+    source.onReaderStart?.();
+    let readerTrackingActive = true;
+    const endReaderTracking = () => {
+      if (readerTrackingActive) {
+        readerTrackingActive = false;
+        source.onReaderEnd?.();
+      }
+    };
+
     try {
       await source.waitForBytes(neededInitialBytes, req.signal, stallTimeoutMs);
     } catch {
+      endReaderTracking();
       if (req.signal.aborted) {
         return new Response(null, { status: 499 });
       }
@@ -366,14 +488,17 @@ export class EphemeralStore {
     }
 
     if (req.signal.aborted) {
+      endReaderTracking();
       return new Response(null, { status: 499 });
     }
 
     if (source.getStatus() === "failed") {
+      endReaderTracking();
       return new Response("Tier 3 progressive stream failed", { status: 503 });
     }
 
     if (source.getAvailableBytes() < neededInitialBytes) {
+      endReaderTracking();
       return new Response("Tier 3 progressive stream truncated", { status: 503 });
     }
 
@@ -390,11 +515,32 @@ export class EphemeralStore {
           this.assertContainedPath(retryPath);
           openFd = fs.openSync(retryPath, "r");
         } catch {
+          endReaderTracking();
           return new Response("Tier 3 progressive file unavailable", { status: 503 });
         }
       } else {
+        endReaderTracking();
         return new Response("Tier 3 progressive file unavailable", { status: 503 });
       }
+    }
+
+    // Verify the opened inode actually contains the advertised starting byte (guards against truncation)
+    try {
+      const initialFdSize = fs.fstatSync(openFd).size;
+      if (initialFdSize < neededInitialBytes) {
+        fs.closeSync(openFd);
+        endReaderTracking();
+        source.cancel?.("Tier 3 staging file truncated before stream start");
+        return new Response("Tier 3 progressive stream truncated", { status: 503 });
+      }
+    } catch {
+      try {
+        fs.closeSync(openFd);
+      } catch {
+        // Ignore
+      }
+      endReaderTracking();
+      return new Response("Tier 3 progressive file unavailable", { status: 503 });
     }
 
     const contentLength = parsed.end - parsed.start + 1;
@@ -426,6 +572,7 @@ export class EphemeralStore {
         unpinned = true;
         this.unpin(pinKey);
       }
+      endReaderTracking();
       signal.removeEventListener("abort", onAbort);
     };
 
@@ -469,6 +616,12 @@ export class EphemeralStore {
                 }
                 return;
               }
+              // File reported fdSize > cursor yet read 0 bytes (truncated/reopened concurrently)
+              closed = true;
+              closeFd();
+              source.cancel?.("Tier 3 staging file truncated during read");
+              controller.error(new Error("Tier 3 progressive file truncated mid-stream"));
+              return;
             }
 
             const status = source.getStatus();
@@ -487,6 +640,18 @@ export class EphemeralStore {
               closed = true;
               closeFd();
               controller.error(new Error("Tier 3 progressive stream ended shorter than expected range"));
+              return;
+            }
+
+            // CRITICAL guard against non-append-only producer truncation:
+            // If the producer still advertises >= cursor + 1 bytes while the open inode is
+            // shorter, waitForBytes(cursor + 1) would resolve synchronously in a tight
+            // microtask loop and hang the event loop. Fail immediately instead.
+            if (source.getAvailableBytes() >= cursor + 1) {
+              closed = true;
+              closeFd();
+              source.cancel?.("Tier 3 staging file shorter than advertised bytes");
+              controller.error(new Error("Tier 3 progressive file truncated below advertised length"));
               return;
             }
 
@@ -528,7 +693,7 @@ export class EphemeralStore {
     });
   }
 
-  cleanup(): { removedCount: number; freedBytes: number } {
+  cleanup(extraReservedBytes = this.getReservedBytes()): { removedCount: number; freedBytes: number } {
     const now = Date.now();
     let removedCount = 0;
     let freedBytes = 0;
@@ -546,12 +711,13 @@ export class EphemeralStore {
       totalBytes += entry.size;
     }
 
-    if (totalBytes > this.maxCacheBytes) {
+    const effectiveCap = Math.max(0, this.maxCacheBytes - Math.max(0, extraReservedBytes));
+    if (totalBytes > effectiveCap) {
       const sorted = [...this.entries.values()].sort(
         (a, b) => a.lastAccessedAt - b.lastAccessedAt,
       );
       for (const entry of sorted) {
-        if (totalBytes <= this.maxCacheBytes) break;
+        if (totalBytes <= effectiveCap) break;
         if (this.isPinned(entry.key)) continue;
         const freed = this.removeEntry(entry.key, entry);
         totalBytes -= freed;

@@ -252,4 +252,217 @@ describe("EphemeralStore & HTTP Range parsing", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test("serveProgressive fails fast without hanging when staging file is truncated mid-stream", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-trunc-"));
+    try {
+      const store = new EphemeralStore(tmpDir, 10 * 1024 * 1024, 60_000);
+      const finalPath = store.getPathFor("truncVid1", "313", "webm");
+      const tmpPath = `${finalPath}.1234.tmp.webm`;
+
+      // Case A: File truncated BEFORE stream start (advertised 200 bytes, disk inode only has 80 bytes)
+      fs.writeFileSync(tmpPath, new Uint8Array(80).fill(0x55));
+      let preCancelReason: string | null = null;
+      const preTruncSource: ProgressiveStreamSource = {
+        videoId: "truncVid1",
+        formatId: "313",
+        mimeType: "video/webm",
+        expectedSize: 400,
+        getReadablePath: () => tmpPath,
+        getAvailableBytes: () => 200,
+        getStatus: () => "downloading",
+        getError: () => null,
+        touch: () => {},
+        cancel: (reason) => {
+          preCancelReason = reason ?? "cancelled";
+        },
+        waitForBytes: () => Promise.resolve(),
+      };
+      const preRes = await store.serveProgressive(
+        preTruncSource,
+        new Request("http://127.0.0.1/videoplayback", { headers: { Range: "bytes=100-199" } }),
+        1000,
+      );
+      expect(preRes.status).toBe(503);
+      expect(preCancelReason).not.toBeNull();
+
+      // Case B: File starts with 120 bytes (requested 0-399), then shrinks to 80 while producer
+      // still advertises 250 bytes -> second pull MUST fail immediately instead of spinning!
+      fs.writeFileSync(tmpPath, new Uint8Array(120).fill(0x55));
+      let advertised = 120;
+      let cancelReason: string | null = null;
+      let readerStarts = 0;
+      let readerEnds = 0;
+      const waiters: Array<() => void> = [];
+      const source: ProgressiveStreamSource = {
+        videoId: "truncVid1",
+        formatId: "313",
+        mimeType: "video/webm",
+        expectedSize: 400,
+        getReadablePath: () => tmpPath,
+        getAvailableBytes: () => advertised,
+        getStatus: () => "downloading",
+        getError: () => null,
+        touch: () => {},
+        onReaderStart: () => {
+          readerStarts++;
+        },
+        onReaderEnd: () => {
+          readerEnds++;
+        },
+        cancel: (reason) => {
+          cancelReason = reason ?? "cancelled";
+        },
+        waitForBytes(minBytes) {
+          if (advertised >= minBytes) return Promise.resolve();
+          return new Promise<void>((resolve) => {
+            waiters.push(resolve);
+          });
+        },
+      };
+
+      const res = await store.serveProgressive(
+        source,
+        new Request("http://127.0.0.1/videoplayback", { headers: { Range: "bytes=0-399" } }),
+        1000,
+      );
+      expect(res.status).toBe(206);
+
+      const reader = res.body!.getReader();
+      const first = await reader.read();
+      expect(first.done).toBe(false);
+      expect(first.value?.byteLength).toBe(120);
+
+      // Now truncate disk file to 80 bytes while producer falsely advertises 250 bytes
+      fs.truncateSync(tmpPath, 80);
+      advertised = 250;
+      for (const wake of waiters.splice(0)) wake();
+
+      let caught: Error | null = null;
+      try {
+        await reader.read();
+      } catch (err) {
+        caught = err as Error;
+      }
+      expect(caught).not.toBeNull();
+      expect(caught!.message).toContain("truncated");
+      expect(cancelReason).not.toBeNull();
+      expect(readerStarts).toBe(1);
+      expect(readerEnds).toBe(1);
+      expect(store.isPinned(store.makeKey("truncVid1", "313"))).toBe(false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("serveProgressive rejects seeks >64 MiB ahead of download frontier immediately", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-seek-"));
+    try {
+      const store = new EphemeralStore(tmpDir, 200 * 1024 * 1024, 60_000);
+      const finalPath = store.getPathFor("seekVid1", "313", "webm");
+      let waited = false;
+      const source: ProgressiveStreamSource = {
+        videoId: "seekVid1",
+        formatId: "313",
+        mimeType: "video/webm",
+        expectedSize: 120 * 1024 * 1024,
+        getReadablePath: () => finalPath,
+        getAvailableBytes: () => 1024 * 1024, // 1 MiB downloaded
+        getStatus: () => "downloading",
+        getError: () => null,
+        touch: () => {},
+        waitForBytes: async () => {
+          waited = true;
+        },
+      };
+
+      const res = await store.serveProgressive(
+        source,
+        new Request("http://127.0.0.1/videoplayback", {
+          headers: { Range: `bytes=${80 * 1024 * 1024}-${80 * 1024 * 1024 + 1023}` },
+        }),
+        1000,
+      );
+      expect(res.status).toBe(503);
+      expect(waited).toBe(false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("reserveBytes accounts for concurrent reservations, evicts unpinned entries, and respects pins", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-resv-"));
+    try {
+      const store = new EphemeralStore(tmpDir, 2000, 60_000);
+      const p1 = store.getPathFor("vid1", "137", "mp4");
+      fs.writeFileSync(p1, new Uint8Array(1000));
+      store.register("vid1", "137", p1, "video/mp4");
+
+      // Reserving 1500 evicts unpinned vid1 (1000) so 1500 <= 2000 fits
+      expect(store.reserveBytes("vid2:137", 1500)).toBe(true);
+      expect(fs.existsSync(p1)).toBe(false);
+      expect(store.getReservedBytes()).toBe(1500);
+
+      // Second concurrent reservation of 600 exceeds shared 2000 cap -> rejected
+      expect(store.reserveBytes("vid3:137", 600)).toBe(false);
+      expect(store.getAvailableBudgetFor("vid3:137")).toBe(500);
+
+      // Releasing first reservation frees budget
+      store.releaseReservation("vid2:137");
+      expect(store.reserveBytes("vid3:137", 1200)).toBe(true);
+
+      // Pinned entry prevents over-reserving without needlessly evicting other unpinned entries
+      const p4 = store.getPathFor("vid4", "137", "mp4");
+      fs.writeFileSync(p4, new Uint8Array(400));
+      store.register("vid4", "137", p4, "video/mp4");
+      const p5 = store.getPathFor("vid5", "137", "mp4");
+      fs.writeFileSync(p5, new Uint8Array(400));
+      store.register("vid5", "137", p5, "video/mp4");
+      store.pin(store.makeKey("vid4", "137"));
+
+      // Reserved (1200) + pinned vid4 (400) + requested (500) = 2100 > 2000 -> fails cleanly without evicting vid5
+      expect(store.reserveBytes("vid6:137", 500)).toBe(false);
+      expect(fs.existsSync(p5)).toBe(true);
+      store.unpin(store.makeKey("vid4", "137"));
+      store.releaseReservation("vid3:137");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("makeKey matches sanitized filenames across restart scan and serveFile pins active streams", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-keynorm-"));
+    try {
+      const store1 = new EphemeralStore(tmpDir, 1500, 60_000);
+      const p1 = store1.getPathFor("vidA", "251-en.4", "webm");
+      fs.writeFileSync(p1, new Uint8Array(1000).fill(7));
+      store1.register("vidA", "251-en.4", p1, "audio/webm");
+
+      // Reopen store from disk: scanExistingFiles must recover the same normalized key
+      const store2 = new EphemeralStore(tmpDir, 1500, 60_000);
+      const recovered = store2.get("vidA", "251-en.4");
+      expect(recovered).not.toBeNull();
+      expect(recovered!.filePath).toBe(p1);
+
+      // Start serving a partial response; entry must stay pinned until body finishes/cancels
+      const res = store2.serveFile(
+        recovered!,
+        new Request("http://127.0.0.1/videoplayback", { headers: { Range: "bytes=0-499" } }),
+      );
+      expect(store2.isPinned(recovered!.key)).toBe(true);
+
+      // Registering another 1000-byte entry must NOT evict the currently streaming entry
+      const p2 = store2.getPathFor("vidB", "140", "m4a");
+      fs.writeFileSync(p2, new Uint8Array(1000).fill(9));
+      store2.register("vidB", "140", p2, "audio/mp4");
+      expect(fs.existsSync(p1)).toBe(true);
+
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      expect(bytes.byteLength).toBe(500);
+      // After stream completes, pin is released
+      expect(store2.isPinned(recovered!.key)).toBe(false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

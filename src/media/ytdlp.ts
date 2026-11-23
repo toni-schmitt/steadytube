@@ -367,6 +367,21 @@ export function createYtDlpRunner(
     return available;
   }
 
+  async function awaitWithGrace<T>(promise: Promise<T>, graceMs: number, fallback: T): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((resolve) => {
+          timer = setTimeout(() => resolve(fallback), graceMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   async function spawnYtDlp(
     args: string[],
     timeoutMs: number,
@@ -375,16 +390,7 @@ export function createYtDlpRunner(
     const proc = Bun.spawn(cmd, {
       stdout: "pipe",
       stderr: "pipe",
-      env: {
-        ...process.env,
-        PATH: [
-          "/opt/homebrew/bin",
-          "/usr/local/bin",
-          `${process.env.HOME || ""}/.local/bin`,
-          `${process.env.HOME || ""}/.bun/bin`,
-          process.env.PATH || "/usr/bin:/bin",
-        ].join(":"),
-      },
+      env: buildSpawnEnv(),
     });
 
     let timedOut = false;
@@ -398,12 +404,18 @@ export function createYtDlpRunner(
     }, timeoutMs);
 
     try {
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
+      // Drain pipes concurrently while the process runs, but bound pipe wait after exit
+      // so an orphaned grandchild holding stdout/stderr open cannot hang the daemon.
+      const stdoutPromise = new Response(proc.stdout).text().catch(() => "");
+      const stderrPromise = new Response(proc.stderr).text().catch(() => "");
+      const exitCode = await proc.exited;
       clearTimeout(timer);
+
+      const graceMs = timedOut ? 100 : 500;
+      const [stdout, stderr] = await Promise.all([
+        awaitWithGrace(stdoutPromise, graceMs, ""),
+        awaitWithGrace(stderrPromise, graceMs, ""),
+      ]);
 
       if (timedOut) {
         throw new YtDlpError(
@@ -569,7 +581,7 @@ export function createYtDlpRunner(
       });
 
       const stallTimeoutMs = opts.stallTimeoutMs ?? Math.max(30_000, config.playback.streamStallTimeoutMs * 2);
-      const idleTimeoutMs = opts.idleTimeoutMs ?? 60_000;
+      const idleTimeoutMs = opts.idleTimeoutMs ?? 5 * 60_000;
       const maxTotalTimeoutMs = opts.maxTotalTimeoutMs ?? 10 * 60_000;
 
       const cmd = [config.binaries.ytDlp, ...args];
@@ -587,6 +599,7 @@ export function createYtDlpRunner(
       const startedAt = Date.now();
       let lastProgressAt = startedAt;
       let lastTouchedAt = startedAt;
+      let activeReaders = 0;
       let promoted = false;
 
       type Waiter = {
@@ -611,13 +624,25 @@ export function createYtDlpRunner(
         }
       };
 
-      const terminateProc = (err: Error) => {
+      const terminateProc = (err: Error, unlinkSyncNow = false) => {
+        if (status !== "downloading") return;
         if (!killReason) killReason = err;
+        status = "failed";
+        failureError = killReason;
+        clearInterval(pollTimer);
         try {
           proc.kill("SIGKILL");
         } catch {
           // Process may have already exited
         }
+        if (unlinkSyncNow && !promoted) {
+          try {
+            if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+          } catch {
+            // Ignore
+          }
+        }
+        notifyWaiters();
       };
 
       const pollTimer = setInterval(() => {
@@ -625,12 +650,24 @@ export function createYtDlpRunner(
         const now = Date.now();
         try {
           const stat = fs.statSync(tmpPath);
+          if (stat.size < availableBytes) {
+            terminateProc(
+              new Error(
+                `Tier 3 staging file truncated mid-download (${stat.size} < ${availableBytes})`,
+              ),
+            );
+            return;
+          }
           if (stat.size > availableBytes) {
             availableBytes = stat.size;
             lastProgressAt = now;
             notifyWaiters();
           }
         } catch {
+          if (availableBytes > 0) {
+            terminateProc(new Error("Tier 3 staging file disappeared mid-download"));
+            return;
+          }
           // File not yet created
         }
 
@@ -661,10 +698,10 @@ export function createYtDlpRunner(
           );
           return;
         }
-        if (now - lastTouchedAt >= idleTimeoutMs) {
-          terminateProc(
-            new Error(`Tier 3 progressive download idle for ${idleTimeoutMs}ms; cancelling`),
-          );
+        if (activeReaders === 0 && now - lastTouchedAt >= idleTimeoutMs) {
+          const idleErr = new Error(`Tier 3 progressive download idle for ${idleTimeoutMs}ms; cancelling`);
+          idleErr.name = "IdleCancelledError";
+          terminateProc(idleErr);
           return;
         }
         if (now - startedAt >= maxTotalTimeoutMs) {
@@ -682,15 +719,15 @@ export function createYtDlpRunner(
 
       const done = (async (): Promise<{ filePath: string; size: number }> => {
         try {
-          const [stderr, exitCode] = await Promise.all([
-            new Response(proc.stderr).text().catch(() => ""),
-            proc.exited,
-          ]);
+          const stderrPromise = new Response(proc.stderr).text().catch(() => "");
+          const exitCode = await proc.exited;
           clearInterval(pollTimer);
 
           if (killReason) {
             throw killReason;
           }
+
+          const stderr = await awaitWithGrace(stderrPromise, 500, "");
 
           if (exitCode !== 0 || !fs.existsSync(tmpPath)) {
             const kind = classifyYtDlpError(stderr);
@@ -764,9 +801,17 @@ export function createYtDlpRunner(
         touch: () => {
           lastTouchedAt = Date.now();
         },
+        onReaderStart: () => {
+          activeReaders++;
+          lastTouchedAt = Date.now();
+        },
+        onReaderEnd: () => {
+          activeReaders = Math.max(0, activeReaders - 1);
+          lastTouchedAt = Date.now();
+        },
         cancel: (reason = "Cancelled") => {
           if (status !== "downloading") return;
-          terminateProc(new Error(reason));
+          terminateProc(new Error(reason), true);
         },
         waitForBytes(minBytes: number, signal: AbortSignal | undefined, timeoutMs: number): Promise<void> {
           lastTouchedAt = Date.now();
