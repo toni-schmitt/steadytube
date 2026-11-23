@@ -3,11 +3,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  hasValidGlobalMp4Sidx,
   parseCuesElementHeaderAt,
   parseMp4DashRanges,
   parseWebmDashRanges,
   probeLocalFileDashRanges,
+  probeRemoteDashRanges,
 } from "../src/media/container-probe.ts";
+import type { Ipv4FetchOptions } from "../src/net/ipv4-fetch.ts";
 
 function makeMp4Box(type: string, payloadSize: number): Uint8Array {
   const total = 8 + payloadSize;
@@ -20,7 +23,7 @@ function makeMp4Box(type: string, payloadSize: number): Uint8Array {
   return buf;
 }
 
-function concatBytes(...arrays: Uint8Array[]): Uint8Array {
+function concatBytes(...arrays: Uint8Array[]): Uint8Array<ArrayBuffer> {
   const len = arrays.reduce((sum, a) => sum + a.byteLength, 0);
   const out = new Uint8Array(len);
   let offset = 0;
@@ -137,6 +140,209 @@ describe("container-probe", () => {
       expect(ranges!.index).toBe("236-303");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("hasValidGlobalMp4Sidx accepts single global sidx and rejects per-fragment or partial sidx", () => {
+    const makeSidxBox = (
+      refSizes: number[],
+      opts?: { version?: 0 | 1; firstOffset?: number; referenceType?: 0 | 1 },
+    ): Uint8Array => {
+      const version = opts?.version ?? 0;
+      const fixedLen = version === 0 ? 24 : 32;
+      const total = 8 + fixedLen + refSizes.length * 12;
+      const buf = new Uint8Array(total);
+      const view = new DataView(buf.buffer);
+      view.setUint32(0, total, false);
+      buf.set([0x73, 0x69, 0x64, 0x78], 4); // "sidx"
+      buf[8] = version;
+      view.setUint32(12, 1, false); // reference_ID
+      view.setUint32(16, 1000, false); // timescale
+      const firstOff = opts?.firstOffset ?? 0;
+      let refCountPos: number;
+      if (version === 0) {
+        view.setUint32(20, 0, false); // earliest_presentation_time
+        view.setUint32(24, firstOff, false); // first_offset
+        refCountPos = 30;
+      } else {
+        view.setUint32(28, 0, false);
+        view.setUint32(32, firstOff, false);
+        refCountPos = 38;
+      }
+      view.setUint16(refCountPos, refSizes.length, false);
+      const refTypeBit = (opts?.referenceType ?? 0) << 31;
+      for (let i = 0; i < refSizes.length; i++) {
+        const pos = refCountPos + 2 + i * 12;
+        view.setUint32(pos, (refTypeBit | (refSizes[i]! & 0x7fffffff)) >>> 0, false);
+        view.setUint32(pos + 4, 1000, false);
+      }
+      return buf;
+    };
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-sidx-"));
+    try {
+      const ftyp = makeMp4Box("ftyp", 16);
+      const moov = makeMp4Box("moov", 120);
+      const frag1 = concatBytes(makeMp4Box("moof", 40), makeMp4Box("mdat", 100));
+      const frag2 = concatBytes(makeMp4Box("moof", 40), makeMp4Box("mdat", 120));
+
+      // Valid global sidx covering both fragments (v0 and v1)
+      const validV0Path = path.join(tmpDir, "valid-v0.mp4");
+      fs.writeFileSync(
+        validV0Path,
+        concatBytes(ftyp, moov, makeSidxBox([frag1.byteLength, frag2.byteLength], { version: 0 }), frag1, frag2),
+      );
+      expect(hasValidGlobalMp4Sidx(validV0Path)).toBe(true);
+
+      const validV1Path = path.join(tmpDir, "valid-v1.mp4");
+      fs.writeFileSync(
+        validV1Path,
+        concatBytes(ftyp, moov, makeSidxBox([frag1.byteLength, frag2.byteLength], { version: 1 }), frag1, frag2),
+      );
+      expect(hasValidGlobalMp4Sidx(validV1Path)).toBe(true);
+
+      // Per-fragment multi-sidx (FFmpeg without +global_sidx) -> MUST be rejected!
+      const perFragPath = path.join(tmpDir, "per-frag.mp4");
+      fs.writeFileSync(
+        perFragPath,
+        concatBytes(
+          ftyp,
+          moov,
+          makeSidxBox([frag1.byteLength]),
+          frag1,
+          makeSidxBox([frag2.byteLength]),
+          frag2,
+        ),
+      );
+      expect(hasValidGlobalMp4Sidx(perFragPath)).toBe(false);
+
+      // Single sidx covering ONLY fragment 1 while fragment 2 follows -> MUST be rejected!
+      const partialPath = path.join(tmpDir, "partial.mp4");
+      fs.writeFileSync(
+        partialPath,
+        concatBytes(ftyp, moov, makeSidxBox([frag1.byteLength]), frag1, frag2),
+      );
+      expect(hasValidGlobalMp4Sidx(partialPath)).toBe(false);
+
+      // Hierarchical reference_type=1 -> MUST be rejected!
+      const hierPath = path.join(tmpDir, "hier.mp4");
+      fs.writeFileSync(
+        hierPath,
+        concatBytes(
+          ftyp,
+          moov,
+          makeSidxBox([frag1.byteLength + frag2.byteLength], { referenceType: 1 }),
+          frag1,
+          frag2,
+        ),
+      );
+      expect(hasValidGlobalMp4Sidx(hierPath)).toBe(false);
+
+      // Real FFmpeg verification if ffmpeg is installed locally
+      const ffmpegBin =
+        Bun.which("ffmpeg") ||
+        (fs.existsSync("/opt/homebrew/bin/ffmpeg") ? "/opt/homebrew/bin/ffmpeg" : null);
+      if (ffmpegBin) {
+        const srcMp4 = path.join(tmpDir, "src.mp4");
+        const badRemux = path.join(tmpDir, "bad-remux.mp4");
+        const goodRemux = path.join(tmpDir, "good-remux.mp4");
+
+        const gen = Bun.spawnSync([
+          ffmpegBin,
+          "-y",
+          "-f",
+          "lavfi",
+          "-i",
+          "testsrc=duration=2.5:size=160x90:rate=10",
+          "-g",
+          "10",
+          "-c:v",
+          "libx264",
+          "-pix_fmt",
+          "yuv420p",
+          srcMp4,
+        ]);
+        if (gen.exitCode === 0) {
+          Bun.spawnSync([
+            ffmpegBin,
+            "-y",
+            "-i",
+            srcMp4,
+            "-c",
+            "copy",
+            "-movflags",
+            "+dash+frag_keyframe+empty_moov+default_base_moof",
+            "-f",
+            "mp4",
+            badRemux,
+          ]);
+          Bun.spawnSync([
+            ffmpegBin,
+            "-y",
+            "-i",
+            srcMp4,
+            "-c",
+            "copy",
+            "-movflags",
+            "+dash+global_sidx+frag_keyframe+empty_moov+default_base_moof",
+            "-f",
+            "mp4",
+            goodRemux,
+          ]);
+          expect(hasValidGlobalMp4Sidx(badRemux)).toBe(false);
+          expect(hasValidGlobalMp4Sidx(goodRemux)).toBe(true);
+          expect(probeLocalFileDashRanges(goodRemux, "video/mp4")).not.toBeNull();
+        }
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("probeRemoteDashRanges enforces googlevideo HTTPS/public-IPv4/host policy on all fetches", async () => {
+    const seenOpts: Ipv4FetchOptions[] = [];
+    const ebml = makeEbmlElement([0x1a, 0x45, 0xdf, 0xa3], new Uint8Array(12));
+    const segHeader = new Uint8Array([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    const seekId = makeEbmlElement([0x53, 0xab], new Uint8Array([0x1c, 0x53, 0xbb, 0x6b]));
+    const seekPos = makeEbmlElement([0x53, 0xac], new Uint8Array([0x02, 0x00]));
+    const seek = makeEbmlElement([0x4d, 0xbb], concatBytes(seekId, seekPos));
+    const seekHead = makeEbmlElement([0x11, 0x4d, 0x9b, 0x74], seek);
+    const tracks = makeEbmlElement([0x16, 0x54, 0xae, 0x6b], new Uint8Array(20));
+    const cluster = makeEbmlElement([0x1f, 0x43, 0xb6, 0x75], new Uint8Array(10));
+    const headerChunk = concatBytes(ebml, segHeader, seekHead, tracks, cluster);
+    const cuesHdr = makeEbmlElement([0x1c, 0x53, 0xbb, 0x6b], new Uint8Array(100));
+
+    let callNum = 0;
+    const mockFetch = async (_url: string | URL | Request, init?: Ipv4FetchOptions) => {
+      seenOpts.push(init ?? {});
+      callNum++;
+      if (callNum === 1) {
+        return new Response(headerChunk, {
+          status: 206,
+          headers: { "Content-Range": `bytes 0-${headerChunk.byteLength - 1}/2000` },
+        });
+      }
+      const cuesOffset = ebml.byteLength + segHeader.byteLength + 512;
+      return new Response(cuesHdr.slice(0, 32), {
+        status: 206,
+        headers: { "Content-Range": `bytes ${cuesOffset}-${cuesOffset + 31}/2000` },
+      });
+    };
+
+    const ranges = await probeRemoteDashRanges(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=251",
+      "audio/webm",
+      mockFetch,
+    );
+    expect(ranges).not.toBeNull();
+    expect(seenOpts.length).toBe(2);
+    for (const opts of seenOpts) {
+      expect(opts.httpsOnly).toBe(true);
+      expect(opts.publicIpv4Only).toBe(true);
+      expect(typeof opts.allowedHost).toBe("function");
+      expect(opts.allowedHost!("rr1---sn-test.googlevideo.com")).toBe(true);
+      expect(opts.allowedHost!("evil.example.com")).toBe(false);
+      expect(opts.allowedHost!("127.0.0.1")).toBe(false);
     }
   });
 });

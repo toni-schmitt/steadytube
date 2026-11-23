@@ -139,7 +139,7 @@ export function resolveBinary(name: string, configured?: string | null): string 
   if (configured && configured.trim() !== "") {
     const expanded = expandHome(configured.trim());
     if (expanded.includes("/")) {
-      return isExecutable(expanded) ? expanded : expanded;
+      return expanded;
     }
     name = expanded;
   }

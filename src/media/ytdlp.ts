@@ -286,6 +286,8 @@ export interface ProgressiveDownloadOptions {
   mimeType: string;
   expectedSize: number;
   maxBytes: number;
+  /** Optional logical cache formatId when yt-dlp selector differs from client fid */
+  cacheFormatId?: string;
   stallTimeoutMs?: number;
   idleTimeoutMs?: number;
   maxTotalTimeoutMs?: number;
@@ -492,6 +494,7 @@ export function createYtDlpRunner(
       const watchUrl = buildWatchUrl(videoId);
       const safeSelector = assertSafeFormatSelector(formatSelector);
       const bgutilAvailable = await isBgutilAvailable();
+      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
       const tmpPath = buildStagingPath(outputPath);
 
       const args = buildYtDlpBaseArgs(config, {
@@ -560,6 +563,7 @@ export function createYtDlpRunner(
       const watchUrl = buildWatchUrl(videoId);
       const safeSelector = assertSafeFormatSelector(formatSelector);
       const bgutilAvailable = await isBgutilAvailable();
+      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
       const tmpPath = buildStagingPath(outputPath);
 
       const args = buildYtDlpBaseArgs(config, {
@@ -790,7 +794,7 @@ export function createYtDlpRunner(
 
       return {
         videoId,
-        formatId: safeSelector,
+        formatId: opts.cacheFormatId || safeSelector,
         mimeType: opts.mimeType,
         expectedSize: opts.expectedSize,
         done,

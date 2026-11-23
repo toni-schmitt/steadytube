@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import type { FetchLike } from "../net/ipv4-fetch.ts";
 
+const ALLOWED_GOOGLEVIDEO_HOST = /^[a-z0-9-]+\.googlevideo\.com$/i;
+
 export interface DashByteRanges {
   init: string; // e.g. "0-740"
   index: string; // e.g. "741-1500"
@@ -85,6 +87,146 @@ export function parseMp4DashRanges(buf: Uint8Array): DashByteRanges | null {
     indexStart,
     indexEnd,
   };
+}
+
+const MAX_SIDX_BOX_BYTES = 2 * 1024 * 1024; // 2 MiB sanity cap
+
+/**
+ * Verify that an MP4/M4A file on disk contains a SINGLE global `sidx` box
+ * placed after `moov` and before the first `moof`/`mdat` whose leaf subsegment
+ * references cover every `moof`/`mdat` in the file (with no per-fragment `sidx`
+ * boxes later in the file).
+ *
+ * FFmpeg without `+global_sidx` emits one `sidx` per fragment; parsing only the
+ * first `sidx` box would truncate DASH playback to fragment 1.
+ */
+export function hasValidGlobalMp4Sidx(filePath: string): boolean {
+  let fd: number;
+  try {
+    fd = fs.openSync(filePath, "r");
+  } catch {
+    return false;
+  }
+
+  try {
+    const fileSize = fs.fstatSync(fd).size;
+    if (fileSize < 32) return false;
+
+    const hdr = new Uint8Array(16);
+    const hdrView = new DataView(hdr.buffer);
+
+    let offset = 0;
+    let sawMoov = false;
+    let sidxCount = 0;
+    let sidxOffset = -1;
+    let sidxSize = 0;
+    let sidxHeaderSize = 8;
+    let moofCount = 0;
+    let lastMediaBoxEnd = 0;
+
+    while (offset + 8 <= fileSize) {
+      const toRead = Math.min(16, fileSize - offset);
+      const n = fs.readSync(fd, hdr, 0, toRead, offset);
+      if (n < 8) return false;
+
+      let size = hdrView.getUint32(0, false);
+      const type = String.fromCharCode(hdr[4]!, hdr[5]!, hdr[6]!, hdr[7]!);
+      let headerSize = 8;
+
+      if (size === 1) {
+        if (n < 16) return false;
+        const hi = hdrView.getUint32(8, false);
+        const lo = hdrView.getUint32(12, false);
+        size = hi * 0x100000000 + lo;
+        headerSize = 16;
+      } else if (size === 0) {
+        size = fileSize - offset;
+      }
+
+      if (!Number.isFinite(size) || size < headerSize || offset + size > fileSize) {
+        return false;
+      }
+
+      const boxEnd = offset + size;
+
+      if (type === "moov") {
+        if (moofCount > 0) return false;
+        sawMoov = true;
+      } else if (type === "sidx") {
+        sidxCount++;
+        // Must have exactly one global sidx after moov and before any media fragments
+        if (sidxCount > 1 || !sawMoov || moofCount > 0 || lastMediaBoxEnd > 0) {
+          return false;
+        }
+        sidxOffset = offset;
+        sidxSize = size;
+        sidxHeaderSize = headerSize;
+      } else if (type === "moof") {
+        moofCount++;
+        lastMediaBoxEnd = boxEnd;
+      } else if (type === "mdat") {
+        lastMediaBoxEnd = boxEnd;
+      }
+
+      offset = boxEnd;
+    }
+
+    if (!sawMoov || sidxCount !== 1 || moofCount < 1 || sidxOffset < 0) {
+      return false;
+    }
+    if (sidxSize > MAX_SIDX_BOX_BYTES || sidxSize < sidxHeaderSize + 24) {
+      return false;
+    }
+
+    const sidxBuf = new Uint8Array(sidxSize);
+    const readSidx = fs.readSync(fd, sidxBuf, 0, sidxSize, sidxOffset);
+    if (readSidx < sidxSize) return false;
+
+    const view = new DataView(sidxBuf.buffer);
+    const body = sidxHeaderSize;
+    const version = sidxBuf[body]!;
+    if (version !== 0 && version !== 1) return false;
+
+    let firstOffset: number;
+    let refCountPos: number;
+    if (version === 0) {
+      if (body + 24 > sidxSize) return false;
+      firstOffset = view.getUint32(body + 16, false);
+      refCountPos = body + 22;
+    } else {
+      if (body + 32 > sidxSize) return false;
+      const hi = view.getUint32(body + 20, false);
+      const lo = view.getUint32(body + 24, false);
+      firstOffset = hi * 0x100000000 + lo;
+      refCountPos = body + 30;
+    }
+
+    const referenceCount = view.getUint16(refCountPos, false);
+    const entriesStart = refCountPos + 2;
+    if (referenceCount < 1 || entriesStart + referenceCount * 12 > sidxSize) {
+      return false;
+    }
+
+    let sumReferencedSizes = 0;
+    for (let i = 0; i < referenceCount; i++) {
+      const entryOffset = entriesStart + i * 12;
+      const refWord = view.getUint32(entryOffset, false);
+      const referenceType = (refWord >>> 31) & 1;
+      // Single-range SegmentBase requires direct media references (reference_type === 0)
+      if (referenceType !== 0) return false;
+      const referencedSize = refWord & 0x7fffffff;
+      if (referencedSize === 0) return false;
+      sumReferencedSizes += referencedSize;
+    }
+
+    const sidxEnd = sidxOffset + sidxSize;
+    const coveredEnd = sidxEnd + firstOffset + sumReferencedSizes;
+    return coveredEnd >= lastMediaBoxEnd && coveredEnd <= fileSize;
+  } catch {
+    return false;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 // EBML element IDs for WebM/Matroska
@@ -373,6 +515,9 @@ export async function probeRemoteDashRanges(
     headers,
     timeoutMs: 8_000,
     signal: AbortSignal.timeout(8_000),
+    httpsOnly: true,
+    publicIpv4Only: true,
+    allowedHost: (h) => ALLOWED_GOOGLEVIDEO_HOST.test(h),
   });
 
   // Only parse partial responses (or bounded byte 0 prefix); always cancel unread body on errors
@@ -404,6 +549,9 @@ export async function probeRemoteDashRanges(
         },
         timeoutMs: 8_000,
         signal: AbortSignal.timeout(8_000),
+        httpsOnly: true,
+        publicIpv4Only: true,
+        allowedHost: (h) => ALLOWED_GOOGLEVIDEO_HOST.test(h),
       });
       if (cuesRes.status === 206) {
         const cr = cuesRes.headers.get("content-range") || "";

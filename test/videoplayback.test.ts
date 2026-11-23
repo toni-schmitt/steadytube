@@ -12,7 +12,9 @@ import type {
 } from "../src/media/ytdlp.ts";
 import {
   deduplicateYtDlpFormats,
+  findMatchingYtDlpFormatId,
   MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES,
+  selectColdTier3Formats,
 } from "../src/media/video-resolver.ts";
 import { withStallWatchdog } from "../src/routes/videoplayback.ts";
 import { createApp } from "../src/server.ts";
@@ -868,6 +870,570 @@ describe("Mid-playback recovery state machine", () => {
       expect(progressiveStarts).toBe(1);
 
       app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("incompatible mid-playback recovery never poisons cache or clobbers parallel Tier 3 tracks", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-compat-"));
+    try {
+      const mp4Bytes = makeMp4StreamBytes(1000);
+      let extractCalls = 0;
+
+      const mockYtDlp: YtDlpRunner = {
+        async isBgutilAvailable() { return false; },
+        async extractVideoInfo(videoId, { useAuth }): Promise<YtDlpVideoInfo> {
+          extractCalls++;
+          // Initial Tier 1 gives clen=mp4Bytes.byteLength; Tier 2 returns an INCOMPATIBLE clen (+500)!
+          const clen = useAuth ? mp4Bytes.byteLength + 500 : mp4Bytes.byteLength;
+          return {
+            id: videoId,
+            title: "Compat Isolation Test",
+            duration: 120,
+            channel: "Creator",
+            channel_id: "UC1234567890123456789012",
+            formats: [
+              {
+                format_id: "137",
+                ext: "mp4",
+                protocol: "https",
+                container: "mp4_dash",
+                vcodec: "avc1.640028",
+                acodec: "none",
+                width: 1920,
+                height: 1080,
+                fps: 30,
+                tbr: 2000,
+                filesize: clen,
+                url: `https://rr1---${useAuth ? "tier2-bad" : "tier1"}.googlevideo.com/videoplayback?itag=137&dur=120.000&expire=1999999999&clen=${clen}`,
+              },
+              {
+                format_id: "140",
+                ext: "m4a",
+                protocol: "https",
+                container: "m4a_dash",
+                vcodec: "none",
+                acodec: "mp4a.40.2",
+                tbr: 128,
+                asr: 44100,
+                audio_channels: 2,
+                filesize: mp4Bytes.byteLength,
+                url: `https://rr1---${useAuth ? "tier2-bad" : "tier1"}.googlevideo.com/videoplayback?itag=140&dur=120.000&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+              },
+            ],
+          };
+        },
+        async downloadFormat() {
+          throw new Error("tier3 disabled for this assertion");
+        },
+      };
+
+      const fakeInnertube = {
+        async getClient() {
+          return {
+            async getInfo() {
+              return {
+                streaming_data: {
+                  adaptive_formats: [
+                    { itag: 137, init_range: { start: 0, end: 231 }, index_range: { start: 232, end: 303 } },
+                    { itag: 140, init_range: { start: 0, end: 231 }, index_range: { start: 232, end: 303 } },
+                  ],
+                },
+                basic_info: {},
+                watch_next_feed: [],
+              };
+            },
+          };
+        },
+        reset() {},
+      } as unknown as AnonymousInnertubeProvider;
+
+      const cfg = makeTestConfig(tmpDir, { authEnabled: true });
+      cfg.playback.ephemeralBuffer.enabled = false;
+      const app = createApp(cfg, {
+        logger: noopLogger,
+        ytDlp: mockYtDlp,
+        innertube: fakeInnertube,
+        fetchRawFn: async () => new Response("Forbidden", { status: 403 }),
+      });
+
+      const vidRes = await app.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"));
+      expect(vidRes.status).toBe(200);
+      const vidJson = (await vidRes.json()) as any;
+      const videoUrl = vidJson.adaptiveFormats.find((f: any) => f.itag === "137").url as string;
+
+      // Simulate audio track 140 already promoted to Tier 3 local buffer on the live record
+      const audioPath = app.ephemeralStore.getPathFor("abc123XYZ99", "140", "m4a");
+      fs.writeFileSync(audioPath, mp4Bytes);
+      app.ephemeralStore.register("abc123XYZ99", "140", audioPath, "audio/mp4");
+      const liveRec = app.resolver.getCached("abc123XYZ99")!;
+      liveRec.targetsByFid.set("140", {
+        kind: "local",
+        videoId: "abc123XYZ99",
+        formatId: "140",
+        itag: 140,
+        filePath: audioPath,
+        mimeType: "audio/mp4",
+        size: mp4Bytes.byteLength,
+        tier: 3,
+      });
+
+      // Video 137 hits 403 -> Tier 2 returns incompatible clen -> must fail cleanly WITHOUT poisoning cache!
+      const res = await app.fetch(new Request(videoUrl, { headers: { Range: "bytes=0-99" } }));
+      expect(res.status).toBe(503);
+      expect(extractCalls).toBe(2);
+
+      // Cached 137 must STILL point to original Tier 1 URL (NOT tier2-bad)
+      const cached137 = app.resolver.getStreamTarget("abc123XYZ99", "137", 137);
+      expect(cached137?.kind).toBe("remote");
+      if (cached137?.kind === "remote") {
+        expect(cached137.url).toContain("tier1");
+        expect(cached137.url).not.toContain("tier2-bad");
+      }
+
+      // Parallel audio track 140 must STILL be Tier 3 local!
+      const cached140 = app.resolver.getStreamTarget("abc123XYZ99", "140", 140);
+      expect(cached140?.kind).toBe("local");
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("mid-playback refresh respects maxTier cap and never triggers cold Tier 3 download on far seek", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-maxtier-"));
+    try {
+      const totalClen = MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES + 10 * 1024 * 1024;
+      let downloadCalls = 0;
+      let extractCalls = 0;
+
+      const mockYtDlp: YtDlpRunner = {
+        async isBgutilAvailable() { return false; },
+        async extractVideoInfo(videoId, { useAuth }): Promise<YtDlpVideoInfo> {
+          extractCalls++;
+          if (useAuth || extractCalls > 1) {
+            throw new Error("upstream refresh failed");
+          }
+          return {
+            id: videoId,
+            title: "MaxTier Cap Video",
+            duration: 600,
+            channel: "Creator",
+            channel_id: "UC1234567890123456789012",
+            formats: [
+              {
+                format_id: "137",
+                ext: "mp4",
+                protocol: "https",
+                container: "mp4_dash",
+                vcodec: "avc1.640028",
+                acodec: "none",
+                width: 1920,
+                height: 1080,
+                fps: 30,
+                tbr: 2000,
+                filesize: totalClen,
+                url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=137&dur=600.000&expire=1999999999&clen=${totalClen}`,
+              },
+            ],
+          };
+        },
+        async downloadFormat() {
+          downloadCalls++;
+          throw new Error("must NEVER fall through into cold Tier 3 during mid-playback refresh");
+        },
+      };
+
+      const fakeInnertube = {
+        async getClient() {
+          return {
+            async getInfo() {
+              return {
+                streaming_data: {
+                  adaptive_formats: [
+                    {
+                      itag: 137,
+                      content_length: totalClen,
+                      init_range: { start: 0, end: 231 },
+                      index_range: { start: 232, end: 303 },
+                    },
+                  ],
+                },
+                basic_info: {},
+                watch_next_feed: [],
+              };
+            },
+          };
+        },
+        reset() {},
+      } as unknown as AnonymousInnertubeProvider;
+
+      const app = createApp(
+        makeTestConfig(tmpDir, { authEnabled: true, maxCacheBytes: 200 * 1024 * 1024 }),
+        {
+          logger: noopLogger,
+          ytDlp: mockYtDlp,
+          innertube: fakeInnertube,
+          fetchRawFn: async () => new Response("Forbidden", { status: 403 }),
+        },
+      );
+
+      const vidRes = await app.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"));
+      const vidJson = (await vidRes.json()) as any;
+      const playUrl = vidJson.adaptiveFormats[0].url as string;
+
+      // Age target so Step 1b yt-dlp refresh AND Step 2 auth refresh both run and fail
+      const t = app.resolver.getStreamTarget("abc123XYZ99", "137", 137);
+      if (t?.kind === "remote") t.resolvedAt = Date.now() - 30_000;
+
+      const farStart = MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES + 4096;
+      const res = await app.fetch(
+        new Request(playUrl, { headers: { Range: `bytes=${farStart}-${farStart + 99}` } }),
+      );
+      expect(res.status).toBe(503);
+      expect(downloadCalls).toBe(0);
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("resolves synthetic InnerTube formatId to verified yt-dlp format_id before progressive Tier 3", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-synfid-"));
+    try {
+      const audioBytes = new Uint8Array(600).fill(0x42);
+      const passedSelectors: string[] = [];
+
+      // Fast InnerTube emits synthetic multi-audio formatId: "251-en-US-en-US.4"
+      const fastInnertube = {
+        async getClient() {
+          return {
+            async getBasicInfo() {
+              return {
+                playability_status: { status: "OK" },
+                basic_info: { title: "Multi-Audio Video", duration: 120, author: "Creator", channel_id: "UC1234567890123456789012" },
+                streaming_data: {
+                  adaptive_formats: [
+                    {
+                      itag: 137,
+                      mime_type: 'video/mp4; codecs="avc1.640028"',
+                      width: 1920,
+                      height: 1080,
+                      fps: 30,
+                      bitrate: 2000000,
+                      content_length: 1000,
+                      init_range: { start: 0, end: 200 },
+                      index_range: { start: 201, end: 300 },
+                      url: "https://rr1---it.googlevideo.com/videoplayback?itag=137&dur=120&expire=1999999999&clen=1000",
+                    },
+                    {
+                      itag: 251,
+                      mime_type: 'audio/webm; codecs="opus"',
+                      bitrate: 128000,
+                      language: "en-US",
+                      audio_track: { id: "en-US.4" },
+                      content_length: audioBytes.byteLength,
+                      init_range: { start: 0, end: 100 },
+                      index_range: { start: 101, end: 200 },
+                      url: `https://rr1---it.googlevideo.com/videoplayback?itag=251&dur=120&expire=1999999999&clen=${audioBytes.byteLength}`,
+                    },
+                  ],
+                },
+              };
+            },
+            async getInfo() {
+              return {
+                streaming_data: {
+                  adaptive_formats: [
+                    {
+                      itag: 251,
+                      content_length: audioBytes.byteLength,
+                      init_range: { start: 0, end: 100 },
+                      index_range: { start: 101, end: 200 },
+                    },
+                  ],
+                },
+                basic_info: {},
+                watch_next_feed: [],
+              };
+            },
+          };
+        },
+        reset() {},
+      } as unknown as AnonymousInnertubeProvider;
+
+      // yt-dlp names the exact same byte-length audio track "251-0"
+      const mockYtDlp: YtDlpRunner = {
+        async isBgutilAvailable() { return false; },
+        async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+          return {
+            id: videoId,
+            title: "Multi-Audio Video",
+            duration: 120,
+            formats: [
+              {
+                format_id: "251-0",
+                ext: "webm",
+                protocol: "https",
+                container: "webm_dash",
+                vcodec: "none",
+                acodec: "opus",
+                tbr: 128,
+                filesize: audioBytes.byteLength,
+                url: `https://rr1---ytdlp.googlevideo.com/videoplayback?itag=251&dur=120&expire=1999999999&clen=${audioBytes.byteLength}`,
+              },
+              {
+                format_id: "251-1",
+                ext: "webm",
+                protocol: "https",
+                container: "webm_dash",
+                vcodec: "none",
+                acodec: "opus",
+                tbr: 128,
+                filesize: audioBytes.byteLength + 123, // Different language track
+                url: `https://rr1---ytdlp-es.googlevideo.com/videoplayback?itag=251&dur=120&expire=1999999999&clen=${audioBytes.byteLength + 123}`,
+              },
+            ],
+          };
+        },
+        async downloadFormat() {
+          throw new Error("should use progressive");
+        },
+        async startProgressiveDownload(videoId, formatSelector, outputPath, opts): Promise<ProgressiveDownloadHandle> {
+          passedSelectors.push(formatSelector);
+          const tmpPath = `${outputPath}.syn.tmp.webm`;
+          fs.writeFileSync(tmpPath, audioBytes);
+          const done = Promise.resolve({ filePath: outputPath, size: audioBytes.byteLength });
+          fs.renameSync(tmpPath, outputPath);
+          return {
+            videoId,
+            formatId: opts.cacheFormatId || formatSelector,
+            mimeType: opts.mimeType,
+            expectedSize: opts.expectedSize,
+            done,
+            getReadablePath: () => outputPath,
+            getAvailableBytes: () => audioBytes.byteLength,
+            getStatus: () => "completed",
+            getError: () => null,
+            touch: () => {},
+            cancel: () => {},
+            waitForBytes: () => Promise.resolve(),
+          };
+        },
+      };
+
+      const app = createApp(makeTestConfig(tmpDir, { authEnabled: false }), {
+        logger: noopLogger,
+        ytDlp: mockYtDlp,
+        innertube: fastInnertube,
+        fetchRawFn: async () => new Response("Forbidden", { status: 403 }),
+      });
+
+      const vidRes = await app.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"));
+      expect(vidRes.status).toBe(200);
+      const vidJson = (await vidRes.json()) as any;
+      const audioFormat = vidJson.adaptiveFormats.find((f: any) => f.itag === "251");
+      expect(audioFormat.url).toContain("fid=251-en-US-en-US.4");
+
+      const segRes = await app.fetch(
+        new Request(audioFormat.url, { headers: { Range: "bytes=0-99" } }),
+      );
+      expect(segRes.status).toBe(206);
+      expect(passedSelectors).toEqual(["251-0"]); // Real yt-dlp selector, NOT synthetic InnerTube ID!
+
+      // Also verify findMatchingYtDlpFormatId rejects mismatched clen
+      expect(
+        findMatchingYtDlpFormatId(
+          [{ format_id: "251-0", filesize: 9999 }],
+          { formatId: "251-en-US-en-US.4", itag: 251, clen: 600, isDrc: false },
+        ),
+      ).toBeNull();
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("stale-target identity race, If-Range handling, stop() during startup, cold Tier 3 selection, and local clen/MIME checks", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-edge5-"));
+    try {
+      const mp4Bytes = makeMp4StreamBytes(800);
+      const seenUpstreamRanges: Array<string | null> = [];
+      let startupCancelCalled = false;
+      let releaseStartup!: () => void;
+
+      const mockYtDlp: YtDlpRunner = {
+        async isBgutilAvailable() { return false; },
+        async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+          return {
+            id: videoId,
+            title: "Edge Cases",
+            duration: 120,
+            formats: [
+              {
+                format_id: "137",
+                ext: "mp4",
+                protocol: "https",
+                container: "mp4_dash",
+                vcodec: "avc1.640028",
+                acodec: "none",
+                width: 1920,
+                height: 1080,
+                fps: 30,
+                tbr: 2000,
+                filesize: mp4Bytes.byteLength,
+                url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=137&dur=120&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+              },
+              {
+                format_id: "251",
+                ext: "webm",
+                protocol: "https",
+                container: "webm_dash",
+                vcodec: "none",
+                acodec: "opus",
+                tbr: 128,
+                filesize: mp4Bytes.byteLength,
+                url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=251&dur=120&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+              },
+            ],
+          };
+        },
+        async downloadFormat() {
+          throw new Error("unused");
+        },
+        async startProgressiveDownload(videoId, formatSelector, outputPath, opts): Promise<ProgressiveDownloadHandle> {
+          let rejectWait!: (err: Error) => void;
+          const waitPromise = new Promise<void>((_, reject) => {
+            rejectWait = reject;
+          });
+          return {
+            videoId,
+            formatId: opts.cacheFormatId || formatSelector,
+            mimeType: opts.mimeType,
+            expectedSize: opts.expectedSize,
+            done: waitPromise.then(() => ({ filePath: outputPath, size: 0 })),
+            getReadablePath: () => outputPath,
+            getAvailableBytes: () => 0,
+            getStatus: () => (startupCancelCalled ? "failed" : "downloading"),
+            getError: () => (startupCancelCalled ? new Error("cancelled") : null),
+            touch: () => {},
+            cancel: (reason) => {
+              startupCancelCalled = true;
+              rejectWait(new Error(reason || "cancelled"));
+              releaseStartup?.();
+            },
+            waitForBytes: () => waitPromise,
+          };
+        },
+      };
+
+      const fakeInnertube = {
+        async getClient() {
+          return {
+            async getInfo() {
+              return {
+                streaming_data: {
+                  adaptive_formats: [
+                    { itag: 137, init_range: { start: 0, end: 231 }, index_range: { start: 232, end: 303 } },
+                    { itag: 251, init_range: { start: 0, end: 231 }, index_range: { start: 232, end: 303 } },
+                  ],
+                },
+                basic_info: {},
+                watch_next_feed: [],
+              };
+            },
+          };
+        },
+        reset() {},
+      } as unknown as AnonymousInnertubeProvider;
+
+      let failUpstream = false;
+      const mockFetchRaw = async (_input: string | URL | Request, init?: RequestInit) => {
+        const hdrs = new Headers(init?.headers);
+        seenUpstreamRanges.push(hdrs.get("range"));
+        if (failUpstream) return new Response("Forbidden", { status: 403 });
+        return new Response(mp4Bytes, {
+          status: 200,
+          headers: { "Content-Type": "video/mp4", "Content-Length": String(mp4Bytes.byteLength) },
+        });
+      };
+
+      const app = createApp(makeTestConfig(tmpDir, { authEnabled: false }), {
+        logger: noopLogger,
+        ytDlp: mockYtDlp,
+        innertube: fakeInnertube,
+        fetchRawFn: mockFetchRaw,
+      });
+
+      const vidRes = await app.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"));
+      const vidJson = (await vidRes.json()) as any;
+      const playUrl137 = vidJson.adaptiveFormats.find((f: any) => f.itag === "137").url as string;
+      const playUrl251 = vidJson.adaptiveFormats.find((f: any) => f.itag === "251").url as string;
+
+      // 1) If-Range omits Range when forwarding to upstream googlevideo
+      const ifRangeRes = await app.fetch(
+        new Request(playUrl137, { headers: { Range: "bytes=0-99", "If-Range": '"v1"' } }),
+      );
+      expect(ifRangeRes.status).toBe(200);
+      expect(seenUpstreamRanges[0]).toBeNull();
+
+      // 2) Stale-target identity check: old target cannot mark replacement target stale
+      const rec = app.resolver.getCached("abc123XYZ99")!;
+      const oldTarget = rec.targetsByFid.get("137")!;
+      expect(oldTarget.kind).toBe("remote");
+      const replacement = { ...(oldTarget as Extract<typeof oldTarget, { kind: "remote" }>), url: "https://rr2---new.googlevideo.com/videoplayback" };
+      rec.targetsByFid.set("137", replacement);
+      app.resolver.markTargetStale("abc123XYZ99", "137", oldTarget as Extract<typeof oldTarget, { kind: "remote" }>);
+      expect(Boolean(replacement.stale)).toBe(false);
+      app.resolver.markTargetStale("abc123XYZ99", "137", replacement);
+      expect(replacement.stale).toBe(true);
+      replacement.stale = false;
+
+      // 3) Local reuse validates clen AND restores audio/webm MIME type (fixing restart-scan video/webm)
+      const audioPath = app.ephemeralStore.getPathFor("abc123XYZ99", "251", "webm");
+      fs.writeFileSync(audioPath, mp4Bytes);
+      // Simulate startup scan registering audio .webm as video/webm
+      app.ephemeralStore.register("abc123XYZ99", "251", audioPath, "video/webm");
+      failUpstream = true;
+      const audioRes = await app.fetch(
+        new Request(playUrl251, { headers: { Range: "bytes=0-99" } }),
+      );
+      expect(audioRes.status).toBe(206);
+      expect(audioRes.headers.get("content-type")).toBe("audio/webm");
+      expect(audioRes.headers.get("x-steadytube-tier")).toBe("3-buffer");
+
+      // 4) Cold Tier 3 deterministic format selector picks 1080p avc1 + non-DRC AAC
+      const selected = selectColdTier3Formats(
+        [
+          { format_id: "134", ext: "mp4", vcodec: "avc1.4d401e", acodec: "none", height: 360, fps: 30, tbr: 400 },
+          { format_id: "399", ext: "mp4", vcodec: "av01.0.08M.08", acodec: "none", height: 1080, fps: 60, tbr: 2800 },
+          { format_id: "137", ext: "mp4", vcodec: "avc1.640028", acodec: "none", height: 1080, fps: 30, tbr: 2200 },
+          { format_id: "138", ext: "mp4", vcodec: "avc1.640032", acodec: "none", height: 2160, fps: 30, tbr: 9000 },
+          { format_id: "140-drc", ext: "m4a", vcodec: "none", acodec: "mp4a.40.2", abr: 130, format_note: "medium, DRC" },
+          { format_id: "140", ext: "m4a", vcodec: "none", acodec: "mp4a.40.2", abr: 128 },
+        ],
+        1080,
+      );
+      expect(selected.video?.format_id).toBe("137");
+      expect(selected.audio?.format_id).toBe("140");
+
+      // 5) stop() cancels a starting progressive download BEFORE byte 1 arrives
+      const startupDone = new Promise<void>((resolve) => {
+        releaseStartup = resolve;
+      });
+      const pendingRes = app.fetch(
+        new Request(playUrl137, { headers: { Range: "bytes=0-99" } }),
+      );
+      await new Promise((r) => setTimeout(r, 20));
+      app.stop();
+      await startupDone;
+      const resAfterStop = await pendingRes;
+      expect(startupCancelCalled).toBe(true);
+      expect(resAfterStop.status).toBe(503);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

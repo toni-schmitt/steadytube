@@ -15,6 +15,7 @@ function isRecoverableStatus(status: number): boolean {
 }
 
 function parseRequestedRangeStart(req: Request, totalSize: number): number | undefined {
+  if (req.headers.get("if-range")) return 0;
   const range = req.headers.get("range");
   if (!range || !range.trim()) return 0;
   if (totalSize > 0) {
@@ -437,7 +438,10 @@ export class VideoPlaybackRoute {
       ...target.httpHeaders,
       "Accept-Encoding": "identity",
     };
-    const range = req.headers.get("range");
+    // Consistent with Tier 3 serving (RFC 9110 §13.1.5): do not forward Range
+    // without validating If-Range; fall back to full representation instead.
+    const ifRange = req.headers.get("if-range");
+    const range = ifRange ? null : req.headers.get("range");
     if (range) {
       headers["Range"] = range;
     }
@@ -479,7 +483,7 @@ export class VideoPlaybackRoute {
       req.signal,
       () => {
         if (req.signal.aborted) return;
-        this.resolver.markTargetStale(target.videoId, target.formatId);
+        this.resolver.markTargetStale(target.videoId, target.formatId, target);
         this.logger.warn("Upstream stream stalled/errored mid-chunk; marked stale for recovery", {
           videoId: target.videoId,
           formatId: target.formatId,
@@ -505,7 +509,8 @@ export class VideoPlaybackRoute {
       ...extraHeaders,
       "Accept-Encoding": "identity",
     };
-    const range = req.headers.get("range");
+    const ifRange = req.headers.get("if-range");
+    const range = ifRange ? null : req.headers.get("range");
     if (range) headers["Range"] = range;
 
     try {

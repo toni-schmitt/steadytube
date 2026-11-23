@@ -201,6 +201,9 @@ export class EphemeralStore {
       return false;
     }
 
+    // Reserve before cleanup so pruneEmptySubdirs never deletes this video's empty directory
+    this.reservedBytesByKey.set(key, needed);
+
     // Evict expired/LRU unpinned completed entries to make room for reserved writers
     this.cleanup(otherReserved + needed);
 
@@ -211,10 +214,14 @@ export class EphemeralStore {
       }
     }
     if (registeredBytes + otherReserved + needed > this.maxCacheBytes) {
+      if (existingForKey > 0) {
+        this.reservedBytesByKey.set(key, existingForKey);
+      } else {
+        this.reservedBytesByKey.delete(key);
+      }
       return false;
     }
 
-    this.reservedBytesByKey.set(key, needed);
     return true;
   }
 
@@ -812,11 +819,23 @@ export class EphemeralStore {
     }
   }
 
+  private isVideoDirActive(dirName: string): boolean {
+    const prefix = `${dirName}:`;
+    for (const key of this.pinnedCounts.keys()) {
+      if (key.startsWith(prefix)) return true;
+    }
+    for (const key of this.reservedBytesByKey.keys()) {
+      if (key.startsWith(prefix)) return true;
+    }
+    return false;
+  }
+
   private pruneEmptySubdirs(): void {
     try {
       const dirents = fs.readdirSync(this.resolvedBaseDir, { withFileTypes: true });
       for (const d of dirents) {
         if (!d.isDirectory()) continue;
+        if (this.isVideoDirActive(d.name)) continue;
         const full = path.join(this.resolvedBaseDir, d.name);
         try {
           if (fs.readdirSync(full).length === 0) {
