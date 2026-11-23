@@ -47,13 +47,17 @@ export function isPrivateOrReservedIpv4(ip: string): boolean {
   if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) {
     return true;
   }
-  const [a, b] = parts as [number, number, number, number];
+  const [a, b, c] = parts as [number, number, number, number];
   if (a === 0) return true; // 0.0.0.0/8
   if (a === 10) return true; // 10.0.0.0/8
   if (a === 127) return true; // 127.0.0.0/8
   if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
   if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // 192.0.0.0/24 & 192.0.2.0/24
   if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmarking
+  if (a === 198 && b === 51 && c === 100) return true; // 198.51.100.0/24 TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true; // 203.0.113.0/24 TEST-NET-3
   if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
   if (a >= 224) return true; // Multicast & reserved
   return false;
@@ -187,6 +191,8 @@ export interface Ipv4FetchOptions extends RequestInit {
   httpsOnly?: boolean;
   /** Optional allowlist validator invoked on the initial URL and every redirect hop. */
   allowedHost?: (hostname: string) => boolean;
+  /** Optional hard upper bound on response body bytes (errors stream and destroys socket if exceeded). */
+  maxBodyBytes?: number;
 }
 
 export type FetchLike = (
@@ -221,6 +227,7 @@ async function doSingleIpv4Request(
     publicIpv4Only: boolean;
     httpsOnly: boolean;
     allowedHost?: (hostname: string) => boolean;
+    maxBodyBytes?: number;
   },
 ): Promise<{
   status: number;
@@ -394,6 +401,7 @@ async function doSingleIpv4Request(
       const webStream = new ReadableStream<Uint8Array>({
         start(controller) {
           let closed = false;
+          let receivedBytes = 0;
           const cleanup = () => {
             onBodyAbort = null;
             options.signal?.removeEventListener("abort", onAbort);
@@ -420,12 +428,43 @@ async function doSingleIpv4Request(
             return;
           }
 
+          if (options.maxBodyBytes && options.maxBodyBytes > 0) {
+            const declaredLen = Number(resHeaders.get("content-length") || "0");
+            if (Number.isFinite(declaredLen) && declaredLen > options.maxBodyBytes) {
+              closed = true;
+              cleanup();
+              if (sourceStream !== res) sourceStream.destroy();
+              res.destroy();
+              req.destroy();
+              controller.error(
+                new Error(
+                  `Upstream response Content-Length exceeded limit (${declaredLen} > ${options.maxBodyBytes})`,
+                ),
+              );
+              return;
+            }
+          }
+
           sourceStream.on("data", (chunk: Buffer | Uint8Array) => {
             if (closed) return;
             try {
               const bytes = chunk instanceof Uint8Array
                 ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
                 : new Uint8Array(chunk);
+              receivedBytes += bytes.byteLength;
+              if (options.maxBodyBytes && options.maxBodyBytes > 0 && receivedBytes > options.maxBodyBytes) {
+                closed = true;
+                cleanup();
+                if (sourceStream !== res) sourceStream.destroy();
+                req.destroy();
+                res.destroy();
+                controller.error(
+                  new Error(
+                    `Upstream response body exceeded limit (${receivedBytes} > ${options.maxBodyBytes})`,
+                  ),
+                );
+                return;
+              }
               controller.enqueue(bytes);
               if (controller.desiredSize !== null && controller.desiredSize <= 0) {
                 sourceStream.pause();
@@ -541,6 +580,7 @@ export async function ipv4Fetch(
   const publicIpv4Only = init.publicIpv4Only ?? false;
   const httpsOnly = init.httpsOnly ?? false;
   const allowedHost = init.allowedHost;
+  const maxBodyBytes = init.maxBodyBytes;
 
   const headers = new Headers(isRequest ? input.headers : undefined);
   if (init.headers) {
@@ -565,6 +605,7 @@ export async function ipv4Fetch(
       publicIpv4Only,
       httpsOnly,
       allowedHost,
+      maxBodyBytes,
     });
 
     const isRedirect =
@@ -626,4 +667,48 @@ export function ipv4FetchRaw(
   init: Omit<Ipv4FetchOptions, "raw"> = {},
 ): Promise<Response> {
   return ipv4Fetch(input, { ...init, raw: true });
+}
+
+/**
+ * Drain an HTTP Response body into memory with a strict upper byte limit,
+ * cancelling the stream immediately if Content-Length or streamed bytes exceed `maxBytes`.
+ */
+export async function readBoundedResponseBytes(
+  res: Response,
+  maxBytes: number,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const declaredLen = Number(res.headers.get("content-length") || "0");
+  if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`Upstream response Content-Length exceeded limit (${declaredLen} > ${maxBytes})`);
+  }
+  if (!res.body) return new Uint8Array(0);
+
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new Error(`Upstream response body exceeded limit (${total} > ${maxBytes})`);
+      }
+      chunks.push(value);
+    }
+  } catch (err) {
+    await reader.cancel().catch(() => {});
+    throw err;
+  }
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }

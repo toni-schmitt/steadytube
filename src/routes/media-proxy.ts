@@ -2,7 +2,12 @@ import type { AppConfig } from "../config.ts";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
 import { Semaphore, TtlLruCache } from "../cache/memory-cache.ts";
-import { ipv4Fetch, ipv4FetchRaw, type FetchLike } from "../net/ipv4-fetch.ts";
+import {
+  ipv4Fetch,
+  ipv4FetchRaw,
+  readBoundedResponseBytes,
+  type FetchLike,
+} from "../net/ipv4-fetch.ts";
 
 interface CachedBinary {
   status: number;
@@ -23,46 +28,8 @@ const ALLOWED_FEED_HOST = /^(?:www\.)?youtube\.com$/i;
 const UPSTREAM_PROXY_TIMEOUT_MS = 20_000;
 const MAX_FEED_BODY_BYTES = 5 * 1024 * 1024; // 5 MiB cap for Atom/XML RSS feeds
 const MIN_MAX_IMAGE_PROXY_BYTES = 10 * 1024 * 1024; // 10 MiB hard cap for uncached image proxying
-
-async function readBoundedResponseBytes(
-  res: Response,
-  maxBytes: number,
-): Promise<Uint8Array<ArrayBuffer>> {
-  const declaredLen = Number(res.headers.get("content-length") || "0");
-  if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
-    await res.body?.cancel().catch(() => {});
-    throw new Error(`Upstream response Content-Length exceeded limit (${declaredLen} > ${maxBytes})`);
-  }
-  if (!res.body) return new Uint8Array(0);
-
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value || value.byteLength === 0) continue;
-      total += value.byteLength;
-      if (total > maxBytes) {
-        await reader.cancel().catch(() => {});
-        throw new Error(`Upstream response body exceeded limit (${total} > ${maxBytes})`);
-      }
-      chunks.push(value);
-    }
-  } catch (err) {
-    await reader.cancel().catch(() => {});
-    throw err;
-  }
-
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
-}
+const MAX_THUMB_CACHE_BYTES = 64 * 1024 * 1024; // 64 MiB total RAM cap for thumbnail cache
+const MAX_FEED_CACHE_BYTES = 32 * 1024 * 1024; // 32 MiB total RAM cap for RSS feed cache
 
 export class MediaProxyRoutes {
   private readonly thumbCache: TtlLruCache<string, CachedBinary>;
@@ -79,10 +46,18 @@ export class MediaProxyRoutes {
     this.thumbCache = new TtlLruCache<string, CachedBinary>(
       config.thumbnails.maxEntries,
       config.thumbnails.cacheTtlSec * 1000,
+      {
+        maxTotalBytes: MAX_THUMB_CACHE_BYTES,
+        sizeOf: (v) => v.body.byteLength,
+      },
     );
     this.feedCache = new TtlLruCache<string, CachedFeed>(
       2000,
       config.rss.cacheTtlSec * 1000,
+      {
+        maxTotalBytes: MAX_FEED_CACHE_BYTES,
+        sizeOf: (v) => v.body.length * 2,
+      },
     );
     this.feedSemaphore = new Semaphore(config.rss.maxConcurrentUpstream);
   }

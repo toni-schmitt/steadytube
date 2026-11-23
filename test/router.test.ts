@@ -663,4 +663,150 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test("bounds caption fetches, deduplicates cold pagination init, skips unmappable playlist pages, and handles bad percent-encoding with 400", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-r2-misc-"));
+    try {
+      let searchInitCalls = 0;
+      let searchContCalls = 0;
+      let captionSignalSeen = false;
+      let captionMaxBytesSeen = 0;
+
+      const makeVideoNode = (id: string, title: string) => ({
+        type: "Video",
+        id,
+        title: { text: title },
+        author: { name: "Test Channel", id: "UC1234567890123456789012" },
+        duration: { seconds: 60 },
+        view_count: { text: "1K views" },
+        published: { text: "1 day ago" },
+      });
+
+      const fakeInnertube = {
+        async getClient() {
+          return {
+            async getInfo() {
+              return {
+                streaming_data: null,
+                basic_info: {},
+                watch_next_feed: [],
+                captions: {
+                  caption_tracks: [
+                    {
+                      name: { text: "English" },
+                      language_code: "en",
+                      base_url: "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en",
+                    },
+                  ],
+                },
+              };
+            },
+            async search() {
+              searchInitCalls++;
+              await new Promise((r) => setTimeout(r, 25));
+              return {
+                results: [makeVideoNode("cold_p1", "Cold Page 1")],
+                has_continuation: true,
+                async getContinuation() {
+                  searchContCalls++;
+                  await new Promise((r) => setTimeout(r, 20));
+                  return {
+                    results: [makeVideoNode("cold_p2", "Cold Page 2")],
+                    has_continuation: false,
+                  };
+                },
+              };
+            },
+            async getPlaylist() {
+              return {
+                info: { title: { text: "Sparse Playlist" }, author: { name: { text: "A" }, id: "UC1234567890123456789012" }, total_items: "150" },
+                items: Array.from({ length: 100 }, (_, i) =>
+                  makeVideoNode(`pl1_${String(i).padStart(3, "0")}`, `P1-${i}`),
+                ),
+                has_continuation: true,
+                async getContinuation() {
+                  // Unmappable middle page (0 valid videos) that still has a continuation!
+                  return {
+                    items: [{ type: "UnsupportedPromoItem" }],
+                    has_continuation: true,
+                    async getContinuation() {
+                      return {
+                        items: [makeVideoNode("p3_valid", "Page 3 Valid Video")],
+                        has_continuation: false,
+                      };
+                    },
+                  };
+                },
+              };
+            },
+          };
+        },
+        reset() {},
+      } as unknown as AnonymousInnertubeProvider;
+
+      const mockFetch = async (_u: string | URL | Request, init?: any) => {
+        captionSignalSeen = Boolean(init?.signal);
+        captionMaxBytesSeen = Number(init?.maxBodyBytes || 0);
+        // Oversized caption exceeding 2 MiB cap
+        return new Response("x", {
+          status: 200,
+          headers: { "Content-Length": String(3 * 1024 * 1024) },
+        });
+      };
+
+      const app = createApp(makeTestConfig(tmpDir, false), {
+        logger: noopLogger,
+        fetchFn: mockFetch,
+        fetchRawFn: mockFetch,
+        innertube: fakeInnertube,
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo() { throw new Error("unused"); },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+      });
+
+      // 1) Captions enforce timeout signal + 2 MiB body cap
+      const hugeCap = await app.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/captions/dQw4w9WgXcQ?lang=en"),
+      );
+      expect(hugeCap.status).toBe(502);
+      expect(captionSignalSeen).toBe(true);
+      expect(captionMaxBytesSeen).toBe(2 * 1024 * 1024);
+
+      // 2) Malformed percent-encoding returns 400 (not 500)
+      const badPct = await app.fetch(new Request("http://127.0.0.1:8787/api/v1/playlists/%E0%A4%A"));
+      expect(badPct.status).toBe(400);
+
+      // 3) Cold concurrent page=2 requests coalesce initial search AND continuation to 1 call each
+      const [c2a, c2b] = await Promise.all([
+        app.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=coldtest&page=2")),
+        app.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=coldtest&page=2")),
+      ]);
+      expect(((await c2a.json()) as any[])[0].videoId).toBe("cold_p2");
+      expect(((await c2b.json()) as any[])[0].videoId).toBe("cold_p2");
+      expect(searchInitCalls).toBe(1);
+      expect(searchContCalls).toBe(1);
+
+      // 4) Extreme page clamp returns [] immediately without looping
+      const clampedSearch = await app.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/search?q=coldtest&page=999999"),
+      );
+      expect(clampedSearch.status).toBe(200);
+      expect((await clampedSearch.json()) as any[]).toEqual([]);
+
+      // 5) Unmappable middle playlist continuation page advances to page 3 instead of stopping early
+      const plRes = await app.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/playlists/PLsparse1?index=150"),
+      );
+      expect(plRes.status).toBe(200);
+      const plJson = (await plRes.json()) as any;
+      expect(plJson.videos.length).toBe(1);
+      expect(plJson.videos[0].videoId).toBe("p3_valid");
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

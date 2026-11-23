@@ -3,9 +3,11 @@ import { noopLogger } from "../logger.ts";
 import { buildStaticDashMpdXml } from "../innertube/mappers.ts";
 import type { VideoResolver } from "../media/video-resolver.ts";
 import { VALID_VIDEO_ID_RE } from "../media/ytdlp.ts";
-import { ipv4Fetch, type FetchLike } from "../net/ipv4-fetch.ts";
+import { ipv4Fetch, readBoundedResponseBytes, type FetchLike } from "../net/ipv4-fetch.ts";
 
 const ALLOWED_CAPTION_HOST = /^(?:www\.)?youtube\.com$/i;
+const CAPTION_FETCH_TIMEOUT_MS = 20_000;
+const MAX_CAPTION_BODY_BYTES = 2 * 1024 * 1024; // 2 MiB cap for VTT subtitle tracks
 
 export class VideoRoutes {
   constructor(
@@ -56,7 +58,12 @@ export class VideoRoutes {
     }
   }
 
-  async handleCaptions(videoId: string, url: URL, _origin: string): Promise<Response> {
+  async handleCaptions(
+    videoId: string,
+    url: URL,
+    _origin: string,
+    reqSignal?: AbortSignal,
+  ): Promise<Response> {
     if (!VALID_VIDEO_ID_RE.test(videoId)) {
       return new Response("WEBVTT\n\n", {
         status: 400,
@@ -72,6 +79,10 @@ export class VideoRoutes {
       const captions =
         this.resolver.getCached(videoId)?.captions ??
         (await this.resolver.getCaptionsAnonymous(videoId));
+
+      if (reqSignal?.aborted) {
+        return new Response(null, { status: 499 });
+      }
 
       const track =
         captions.find((c) => label && c.label === label) ||
@@ -90,8 +101,14 @@ export class VideoRoutes {
         upstream.searchParams.set("fmt", "vtt");
       }
 
+      const timeoutSignal = AbortSignal.timeout(CAPTION_FETCH_TIMEOUT_MS);
+      const signal = reqSignal ? AbortSignal.any([reqSignal, timeoutSignal]) : timeoutSignal;
+
       const res = await this.fetchFn(upstream.toString(), {
         method: "GET",
+        timeoutMs: CAPTION_FETCH_TIMEOUT_MS,
+        signal,
+        maxBodyBytes: MAX_CAPTION_BODY_BYTES,
         httpsOnly: true,
         publicIpv4Only: true,
         allowedHost: (h) => ALLOWED_CAPTION_HOST.test(h),
@@ -104,7 +121,8 @@ export class VideoRoutes {
         });
       }
 
-      const vttText = await res.text();
+      const vttBytes = await readBoundedResponseBytes(res, MAX_CAPTION_BODY_BYTES);
+      const vttText = new TextDecoder("utf-8").decode(vttBytes);
       return new Response(vttText, {
         status: 200,
         headers: {
@@ -113,6 +131,9 @@ export class VideoRoutes {
         },
       });
     } catch (err) {
+      if (reqSignal?.aborted) {
+        return new Response(null, { status: 499 });
+      }
       this.logger.warn("Caption fetch failed", {
         videoId,
         error: err instanceof Error ? err.message : String(err),

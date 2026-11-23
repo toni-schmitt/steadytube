@@ -6,9 +6,31 @@ import { ipv4Fetch } from "../net/ipv4-fetch.ts";
 // Keep daemon logs clean from benign youtubei.js JIT parser notices
 Log.setLevel(Log.Level.ERROR);
 
+const INNERTUBE_HEADER_TIMEOUT_MS = 15_000;
+const INNERTUBE_TOTAL_TIMEOUT_MS = 20_000;
+const INNERTUBE_MAX_BODY_BYTES = 16 * 1024 * 1024; // 16 MiB cap on anonymous metadata responses
+
+function guardedInnertubeFetch(
+  input: string | URL | Request,
+  init?: RequestInit,
+): Promise<Response> {
+  const timeoutSignal = AbortSignal.timeout(INNERTUBE_TOTAL_TIMEOUT_MS);
+  const combinedSignal = init?.signal
+    ? AbortSignal.any([init.signal, timeoutSignal])
+    : timeoutSignal;
+  return ipv4Fetch(input, {
+    ...init,
+    httpsOnly: true,
+    publicIpv4Only: true,
+    timeoutMs: INNERTUBE_HEADER_TIMEOUT_MS,
+    maxBodyBytes: INNERTUBE_MAX_BODY_BYTES,
+    signal: combinedSignal,
+  });
+}
+
 /**
  * Anonymous IPv4-only InnerTube singleton.
- * NEVER uses cookies or authentication; all requests flow through `ipv4Fetch`.
+ * NEVER uses cookies or authentication; all requests flow through `guardedInnertubeFetch`.
  */
 export class AnonymousInnertubeProvider {
   private instance: Innertube | null = null;
@@ -31,7 +53,7 @@ export class AnonymousInnertubeProvider {
     this.creating = (async () => {
       try {
         const client = await Innertube.create({
-          fetch: ipv4Fetch as typeof globalThis.fetch,
+          fetch: guardedInnertubeFetch as typeof globalThis.fetch,
           lang: "en",
           retrieve_player: false,
           generate_session_locally: false,

@@ -190,5 +190,13 @@ describe("ipv4-fetch", () => {
     // 3) Corrupt gzip payload fails stream and cleans up socket
     const badGzRes = await ipv4Fetch(`${baseUrl}/bad-gzip`);
     await expect(badGzRes.text()).rejects.toThrow();
+
+    // 4) maxBodyBytes enforces hard cap on response bodies and special-purpose IPv4 blocks are rejected
+    expect(isPrivateOrReservedIpv4("192.0.2.1")).toBe(true);
+    expect(isPrivateOrReservedIpv4("198.18.0.1")).toBe(true);
+    expect(isPrivateOrReservedIpv4("198.51.100.5")).toBe(true);
+    expect(isPrivateOrReservedIpv4("203.0.113.9")).toBe(true);
+    const cappedRes = await ipv4Fetch(`${baseUrl}/range`, { maxBodyBytes: 8 });
+    await expect(cappedRes.text()).rejects.toThrow(/exceeded limit/i);
   });
 });

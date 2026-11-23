@@ -126,6 +126,14 @@ export function createRequestHandler(deps: RouterDeps) {
   };
 }
 
+function safeDecodeParam(raw: string): string | null {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
 async function dispatch(
   req: Request,
   url: URL,
@@ -161,45 +169,45 @@ async function dispatch(
   // RSS subscription feeds
   const feedPlaylistMatch = /^\/feed\/playlist\/([^/]+)$/.exec(pathname);
   if (feedPlaylistMatch) {
-    return await deps.mediaProxy.handleFeed(
-      "playlist",
-      decodeURIComponent(feedPlaylistMatch[1]!),
-      method,
-    );
+    const id = safeDecodeParam(feedPlaylistMatch[1]!);
+    if (id === null) return Response.json({ error: "Malformed path parameter" }, { status: 400 });
+    return await deps.mediaProxy.handleFeed("playlist", id, method);
   }
 
   const feedChannelMatch = /^\/feed\/channel\/([^/]+)$/.exec(pathname);
   if (feedChannelMatch) {
-    return await deps.mediaProxy.handleFeed(
-      "channel",
-      decodeURIComponent(feedChannelMatch[1]!),
-      method,
-    );
+    const id = safeDecodeParam(feedChannelMatch[1]!);
+    if (id === null) return Response.json({ error: "Malformed path parameter" }, { status: 400 });
+    return await deps.mediaProxy.handleFeed("channel", id, method);
   }
 
   // Video playback & manifests
   const videoMatch = /^\/api\/v1\/videos\/([^/]+)$/.exec(pathname);
   if (videoMatch) {
-    return await deps.videoRoutes.handleVideo(decodeURIComponent(videoMatch[1]!), origin);
+    const id = safeDecodeParam(videoMatch[1]!);
+    if (id === null) return Response.json({ error: "Malformed path parameter" }, { status: 400 });
+    return await deps.videoRoutes.handleVideo(id, origin);
   }
 
   const dashMatch = /^\/api\/manifest\/dash\/id\/([^/]+)$/.exec(pathname);
   if (dashMatch) {
-    return await deps.videoRoutes.handleDashManifest(decodeURIComponent(dashMatch[1]!), origin);
+    const id = safeDecodeParam(dashMatch[1]!);
+    if (id === null) return Response.json({ error: "Malformed path parameter" }, { status: 400 });
+    return await deps.videoRoutes.handleDashManifest(id, origin);
   }
 
   const captionsMatch = /^\/api\/v1\/captions\/([^/]+)$/.exec(pathname);
   if (captionsMatch) {
-    return await deps.videoRoutes.handleCaptions(decodeURIComponent(captionsMatch[1]!), url, origin);
+    const id = safeDecodeParam(captionsMatch[1]!);
+    if (id === null) return Response.json({ error: "Malformed path parameter" }, { status: 400 });
+    return await deps.videoRoutes.handleCaptions(id, url, origin, req.signal);
   }
 
   const storyboardsMatch = /^\/api\/v1\/storyboards\/([^/]+)$/.exec(pathname);
   if (storyboardsMatch) {
-    return await deps.videoRoutes.handleStoryboards(
-      decodeURIComponent(storyboardsMatch[1]!),
-      url,
-      origin,
-    );
+    const id = safeDecodeParam(storyboardsMatch[1]!);
+    if (id === null) return Response.json({ error: "Malformed path parameter" }, { status: 400 });
+    return await deps.videoRoutes.handleStoryboards(id, url, origin);
   }
 
   // Anonymous IPv4 browsing routes
@@ -217,9 +225,14 @@ async function dispatch(
 
   const channelTabMatch = /^\/api\/v1\/channels\/([^/]+)\/([^/]+)$/.exec(pathname);
   if (channelTabMatch) {
+    const channelId = safeDecodeParam(channelTabMatch[1]!);
+    const tab = safeDecodeParam(channelTabMatch[2]!);
+    if (channelId === null || tab === null) {
+      return Response.json({ error: "Malformed path parameter" }, { status: 400 });
+    }
     return await deps.browseRoutes.handleChannelTab(
-      decodeURIComponent(channelTabMatch[1]!),
-      decodeURIComponent(channelTabMatch[2]!).toLowerCase(),
+      channelId,
+      tab.toLowerCase(),
       url,
       origin,
     );
@@ -227,17 +240,23 @@ async function dispatch(
 
   const channelMatch = /^\/api\/v1\/channels\/([^/]+)$/.exec(pathname);
   if (channelMatch) {
-    return await deps.browseRoutes.handleChannel(decodeURIComponent(channelMatch[1]!), origin);
+    const id = safeDecodeParam(channelMatch[1]!);
+    if (id === null) return Response.json({ error: "Malformed path parameter" }, { status: 400 });
+    return await deps.browseRoutes.handleChannel(id, origin);
   }
 
   const commentsMatch = /^\/api\/v1\/comments\/([^/]+)$/.exec(pathname);
   if (commentsMatch) {
-    return await deps.browseRoutes.handleComments(decodeURIComponent(commentsMatch[1]!), url, origin);
+    const id = safeDecodeParam(commentsMatch[1]!);
+    if (id === null) return Response.json({ error: "Malformed path parameter" }, { status: 400 });
+    return await deps.browseRoutes.handleComments(id, url, origin);
   }
 
   const playlistMatch = /^\/api\/v1\/playlists\/([^/]+)$/.exec(pathname);
   if (playlistMatch) {
-    return await deps.browseRoutes.handlePlaylist(decodeURIComponent(playlistMatch[1]!), url, origin);
+    const id = safeDecodeParam(playlistMatch[1]!);
+    if (id === null) return Response.json({ error: "Malformed path parameter" }, { status: 400 });
+    return await deps.browseRoutes.handlePlaylist(id, url, origin);
   }
 
   return Response.json({ error: `Not Found: ${pathname}` }, { status: 404 });
