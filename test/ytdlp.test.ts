@@ -131,6 +131,17 @@ describe("ytdlp arg builder & error classifier", () => {
     expect(assertSafeFormatSelector("bestvideo[height<=1080][ext=mp4]/bestvideo")).toBe(
       "bestvideo[height<=1080][ext=mp4]/bestvideo",
     );
+    // Cold Tier 3 fallback selectors with prefix match (^=) MUST pass validation
+    expect(
+      assertSafeFormatSelector(
+        "bestvideo[height<=1080][ext=mp4][vcodec^=avc1]/bestvideo[height<=1080][ext=mp4]/bestvideo[height<=1080]/bestvideo",
+      ),
+    ).toContain("[vcodec^=avc1]");
+    expect(
+      assertSafeFormatSelector(
+        "bestaudio[ext=m4a][acodec^=mp4a]/bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio",
+      ),
+    ).toContain("[acodec^=mp4a]");
     expect(() => assertSafeFormatSelector("--exec")).toThrow();
     expect(() => assertSafeFormatSelector("-o /tmp/pwn")).toThrow();
     expect(() => assertSafeFormatSelector("313\n--exec")).toThrow();
@@ -309,6 +320,104 @@ exec sleep 5`,
       expect(cancelHandle.getStatus()).toBe("failed");
       expect(fs.existsSync(stagingPath)).toBe(false);
       await expect(cancelHandle.done).rejects.toThrow("Shutdown test");
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("downloadFormat cleans -FragN sidecars on timeout, enforces live maxBytes, and terminates on runner.stop()", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "steadytube-dl-life-"));
+    try {
+      const writeStub = (name: string, body: string): string => {
+        const scriptPath = path.join(tmpRoot, name);
+        fs.writeFileSync(
+          scriptPath,
+          `#!/bin/sh
+OUT=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    OUT="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+${body}
+`,
+          { mode: 0o755 },
+        );
+        return scriptPath;
+      };
+
+      // 1) Timeout with -Frag1 / -Frag2 sidecars -> private staging dir is completely removed!
+      const fragDir = path.join(tmpRoot, "vid-frag");
+      const fragOut = path.join(fragDir, "137.mp4");
+      const fragStub = writeStub(
+        "stub-frag.sh",
+        `head -c 256 /dev/zero > "$OUT"
+head -c 256 /dev/zero > "$OUT-Frag1"
+head -c 256 /dev/zero > "$OUT-Frag2"
+exec sleep 5`,
+      );
+      const fragCfg = makeTestConfig();
+      fragCfg.binaries.ytDlp = fragStub;
+      fragCfg.playback.enableBgutilPot = false;
+      const fragRunner = createYtDlpRunner(fragCfg);
+      await expect(
+        fragRunner.downloadFormat("dQw4w9WgXcQ", "137", fragOut, {
+          useAuth: false,
+          timeoutMs: 250,
+        }),
+      ).rejects.toThrow(/timed out/i);
+      expect(fs.readdirSync(fragDir)).toEqual([]);
+
+      // 2) Mid-download maxBytes cap kills writer and leaves zero files on disk
+      const capDir = path.join(tmpRoot, "vid-cap");
+      const capOut = path.join(capDir, "137.mp4");
+      const capStub = writeStub(
+        "stub-cap.sh",
+        `head -c 1500 /dev/zero > "$OUT"
+exec sleep 5`,
+      );
+      const capCfg = makeTestConfig();
+      capCfg.binaries.ytDlp = capStub;
+      capCfg.playback.enableBgutilPot = false;
+      const capRunner = createYtDlpRunner(capCfg);
+      let capErr: Error | null = null;
+      try {
+        await capRunner.downloadFormat("dQw4w9WgXcQ", "137", capOut, {
+          useAuth: false,
+          timeoutMs: 5_000,
+          maxBytes: 1000,
+        });
+      } catch (err) {
+        capErr = err as Error;
+      }
+      expect(capErr).not.toBeNull();
+      expect(capErr!.name).toBe("BudgetExceededError");
+      expect(fs.readdirSync(capDir)).toEqual([]);
+
+      // 3) runner.stop() + awaitShutdown() kills active downloadFormat child and wipes staging dir
+      const stopDir = path.join(tmpRoot, "vid-stop");
+      const stopOut = path.join(stopDir, "137.mp4");
+      const stopStub = writeStub(
+        "stub-stop.sh",
+        `head -c 128 /dev/zero > "$OUT"
+exec sleep 10`,
+      );
+      const stopCfg = makeTestConfig();
+      stopCfg.binaries.ytDlp = stopStub;
+      stopCfg.playback.enableBgutilPot = false;
+      const stopRunner = createYtDlpRunner(stopCfg);
+      const pendingDl = stopRunner.downloadFormat("dQw4w9WgXcQ", "137", stopOut, {
+        useAuth: false,
+        timeoutMs: 10_000,
+      });
+      await new Promise((r) => setTimeout(r, 120));
+      stopRunner.stop?.();
+      await stopRunner.awaitShutdown?.(1000);
+      await expect(pendingDl).rejects.toThrow();
+      expect(fs.readdirSync(stopDir)).toEqual([]);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }

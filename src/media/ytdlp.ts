@@ -8,7 +8,9 @@ import { noopLogger } from "../logger.ts";
 import { ipv4Fetch } from "../net/ipv4-fetch.ts";
 
 export const VALID_VIDEO_ID_RE = /^[A-Za-z0-9_-]{6,20}$/;
-const SAFE_FORMAT_SELECTOR_RE = /^[A-Za-z0-9][A-Za-z0-9._+/[\]<=>,-]{0,199}$/;
+// Allows yt-dlp format filter operators including ^= (prefix match, e.g. [vcodec^=avc1]);
+// always passed as a single argv element to `-f` (never via shell) and must start alphanumeric.
+const SAFE_FORMAT_SELECTOR_RE = /^[A-Za-z0-9][A-Za-z0-9._+/[\]<=>^,-]{0,199}$/;
 
 export function assertValidVideoId(videoId: string): string {
   if (!VALID_VIDEO_ID_RE.test(videoId)) {
@@ -298,13 +300,21 @@ export interface ProgressiveDownloadHandle extends ProgressiveStreamSource {
   cancel(reason?: string): void;
 }
 
+export interface DownloadFormatOptions {
+  useAuth: boolean;
+  timeoutMs?: number;
+  maxBytes?: number;
+  /** Called periodically with total bytes inside the job's staging dir; return false to abort download */
+  onStagingBytes?: (bytes: number) => boolean;
+}
+
 export interface YtDlpRunner {
   extractVideoInfo(videoId: string, opts: { useAuth: boolean }): Promise<YtDlpVideoInfo>;
   downloadFormat(
     videoId: string,
     formatSelector: string,
     outputPath: string,
-    opts: { useAuth: boolean; timeoutMs?: number },
+    opts: DownloadFormatOptions,
   ): Promise<string>;
   startProgressiveDownload?(
     videoId: string,
@@ -313,6 +323,29 @@ export interface YtDlpRunner {
     opts: ProgressiveDownloadOptions,
   ): Promise<ProgressiveDownloadHandle>;
   isBgutilAvailable(): Promise<boolean>;
+  stop?(): void;
+  awaitShutdown?(timeoutMs?: number): Promise<void>;
+}
+
+function getDirectoryBytes(dirPath: string): number {
+  let total = 0;
+  try {
+    for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+      const full = path.join(dirPath, entry.name);
+      if (entry.isFile()) {
+        try {
+          total += fs.statSync(full).size;
+        } catch {
+          // Concurrent rename/delete by yt-dlp
+        }
+      } else if (entry.isDirectory()) {
+        total += getDirectoryBytes(full);
+      }
+    }
+  } catch {
+    // Staging dir not yet created or already removed
+  }
+  return total;
 }
 
 export function createYtDlpRunner(
@@ -321,13 +354,33 @@ export function createYtDlpRunner(
 ): YtDlpRunner {
   let bgutilCheckCache: { available: boolean; expiresAt: number } | null = null;
   let stagingSeq = 0;
+  let stopped = false;
 
-  function buildStagingPath(outputPath: string): string {
-    const dotIdx = outputPath.lastIndexOf(".");
+  interface TrackedJob {
+    killSync: () => void;
+    exited: Promise<unknown>;
+  }
+  const activeJobs = new Set<TrackedJob>();
+
+  function createStagingLocation(outputPath: string): { stagingDir: string; stagingFile: string } {
+    const parentDir = path.dirname(outputPath);
+    fs.mkdirSync(parentDir, { recursive: true });
+    const ext = path.extname(outputPath).replace(/[^.A-Za-z0-9]/g, "") || ".bin";
     const uniq = `${process.pid}-${Date.now()}-${++stagingSeq}`;
-    return dotIdx > outputPath.lastIndexOf("/")
-      ? `${outputPath.slice(0, dotIdx)}.${uniq}.tmp${outputPath.slice(dotIdx)}`
-      : `${outputPath}.${uniq}.tmp.bin`;
+    const stagingDir = path.join(parentDir, `.stage-${uniq}`);
+    fs.mkdirSync(stagingDir, { recursive: true });
+    return {
+      stagingDir,
+      stagingFile: path.join(stagingDir, `media${ext}`),
+    };
+  }
+
+  function removeStagingDir(stagingDir: string): void {
+    try {
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup
+    }
   }
 
   function buildSpawnEnv(): Record<string, string | undefined> {
@@ -387,7 +440,16 @@ export function createYtDlpRunner(
   async function spawnYtDlp(
     args: string[],
     timeoutMs: number,
+    monitor?: {
+      stagingDir: string;
+      maxBytes?: number;
+      onStagingBytes?: (bytes: number) => boolean;
+    },
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    if (stopped) {
+      throw new YtDlpError("yt-dlp runner stopped", "unknown", "", null);
+    }
+
     const cmd = [config.binaries.ytDlp, ...args];
     const proc = Bun.spawn(cmd, {
       stdout: "pipe",
@@ -396,14 +458,59 @@ export function createYtDlpRunner(
     });
 
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
+    let abortedReason: Error | null = null;
+
+    const killProc = (reason?: Error) => {
+      if (reason && !abortedReason) abortedReason = reason;
       try {
         proc.kill("SIGKILL");
       } catch {
-        // Ignore
+        // Already exited
       }
+    };
+
+    const job: TrackedJob = {
+      killSync: () => {
+        killProc(new YtDlpError("yt-dlp cancelled during shutdown", "unknown", "", null));
+        if (monitor?.stagingDir) {
+          removeStagingDir(monitor.stagingDir);
+        }
+      },
+      exited: proc.exited.catch(() => {}),
+    };
+    activeJobs.add(job);
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killProc();
     }, timeoutMs);
+
+    let sizePollTimer: ReturnType<typeof setInterval> | null = null;
+    if (monitor && ((monitor.maxBytes && monitor.maxBytes > 0) || monitor.onStagingBytes)) {
+      let highWater = 0;
+      sizePollTimer = setInterval(() => {
+        const dirBytes = getDirectoryBytes(monitor.stagingDir);
+        if (monitor.maxBytes && monitor.maxBytes > 0 && dirBytes > monitor.maxBytes) {
+          const budgetErr = new Error(
+            `Tier 3 download exceeded maxCacheBytes (${dirBytes} > ${monitor.maxBytes})`,
+          );
+          budgetErr.name = "BudgetExceededError";
+          killProc(budgetErr);
+          return;
+        }
+        if (dirBytes > highWater && monitor.onStagingBytes) {
+          highWater = dirBytes;
+          if (!monitor.onStagingBytes(dirBytes)) {
+            const budgetErr = new Error(
+              `Tier 3 download exceeded shared ephemeral disk budget (${dirBytes} bytes)`,
+            );
+            budgetErr.name = "BudgetExceededError";
+            killProc(budgetErr);
+          }
+        }
+      }, 100);
+      sizePollTimer.unref?.();
+    }
 
     try {
       // Drain pipes concurrently while the process runs, but bound pipe wait after exit
@@ -412,12 +519,17 @@ export function createYtDlpRunner(
       const stderrPromise = new Response(proc.stderr).text().catch(() => "");
       const exitCode = await proc.exited;
       clearTimeout(timer);
+      if (sizePollTimer) clearInterval(sizePollTimer);
 
-      const graceMs = timedOut ? 100 : 500;
+      const graceMs = timedOut || abortedReason ? 100 : 500;
       const [stdout, stderr] = await Promise.all([
         awaitWithGrace(stdoutPromise, graceMs, ""),
         awaitWithGrace(stderrPromise, graceMs, ""),
       ]);
+
+      if (abortedReason) {
+        throw abortedReason;
+      }
 
       if (timedOut) {
         throw new YtDlpError(
@@ -431,18 +543,37 @@ export function createYtDlpRunner(
       return { stdout, stderr, exitCode };
     } catch (err) {
       clearTimeout(timer);
+      if (sizePollTimer) clearInterval(sizePollTimer);
       if (err instanceof YtDlpError) throw err;
+      if (abortedReason && err === abortedReason) throw err;
       throw new YtDlpError(
         `Failed to run yt-dlp: ${err instanceof Error ? err.message : String(err)}`,
         "unknown",
         "",
         null,
       );
+    } finally {
+      clearTimeout(timer);
+      if (sizePollTimer) clearInterval(sizePollTimer);
+      activeJobs.delete(job);
     }
   }
 
   return {
     isBgutilAvailable,
+
+    stop(): void {
+      stopped = true;
+      for (const job of [...activeJobs]) {
+        job.killSync();
+      }
+    },
+
+    async awaitShutdown(timeoutMs = 1000): Promise<void> {
+      const pending = [...activeJobs].map((j) => j.exited);
+      if (pending.length === 0) return;
+      await awaitWithGrace(Promise.allSettled(pending), timeoutMs, []);
+    },
 
     async extractVideoInfo(videoId: string, opts: { useAuth: boolean }): Promise<YtDlpVideoInfo> {
       const watchUrl = buildWatchUrl(videoId);
@@ -489,13 +620,15 @@ export function createYtDlpRunner(
       videoId: string,
       formatSelector: string,
       outputPath: string,
-      opts: { useAuth: boolean; timeoutMs?: number },
+      opts: DownloadFormatOptions,
     ): Promise<string> {
+      if (stopped) {
+        throw new YtDlpError("yt-dlp runner stopped", "unknown", "", null);
+      }
       const watchUrl = buildWatchUrl(videoId);
       const safeSelector = assertSafeFormatSelector(formatSelector);
       const bgutilAvailable = await isBgutilAvailable();
-      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-      const tmpPath = buildStagingPath(outputPath);
+      const { stagingDir, stagingFile } = createStagingLocation(outputPath);
 
       const args = buildYtDlpBaseArgs(config, {
         useAuth: opts.useAuth,
@@ -509,7 +642,7 @@ export function createYtDlpRunner(
           "--no-continue",
           "--force-overwrites",
           "-o",
-          tmpPath,
+          stagingFile,
           "--",
           watchUrl,
         ],
@@ -517,13 +650,16 @@ export function createYtDlpRunner(
 
       const timeoutMs = opts.timeoutMs ?? 180_000;
       const startMs = Date.now();
-      let promoted = false;
 
       try {
-        const { stderr, exitCode } = await spawnYtDlp(args, timeoutMs);
+        const { stderr, exitCode } = await spawnYtDlp(args, timeoutMs, {
+          stagingDir,
+          maxBytes: opts.maxBytes,
+          onStagingBytes: opts.onStagingBytes,
+        });
         const elapsedMs = Date.now() - startMs;
 
-        if (exitCode !== 0 || !fs.existsSync(tmpPath)) {
+        if (exitCode !== 0 || !fs.existsSync(stagingFile)) {
           const kind = classifyYtDlpError(stderr);
           throw new YtDlpError(
             stderr.trim().split("\n").pop() || `yt-dlp download exited with code ${exitCode}`,
@@ -533,8 +669,16 @@ export function createYtDlpRunner(
           );
         }
 
-        fs.renameSync(tmpPath, outputPath);
-        promoted = true;
+        const finalSize = fs.statSync(stagingFile).size;
+        if (opts.maxBytes && opts.maxBytes > 0 && finalSize > opts.maxBytes) {
+          const budgetErr = new Error(
+            `Tier 3 download exceeded maxCacheBytes (${finalSize} > ${opts.maxBytes})`,
+          );
+          budgetErr.name = "BudgetExceededError";
+          throw budgetErr;
+        }
+
+        fs.renameSync(stagingFile, outputPath);
         logger.info("Tier 3 ephemeral buffer download completed", {
           videoId,
           formatSelector,
@@ -543,14 +687,9 @@ export function createYtDlpRunner(
         });
         return outputPath;
       } finally {
-        // Always clean up partial/staging file on failure or timeout
-        if (!promoted) {
-          try {
-            if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-          } catch {
-            // Ignore
-          }
-        }
+        // Always wipe private staging directory (including any -FragN sidecars, .part, .ytdl)
+        // after child process has exited.
+        removeStagingDir(stagingDir);
       }
     },
 
@@ -560,11 +699,13 @@ export function createYtDlpRunner(
       outputPath: string,
       opts: ProgressiveDownloadOptions,
     ): Promise<ProgressiveDownloadHandle> {
+      if (stopped) {
+        throw new YtDlpError("yt-dlp runner stopped", "unknown", "", null);
+      }
       const watchUrl = buildWatchUrl(videoId);
       const safeSelector = assertSafeFormatSelector(formatSelector);
       const bgutilAvailable = await isBgutilAvailable();
-      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-      const tmpPath = buildStagingPath(outputPath);
+      const { stagingDir, stagingFile } = createStagingLocation(outputPath);
 
       const args = buildYtDlpBaseArgs(config, {
         useAuth: opts.useAuth,
@@ -578,7 +719,7 @@ export function createYtDlpRunner(
           "--no-continue",
           "--force-overwrites",
           "-o",
-          tmpPath,
+          stagingFile,
           "--",
           watchUrl,
         ],
@@ -595,7 +736,7 @@ export function createYtDlpRunner(
         env: buildSpawnEnv(),
       });
 
-      let readablePath = tmpPath;
+      let readablePath = stagingFile;
       let availableBytes = 0;
       let status: "downloading" | "completed" | "failed" = "downloading";
       let failureError: Error | null = null;
@@ -628,7 +769,7 @@ export function createYtDlpRunner(
         }
       };
 
-      const terminateProc = (err: Error, unlinkSyncNow = false) => {
+      const terminateProc = (err: Error, cleanupSyncNow = false) => {
         if (status !== "downloading") return;
         if (!killReason) killReason = err;
         status = "failed";
@@ -639,21 +780,23 @@ export function createYtDlpRunner(
         } catch {
           // Process may have already exited
         }
-        if (unlinkSyncNow && !promoted) {
-          try {
-            if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-          } catch {
-            // Ignore
-          }
+        if (cleanupSyncNow && !promoted) {
+          removeStagingDir(stagingDir);
         }
         notifyWaiters();
       };
+
+      const trackedJob: TrackedJob = {
+        killSync: () => terminateProc(new Error("Server shutting down"), true),
+        exited: proc.exited.catch(() => {}),
+      };
+      activeJobs.add(trackedJob);
 
       const pollTimer = setInterval(() => {
         if (status !== "downloading") return;
         const now = Date.now();
         try {
-          const stat = fs.statSync(tmpPath);
+          const stat = fs.statSync(stagingFile);
           if (stat.size < availableBytes) {
             terminateProc(
               new Error(
@@ -675,10 +818,11 @@ export function createYtDlpRunner(
           // File not yet created
         }
 
-        if (opts.maxBytes > 0 && availableBytes > opts.maxBytes) {
+        const dirBytes = getDirectoryBytes(stagingDir);
+        if (opts.maxBytes > 0 && Math.max(availableBytes, dirBytes) > opts.maxBytes) {
           terminateProc(
             new Error(
-              `Tier 3 progressive download exceeded maxCacheBytes (${availableBytes} > ${opts.maxBytes})`,
+              `Tier 3 progressive download exceeded maxCacheBytes (${Math.max(availableBytes, dirBytes)} > ${opts.maxBytes})`,
             ),
           );
           return;
@@ -733,7 +877,7 @@ export function createYtDlpRunner(
 
           const stderr = await awaitWithGrace(stderrPromise, 500, "");
 
-          if (exitCode !== 0 || !fs.existsSync(tmpPath)) {
+          if (exitCode !== 0 || !fs.existsSync(stagingFile)) {
             const kind = classifyYtDlpError(stderr);
             throw new YtDlpError(
               stderr.trim().split("\n").pop() || `yt-dlp download exited with code ${exitCode}`,
@@ -743,7 +887,7 @@ export function createYtDlpRunner(
             );
           }
 
-          const finalSize = fs.statSync(tmpPath).size;
+          const finalSize = fs.statSync(stagingFile).size;
           if (finalSize <= 0) {
             throw new Error("Tier 3 progressive download produced empty file");
           }
@@ -760,7 +904,7 @@ export function createYtDlpRunner(
             throw mismatchErr;
           }
 
-          fs.renameSync(tmpPath, outputPath);
+          fs.renameSync(stagingFile, outputPath);
           promoted = true;
           readablePath = outputPath;
           availableBytes = finalSize;
@@ -780,17 +924,16 @@ export function createYtDlpRunner(
           const errorObj = err instanceof Error ? err : new Error(String(err));
           status = "failed";
           failureError = errorObj;
-          if (!promoted) {
-            try {
-              if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-            } catch {
-              // Ignore
-            }
-          }
           notifyWaiters();
           throw errorObj;
+        } finally {
+          clearInterval(pollTimer);
+          activeJobs.delete(trackedJob);
+          // Always remove private staging dir (and any sidecars) after child process has exited
+          removeStagingDir(stagingDir);
         }
       })();
+      trackedJob.exited = done.catch(() => {});
 
       return {
         videoId,

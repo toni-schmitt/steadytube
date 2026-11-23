@@ -372,6 +372,10 @@ export class VideoResolver {
   private readonly videoRefreshInflight = new Map<string, Promise<ResolvedVideoRecord>>();
   private readonly activeProgressive = new Map<string, ProgressiveDownloadHandle>();
   private readonly startingHandles = new Set<ProgressiveDownloadHandle>();
+  private readonly activeRemuxProcs = new Set<{
+    killSync: () => void;
+    exited: Promise<unknown>;
+  }>();
   private readonly probeSemaphore = new Semaphore(6);
   private readonly tier3Semaphore = new Semaphore(2);
   private stopped = false;
@@ -411,6 +415,22 @@ export class VideoResolver {
       handle.cancel("Server shutting down");
     }
     this.activeProgressive.clear();
+    for (const remux of [...this.activeRemuxProcs]) {
+      remux.killSync();
+    }
+    this.ytDlp.stop?.();
+  }
+
+  async awaitShutdown(timeoutMs = 1000): Promise<void> {
+    const waiters: Array<Promise<unknown>> = [];
+    for (const remux of [...this.activeRemuxProcs]) {
+      waiters.push(remux.exited);
+    }
+    if (this.ytDlp.awaitShutdown) {
+      waiters.push(this.ytDlp.awaitShutdown(timeoutMs));
+    }
+    if (waiters.length === 0) return;
+    await withTimeoutNull(Promise.allSettled(waiters), timeoutMs);
   }
 
   getCached(videoId: string): ResolvedVideoRecord | undefined {
@@ -844,7 +864,16 @@ export class VideoResolver {
 
           // Progressive streaming path: stream bytes as yt-dlp writes them to disk instead of waiting for 100% completion
           if (failedTarget.clen > 0 && typeof this.ytDlp.startProgressiveDownload === "function") {
-            const releasePermit = await this.tier3Semaphore.acquirePermit();
+            let releasePermit: () => void;
+            try {
+              releasePermit = await this.tier3Semaphore.acquirePermit(5_000);
+            } catch {
+              this.logger.warn("Skipping Tier 3 progressive buffer: concurrent Tier 3 slots busy", {
+                videoId,
+                formatId: cacheFormatId,
+              });
+              return null;
+            }
             let permitOwnedByBackground = false;
             let reservationActive = false;
             this.ephemeralStore.pin(pinKey);
@@ -1025,7 +1054,17 @@ export class VideoResolver {
           }
 
           // Fallback non-progressive path (unknown clen or runner without progressive support)
-          return await this.tier3Semaphore.run(async () => {
+          let fallbackPermit: () => void;
+          try {
+            fallbackPermit = await this.tier3Semaphore.acquirePermit(5_000);
+          } catch {
+            this.logger.warn("Skipping Tier 3 fallback buffer: concurrent Tier 3 slots busy", {
+              videoId,
+              formatId: cacheFormatId,
+            });
+            return null;
+          }
+          try {
             if (this.stopped) return null;
             const recheck = reuseValidLocal(this.ephemeralStore.get(videoId, cacheFormatId));
             if (recheck) {
@@ -1045,15 +1084,34 @@ export class VideoResolver {
               return null;
             }
 
+            const downloadMaxBytes =
+              failedTarget.clen > 0
+                ? Math.min(maxCacheBytes, failedTarget.clen)
+                : Math.min(maxCacheBytes, budgetBefore);
+            const onStagingBytes =
+              failedTarget.clen > 0
+                ? undefined
+                : (bytes: number) => this.ephemeralStore.reserveBytes(pinKey, bytes);
+
             this.ephemeralStore.pin(pinKey);
 
             try {
               const useAuth = failedTarget.tier === 2 && this.config.playback.authFallback.enabled;
               try {
-                await this.ytDlp.downloadFormat(videoId, ytDlpSelector, outPath, { useAuth });
+                await this.ytDlp.downloadFormat(videoId, ytDlpSelector, outPath, {
+                  useAuth,
+                  maxBytes: downloadMaxBytes,
+                  onStagingBytes,
+                });
               } catch (firstErr) {
-                if (!this.stopped && !useAuth && this.config.playback.authFallback.enabled) {
-                  await this.ytDlp.downloadFormat(videoId, ytDlpSelector, outPath, { useAuth: true });
+                const isBudgetErr =
+                  firstErr instanceof Error && firstErr.name === "BudgetExceededError";
+                if (!this.stopped && !isBudgetErr && !useAuth && this.config.playback.authFallback.enabled) {
+                  await this.ytDlp.downloadFormat(videoId, ytDlpSelector, outPath, {
+                    useAuth: true,
+                    maxBytes: downloadMaxBytes,
+                    onStagingBytes,
+                  });
                 } else {
                   throw firstErr;
                 }
@@ -1117,7 +1175,9 @@ export class VideoResolver {
               this.ephemeralStore.releaseReservation(pinKey);
               this.ephemeralStore.unpin(pinKey);
             }
-          });
+          } finally {
+            fallbackPermit();
+          }
         }
 
         return null;
@@ -2102,12 +2162,20 @@ export class VideoResolver {
           : `bestaudio[ext=m4a][acodec^=mp4a]/bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio`;
 
         if (!this.ephemeralStore.get(videoId, videoFid)) {
-          if (expectedVideoBytes > 0 && !this.ephemeralStore.reserveBytes(videoPin, expectedVideoBytes)) {
-            throw new Error(
-              `Tier 3 video track exceeds available ephemeral disk budget (${expectedVideoBytes} > ${maxCacheBytes})`,
-            );
+          const videoBudget = this.ephemeralStore.getAvailableBudgetFor(videoPin);
+          if (expectedVideoBytes > 0) {
+            if (!this.ephemeralStore.reserveBytes(videoPin, expectedVideoBytes)) {
+              throw new Error(
+                `Tier 3 video track exceeds available ephemeral disk budget (${expectedVideoBytes} > ${maxCacheBytes})`,
+              );
+            }
+          } else if (videoBudget <= 0) {
+            throw new Error("Insufficient ephemeral disk budget for Tier 3 video track");
           }
-          await this.downloadWithAuthFallback(videoId, videoSelector, videoPath);
+          await this.downloadWithAuthFallback(videoId, videoSelector, videoPath, {
+            maxBytes: Math.min(maxCacheBytes, videoBudget),
+            onStagingBytes: (bytes) => this.ephemeralStore.reserveBytes(videoPin, bytes),
+          });
           downloadedVideo = true;
         }
         const finalVideoPath = await this.ensureDashIndexedFile(videoPath, "video/mp4", videoPin);
@@ -2121,12 +2189,20 @@ export class VideoResolver {
         const videoEntry = this.ephemeralStore.register(videoId, videoFid, finalVideoPath, "video/mp4");
 
         if (!this.ephemeralStore.get(videoId, audioFid)) {
-          if (expectedAudioBytes > 0 && !this.ephemeralStore.reserveBytes(audioPin, expectedAudioBytes)) {
-            throw new Error(
-              `Tier 3 audio track exceeds available ephemeral disk budget (${expectedAudioBytes} > ${maxCacheBytes})`,
-            );
+          const audioBudget = this.ephemeralStore.getAvailableBudgetFor(audioPin);
+          if (expectedAudioBytes > 0) {
+            if (!this.ephemeralStore.reserveBytes(audioPin, expectedAudioBytes)) {
+              throw new Error(
+                `Tier 3 audio track exceeds available ephemeral disk budget (${expectedAudioBytes} > ${maxCacheBytes})`,
+              );
+            }
+          } else if (audioBudget <= 0) {
+            throw new Error("Insufficient ephemeral disk budget for Tier 3 audio track");
           }
-          await this.downloadWithAuthFallback(videoId, audioSelector, audioPath);
+          await this.downloadWithAuthFallback(videoId, audioSelector, audioPath, {
+            maxBytes: Math.min(maxCacheBytes, audioBudget),
+            onStagingBytes: (bytes) => this.ephemeralStore.reserveBytes(audioPin, bytes),
+          });
           downloadedAudio = true;
         }
         const finalAudioPath = await this.ensureDashIndexedFile(audioPath, "audio/mp4", audioPin);
@@ -2309,13 +2385,23 @@ export class VideoResolver {
     videoId: string,
     selector: string,
     outputPath: string,
+    limits?: { maxBytes?: number; onStagingBytes?: (bytes: number) => boolean },
   ): Promise<void> {
     if (this.stopped) throw new Error("Server shutting down");
     try {
-      await this.ytDlp.downloadFormat(videoId, selector, outputPath, { useAuth: false });
+      await this.ytDlp.downloadFormat(videoId, selector, outputPath, {
+        useAuth: false,
+        maxBytes: limits?.maxBytes,
+        onStagingBytes: limits?.onStagingBytes,
+      });
     } catch (err) {
-      if (!this.stopped && this.config.playback.authFallback.enabled) {
-        await this.ytDlp.downloadFormat(videoId, selector, outputPath, { useAuth: true });
+      const isBudgetErr = err instanceof Error && err.name === "BudgetExceededError";
+      if (!this.stopped && !isBudgetErr && this.config.playback.authFallback.enabled) {
+        await this.ytDlp.downloadFormat(videoId, selector, outputPath, {
+          useAuth: true,
+          maxBytes: limits?.maxBytes,
+          onStagingBytes: limits?.onStagingBytes,
+        });
       } else {
         throw err;
       }
@@ -2327,9 +2413,7 @@ export class VideoResolver {
     mimeType: string,
     reserveKey?: string,
   ): Promise<string> {
-    const isWebm = mimeType.includes("webm");
-    if (isWebm) {
-      if (probeLocalFileDashRanges(filePath, mimeType)) return filePath;
+    if (mimeType.includes("webm")) {
       return filePath;
     }
     // For MP4/M4A, require a SINGLE global sidx covering all fragments (not per-fragment sidx)
@@ -2348,43 +2432,73 @@ export class VideoResolver {
     }
 
     const remuxPath = `${filePath}.dash.mp4`;
-    const proc = Bun.spawn(
-      [
-        ffmpeg,
-        "-y",
-        "-i",
-        filePath,
-        "-c",
-        "copy",
-        "-movflags",
-        "+dash+global_sidx+frag_keyframe+empty_moov+default_base_moof",
-        "-f",
-        "mp4",
-        remuxPath,
-      ],
-      { stdout: "ignore", stderr: "pipe" },
-    );
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        // Ignore
-      }
-    }, 60_000);
     let code = -1;
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let trackedRemux: { killSync: () => void; exited: Promise<unknown> } | null = null;
+
     try {
+      if (this.stopped) {
+        throw new Error("Server shutting down");
+      }
+      const proc = Bun.spawn(
+        [
+          ffmpeg,
+          "-y",
+          "-i",
+          filePath,
+          "-c",
+          "copy",
+          "-movflags",
+          "+dash+global_sidx+frag_keyframe+empty_moov+default_base_moof",
+          "-f",
+          "mp4",
+          remuxPath,
+        ],
+        { stdout: "ignore", stderr: "pipe" },
+      );
+
+      trackedRemux = {
+        killSync: () => {
+          try {
+            proc.kill("SIGKILL");
+          } catch {
+            // Already exited
+          }
+          try {
+            if (fs.existsSync(remuxPath)) fs.unlinkSync(remuxPath);
+          } catch {
+            // Ignore
+          }
+        },
+        exited: proc.exited.catch(() => {}),
+      };
+      this.activeRemuxProcs.add(trackedRemux);
+
+      timer = setTimeout(() => {
+        timedOut = true;
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // Ignore
+        }
+      }, 60_000);
+
       const stderrPromise = new Response(proc.stderr).text().catch(() => "");
       code = await proc.exited;
       await withTimeoutNull(stderrPromise, timedOut ? 100 : 500);
     } finally {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
+      if (trackedRemux) {
+        this.activeRemuxProcs.delete(trackedRemux);
+      }
       if (remuxReserveKey) {
         this.ephemeralStore.releaseReservation(remuxReserveKey);
       }
     }
+
     if (
+      !this.stopped &&
       !timedOut &&
       code === 0 &&
       fs.existsSync(remuxPath) &&

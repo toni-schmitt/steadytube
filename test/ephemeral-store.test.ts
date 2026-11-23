@@ -465,4 +465,22 @@ describe("EphemeralStore & HTTP Range parsing", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test("scanExistingFiles removes orphaned .stage-* dirs and -FragN sidecars on startup", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-stage-scan-"));
+    try {
+      const vidDir = path.join(tmpDir, "vidStage1");
+      const stageDir = path.join(vidDir, ".stage-123-456-1");
+      fs.mkdirSync(stageDir, { recursive: true });
+      fs.writeFileSync(path.join(stageDir, "media.mp4-Frag1"), new Uint8Array(500));
+      fs.writeFileSync(path.join(vidDir, "137.mp4-Frag2"), new Uint8Array(500));
+
+      const store = new EphemeralStore(tmpDir, 10_000, 60_000);
+      expect(fs.existsSync(stageDir)).toBe(false);
+      expect(fs.existsSync(path.join(vidDir, "137.mp4-Frag2"))).toBe(false);
+      expect(store.getStats().fileCount).toBe(0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

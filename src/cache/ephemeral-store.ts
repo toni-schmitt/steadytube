@@ -777,8 +777,19 @@ export class EphemeralStore {
         const dirPath = path.join(this.resolvedBaseDir, dirent.name);
         const files = fs.readdirSync(dirPath, { withFileTypes: true });
         for (const f of files) {
-          if (!f.isFile()) continue;
           const filePath = path.join(dirPath, f.name);
+          if (f.isDirectory()) {
+            // Delete orphaned private staging directories (and any -FragN sidecars inside)
+            if (f.name.startsWith(".stage-")) {
+              try {
+                fs.rmSync(filePath, { recursive: true, force: true });
+              } catch {
+                // Ignore
+              }
+            }
+            continue;
+          }
+          if (!f.isFile()) continue;
           try {
             const stat = fs.statSync(filePath);
             // Delete orphaned staging/temp files and expired entries on startup
@@ -787,6 +798,7 @@ export class EphemeralStore {
               f.name.endsWith(".ytdl") ||
               f.name.endsWith(".downloading") ||
               /\.tmp\.[^.]+$/.test(f.name) ||
+              /-Frag\d+/.test(f.name) ||
               f.name.endsWith(".dash.mp4");
             if (isStaging || now - stat.mtimeMs >= this.ttlMs) {
               fs.unlinkSync(filePath);

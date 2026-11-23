@@ -26,6 +26,7 @@ export interface RunningApp {
   resolver: VideoResolver;
   fetch: (req: Request) => Promise<Response>;
   stop(): void;
+  awaitShutdown(timeoutMs?: number): Promise<void>;
 }
 
 export function createApp(config: AppConfig, overrides: AppOverrides = {}): RunningApp {
@@ -79,6 +80,9 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
       resolver.stop();
       ephemeralStore.stopPeriodicCleanup();
     },
+    async awaitShutdown(timeoutMs = 1000): Promise<void> {
+      await resolver.awaitShutdown(timeoutMs);
+    },
   };
 }
 
@@ -111,6 +115,9 @@ export function startServer(config: AppConfig, overrides: AppOverrides = {}) {
     stop() {
       app.stop();
       server.stop(true);
+    },
+    async awaitShutdown(timeoutMs = 1000): Promise<void> {
+      await app.awaitShutdown(timeoutMs);
     },
   };
 }
