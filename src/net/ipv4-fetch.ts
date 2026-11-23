@@ -236,17 +236,43 @@ async function doSingleIpv4Request(
   const defaultPort = isHttps ? 443 : 80;
   const port = url.port ? Number(url.port) : defaultPort;
 
-  // Enforce deadline across DNS resolution as well as socket headers
-  const ipv4 = await Promise.race([
-    resolveIpv4(url.hostname, { publicIpv4Only: options.publicIpv4Only }),
-    new Promise<never>((_, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error(`IPv4 DNS resolution timed out after ${options.timeoutMs}ms: ${url.hostname}`)),
-        options.timeoutMs,
-      );
-      timer.unref?.();
-    }),
-  ]);
+  const getAbortError = () =>
+    options.signal?.reason instanceof Error
+      ? options.signal.reason
+      : new DOMException("The operation was aborted.", "AbortError");
+
+  if (options.signal?.aborted) {
+    throw getAbortError();
+  }
+
+  // Enforce deadline and abort signal across DNS resolution as well as socket headers
+  let dnsTimer: ReturnType<typeof setTimeout> | null = null;
+  let onDnsAbort: (() => void) | null = null;
+  let ipv4: string;
+  try {
+    ipv4 = await Promise.race([
+      resolveIpv4(url.hostname, { publicIpv4Only: options.publicIpv4Only }),
+      new Promise<never>((_, reject) => {
+        dnsTimer = setTimeout(
+          () =>
+            reject(
+              new Error(`IPv4 DNS resolution timed out after ${options.timeoutMs}ms: ${url.hostname}`),
+            ),
+          options.timeoutMs,
+        );
+        dnsTimer.unref?.();
+        if (options.signal) {
+          onDnsAbort = () => reject(getAbortError());
+          options.signal.addEventListener("abort", onDnsAbort, { once: true });
+        }
+      }),
+    ]);
+  } finally {
+    if (dnsTimer) clearTimeout(dnsTimer);
+    if (onDnsAbort && options.signal) {
+      options.signal.removeEventListener("abort", onDnsAbort);
+    }
+  }
 
   const remainingMs = Math.max(100, deadlineAt - Date.now());
 
@@ -261,13 +287,13 @@ async function doSingleIpv4Request(
 
   return await new Promise((resolve, reject) => {
     let settled = false;
-
-    const getAbortError = () =>
-      options.signal?.reason instanceof Error
-        ? options.signal.reason
-        : new DOMException("The operation was aborted.", "AbortError");
+    let onBodyAbort: (() => void) | null = null;
 
     const onAbort = () => {
+      if (onBodyAbort) {
+        onBodyAbort();
+        return;
+      }
       const abortErr = getAbortError();
       req.destroy(abortErr);
       if (!settled) {
@@ -369,8 +395,30 @@ async function doSingleIpv4Request(
         start(controller) {
           let closed = false;
           const cleanup = () => {
+            onBodyAbort = null;
             options.signal?.removeEventListener("abort", onAbort);
           };
+
+          const abortBodyStream = () => {
+            cleanup();
+            if (!closed) {
+              closed = true;
+              try {
+                controller.error(getAbortError());
+              } catch {
+                // Already closed
+              }
+            }
+            if (sourceStream !== res) sourceStream.destroy();
+            res.destroy();
+            req.destroy();
+          };
+
+          onBodyAbort = abortBodyStream;
+          if (options.signal?.aborted) {
+            abortBodyStream();
+            return;
+          }
 
           sourceStream.on("data", (chunk: Buffer | Uint8Array) => {
             if (closed) return;
@@ -384,6 +432,8 @@ async function doSingleIpv4Request(
               }
             } catch {
               closed = true;
+              cleanup();
+              if (sourceStream !== res) sourceStream.destroy();
               req.destroy();
               res.destroy();
             }
@@ -394,7 +444,11 @@ async function doSingleIpv4Request(
             if (!closed) {
               closed = true;
               try {
-                controller.close();
+                if (options.signal?.aborted) {
+                  controller.error(getAbortError());
+                } else {
+                  controller.close();
+                }
               } catch {
                 // Already closed
               }
@@ -403,6 +457,9 @@ async function doSingleIpv4Request(
 
           sourceStream.on("error", (err) => {
             cleanup();
+            if (sourceStream !== res) sourceStream.destroy();
+            res.destroy();
+            req.destroy();
             if (!closed) {
               closed = true;
               try {
@@ -415,6 +472,7 @@ async function doSingleIpv4Request(
 
           res.on("aborted", () => {
             cleanup();
+            if (sourceStream !== res) sourceStream.destroy();
             if (!closed) {
               closed = true;
               try {
@@ -428,11 +486,29 @@ async function doSingleIpv4Request(
               }
             }
           });
+
+          res.on("close", () => {
+            if (!closed && !res.complete) {
+              cleanup();
+              if (sourceStream !== res) sourceStream.destroy();
+              closed = true;
+              try {
+                controller.error(
+                  options.signal?.aborted
+                    ? getAbortError()
+                    : new Error("Upstream connection closed prematurely"),
+                );
+              } catch {
+                // Already closed
+              }
+            }
+          });
         },
         pull() {
           sourceStream.resume();
         },
         cancel() {
+          onBodyAbort = null;
           options.signal?.removeEventListener("abort", onAbort);
           sourceStream.destroy();
           res.destroy();

@@ -492,4 +492,175 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test("serializes concurrent search and playlist pagination continuations without duplicate fetches", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-pag-"));
+    try {
+      const searchContCalls: number[] = [];
+      const playlistContCalls: number[] = [];
+
+      const makeVideoNode = (id: string, title: string) => ({
+        type: "Video",
+        id,
+        title: { text: title },
+        author: { name: "Test Channel", id: "UC1234567890123456789012" },
+        duration: { seconds: 60 },
+        view_count: { text: "1K views" },
+        published: { text: "1 day ago" },
+      });
+
+      const makeSearchPage = (pageNum: number): any => ({
+        results: [makeVideoNode(`vid_page_${pageNum}`, `Page ${pageNum}`)],
+        has_continuation: pageNum < 3,
+        async getContinuation() {
+          searchContCalls.push(pageNum + 1);
+          await new Promise((r) => setTimeout(r, 25));
+          return makeSearchPage(pageNum + 1);
+        },
+      });
+
+      const makePlaylistFeed = (batchNum: number): any => {
+        const items = Array.from({ length: 100 }, (_, i) =>
+          makeVideoNode(`pl_${batchNum}_${i}`, `Item ${batchNum}-${i}`),
+        );
+        return {
+          info: {
+            title: { text: "Big Playlist" },
+            author: { name: { text: "Author" }, id: "UC1234567890123456789012" },
+            total_items: "200 videos",
+          },
+          items,
+          has_continuation: batchNum < 2,
+          async getContinuation() {
+            playlistContCalls.push(batchNum + 1);
+            await new Promise((r) => setTimeout(r, 25));
+            return makePlaylistFeed(batchNum + 1);
+          },
+        };
+      };
+
+      const fakeInnertube = {
+        async getClient() {
+          return {
+            async search() {
+              return makeSearchPage(1);
+            },
+            async getPlaylist() {
+              return makePlaylistFeed(1);
+            },
+          };
+        },
+        reset() {},
+      } as unknown as AnonymousInnertubeProvider;
+
+      const app = createApp(makeTestConfig(tmpDir, false), {
+        logger: noopLogger,
+        innertube: fakeInnertube,
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo() { throw new Error("unused"); },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+      });
+
+      // Seed page 1, then request page 2 (twice concurrently) + page 3 concurrently
+      const p1 = await (await app.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=cats&page=1"))).json() as any[];
+      expect(p1[0].videoId).toBe("vid_page_1");
+
+      const [r2a, r2b, r3] = await Promise.all([
+        app.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=cats&page=2")),
+        app.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=cats&page=2")),
+        app.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=cats&page=3")),
+      ]);
+      expect(((await r2a.json()) as any[])[0].videoId).toBe("vid_page_2");
+      expect(((await r2b.json()) as any[])[0].videoId).toBe("vid_page_2");
+      expect(((await r3.json()) as any[])[0].videoId).toBe("vid_page_3");
+      // Continuation for page 2 and page 3 must each have been called EXACTLY ONCE!
+      expect(searchContCalls).toEqual([2, 3]);
+
+      // Seed playlist page 1 (index=50 -> offset 0..99), then concurrently request index=150 (offset 100..199)
+      const pl1 = await (await app.fetch(new Request("http://127.0.0.1:8787/api/v1/playlists/PLtest123?index=50"))).json() as any;
+      expect(pl1.videos.length).toBe(100);
+
+      const [pl2a, pl2b] = await Promise.all([
+        app.fetch(new Request("http://127.0.0.1:8787/api/v1/playlists/PLtest123?index=150")),
+        app.fetch(new Request("http://127.0.0.1:8787/api/v1/playlists/PLtest123?index=150")),
+      ]);
+      const pl2aJson = (await pl2a.json()) as any;
+      const pl2bJson = (await pl2b.json()) as any;
+      expect(pl2aJson.videos.length).toBe(100);
+      expect(pl2aJson.videos[0].videoId).toBe("pl_2_0");
+      expect(pl2bJson.videos[0].videoId).toBe("pl_2_0");
+      expect(playlistContCalls).toEqual([2]);
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("media proxy enforces body timeout signals and rejects oversized RSS/image responses", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-media-bounds-"));
+    try {
+      const seenSignals: boolean[] = [];
+      const mockFetch = async (input: string | URL | Request, init?: RequestInit) => {
+        seenSignals.push(Boolean(init?.signal));
+        const u = input.toString();
+        if (u.includes("UULF_HUGE_FEED")) {
+          // Exceeds 5 MiB feed cap via Content-Length
+          return new Response("x", {
+            status: 200,
+            headers: {
+              "Content-Type": "application/atom+xml",
+              "Content-Length": String(6 * 1024 * 1024),
+            },
+          });
+        }
+        // Oversized image stream exceeding 10 MiB cap without Content-Length header
+        const bigBody = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const chunk = new Uint8Array(1024 * 1024);
+            for (let i = 0; i < 11; i++) {
+              controller.enqueue(chunk);
+            }
+            controller.close();
+          },
+        });
+        return new Response(bigBody, {
+          status: 200,
+          headers: { "Content-Type": "image/jpeg" },
+        });
+      };
+
+      const app = createApp(makeTestConfig(tmpDir, false), {
+        logger: noopLogger,
+        fetchFn: mockFetch,
+        fetchRawFn: mockFetch,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo() { throw new Error("unused"); },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+      });
+
+      const hugeFeed = await app.fetch(
+        new Request("http://127.0.0.1:8787/feed/playlist/UULF_HUGE_FEED"),
+      );
+      expect(hugeFeed.status).toBe(502);
+
+      const hugeImg = await app.fetch(
+        new Request("http://127.0.0.1:8787/vi/dQw4w9WgXcQ/maxresdefault.jpg"),
+      );
+      expect(hugeImg.status).toBe(502);
+
+      // Every upstream call received an AbortSignal timeout
+      expect(seenSignals.length).toBeGreaterThanOrEqual(2);
+      expect(seenSignals.every(Boolean)).toBe(true);
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

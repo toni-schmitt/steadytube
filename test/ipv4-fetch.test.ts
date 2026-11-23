@@ -42,6 +42,27 @@ describe("ipv4-fetch", () => {
             },
           });
         }
+        if (url.pathname === "/bad-gzip") {
+          return new Response(new Uint8Array([0x1f, 0x8b, 0xff, 0xff, 0x00, 0x01, 0x02, 0x03]), {
+            status: 200,
+            headers: {
+              "Content-Type": "text/plain",
+              "Content-Encoding": "gzip",
+            },
+          });
+        }
+        if (url.pathname === "/slow-body") {
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("chunk1"));
+              // Hold stream open until client aborts
+            },
+          });
+          return new Response(body, {
+            status: 200,
+            headers: { "Content-Type": "text/plain" },
+          });
+        }
         if (url.pathname === "/range") {
           const payload = "0123456789abcdefghij";
           const range = req.headers.get("range");
@@ -134,5 +155,40 @@ describe("ipv4-fetch", () => {
         allowedHost: (h) => /^(?:www\.)?youtube\.com$/i.test(h),
       }),
     ).rejects.toThrow(/disallowed upstream host/);
+  });
+
+  test("honors AbortSignal before DNS/request, aborts mid-body cleanly, and tears down corrupt gzip streams", async () => {
+    // 1) Pre-aborted signal rejects immediately with AbortError
+    const preCtrl = new AbortController();
+    preCtrl.abort(new DOMException("Pre-aborted", "AbortError"));
+    let preErr: Error | null = null;
+    try {
+      await ipv4Fetch(`${baseUrl}/echo-host`, { signal: preCtrl.signal });
+    } catch (err) {
+      preErr = err as Error;
+    }
+    expect(preErr).not.toBeNull();
+    expect(preErr!.name).toBe("AbortError");
+
+    // 2) Mid-body abort rejects with AbortError
+    const bodyCtrl = new AbortController();
+    const slowRes = await ipv4Fetch(`${baseUrl}/slow-body`, { signal: bodyCtrl.signal });
+    const reader = slowRes.body!.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toBe("chunk1");
+    const pending = reader.read();
+    bodyCtrl.abort(new DOMException("Client gone", "AbortError"));
+    let bodyErr: Error | null = null;
+    try {
+      await pending;
+    } catch (err) {
+      bodyErr = err as Error;
+    }
+    expect(bodyErr).not.toBeNull();
+    expect(bodyErr!.name).toBe("AbortError");
+
+    // 3) Corrupt gzip payload fails stream and cleans up socket
+    const badGzRes = await ipv4Fetch(`${baseUrl}/bad-gzip`);
+    await expect(badGzRes.text()).rejects.toThrow();
   });
 });

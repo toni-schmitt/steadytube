@@ -20,6 +20,49 @@ const VALID_VI_PATH = /^\/vi\/[A-Za-z0-9_-]{6,20}\/[A-Za-z0-9_.-]+\.(jpg|jpeg|we
 const VALID_FEED_ID = /^[A-Za-z0-9_-]{8,64}$/;
 const ALLOWED_IMAGE_HOST = /^(?:i\d*\.ytimg\.com|yt\d+\.ggpht\.com|yt\d+\.googleusercontent\.com|lh\d+\.googleusercontent\.com)$/i;
 const ALLOWED_FEED_HOST = /^(?:www\.)?youtube\.com$/i;
+const UPSTREAM_PROXY_TIMEOUT_MS = 20_000;
+const MAX_FEED_BODY_BYTES = 5 * 1024 * 1024; // 5 MiB cap for Atom/XML RSS feeds
+const MIN_MAX_IMAGE_PROXY_BYTES = 10 * 1024 * 1024; // 10 MiB hard cap for uncached image proxying
+
+async function readBoundedResponseBytes(
+  res: Response,
+  maxBytes: number,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const declaredLen = Number(res.headers.get("content-length") || "0");
+  if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`Upstream response Content-Length exceeded limit (${declaredLen} > ${maxBytes})`);
+  }
+  if (!res.body) return new Uint8Array(0);
+
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new Error(`Upstream response body exceeded limit (${total} > ${maxBytes})`);
+      }
+      chunks.push(value);
+    }
+  } catch (err) {
+    await reader.cancel().catch(() => {});
+    throw err;
+  }
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
 
 export class MediaProxyRoutes {
   private readonly thumbCache: TtlLruCache<string, CachedBinary>;
@@ -101,6 +144,8 @@ export class MediaProxyRoutes {
             try {
               const res = await this.fetchFn(upstreamUrl, {
                 method: "GET",
+                timeoutMs: UPSTREAM_PROXY_TIMEOUT_MS,
+                signal: AbortSignal.timeout(UPSTREAM_PROXY_TIMEOUT_MS),
                 httpsOnly: true,
                 publicIpv4Only: true,
                 allowedHost: (h) => ALLOWED_FEED_HOST.test(h),
@@ -111,15 +156,20 @@ export class MediaProxyRoutes {
               });
               lastStatus = res.status;
               lastContentType = res.headers.get("content-type") || "application/atom+xml; charset=utf-8";
-              lastBody = await res.text();
 
-              if (res.status === 200 || res.status === 404) {
+              if (res.status === 404) {
+                await res.body?.cancel().catch(() => {});
+                lastBody = "Not Found";
                 break;
               }
               if (res.status >= 500 && attempt === 0) {
+                await res.body?.cancel().catch(() => {});
                 await new Promise((r) => setTimeout(r, 250));
                 continue;
               }
+
+              const bodyBytes = await readBoundedResponseBytes(res, MAX_FEED_BODY_BYTES);
+              lastBody = new TextDecoder("utf-8").decode(bodyBytes);
               break;
             } catch (err) {
               if (attempt === 0) {
@@ -183,9 +233,16 @@ export class MediaProxyRoutes {
           let lastType = "image/jpeg";
           let lastBytes = new Uint8Array(0);
 
+          const maxProxyImageBytes = Math.max(
+            this.config.thumbnails.maxEntryBytes,
+            MIN_MAX_IMAGE_PROXY_BYTES,
+          );
+
           for (const url of candidateUrls) {
             const res = await this.fetchRawFn(url, {
               method: "GET",
+              timeoutMs: UPSTREAM_PROXY_TIMEOUT_MS,
+              signal: AbortSignal.timeout(UPSTREAM_PROXY_TIMEOUT_MS),
               httpsOnly: true,
               publicIpv4Only: true,
               allowedHost: (h) => ALLOWED_IMAGE_HOST.test(h),
@@ -197,7 +254,7 @@ export class MediaProxyRoutes {
             lastStatus = res.status;
             lastType = res.headers.get("content-type") || "image/jpeg";
             if (res.ok) {
-              lastBytes = new Uint8Array(await res.arrayBuffer());
+              lastBytes = await readBoundedResponseBytes(res, maxProxyImageBytes);
               const shouldCache = lastBytes.byteLength <= this.config.thumbnails.maxEntryBytes;
               return {
                 value: { status: 200, contentType: lastType, body: lastBytes },

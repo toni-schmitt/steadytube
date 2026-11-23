@@ -18,6 +18,7 @@ import {
 interface CachedSearchSession {
   pages: Array<Array<Record<string, unknown>>>;
   lastResult: any;
+  inflightContinuation?: Promise<void>;
 }
 
 interface CachedPlaylistSession {
@@ -36,6 +37,8 @@ interface CachedPlaylistSession {
   };
   videos: Array<Record<string, unknown>>;
   lastFeed: any;
+  exhausted?: boolean;
+  inflightContinuation?: Promise<void>;
 }
 
 interface ChannelTabContinuation {
@@ -113,15 +116,30 @@ export class BrowseRoutes {
       }
 
       while (session.pages.length < page) {
+        if (session.inflightContinuation) {
+          await session.inflightContinuation;
+          continue;
+        }
         if (!session.lastResult?.has_continuation) {
           return Response.json([]);
         }
-        const next: any = await session.lastResult.getContinuation();
-        const mapped = (next.results || [])
-          .map((n: unknown) => mapSearchResultNode(n, origin))
-          .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
-        session.pages.push(mapped);
-        session.lastResult = next;
+        const activeSession = session;
+        const step = (async () => {
+          const next: any = await activeSession.lastResult.getContinuation();
+          const mapped = (next.results || [])
+            .map((n: unknown) => mapSearchResultNode(n, origin))
+            .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
+          activeSession.pages.push(mapped);
+          activeSession.lastResult = next;
+        })();
+        activeSession.inflightContinuation = step;
+        try {
+          await step;
+        } finally {
+          if (activeSession.inflightContinuation === step) {
+            activeSession.inflightContinuation = undefined;
+          }
+        }
       }
 
       return Response.json(session.pages[page - 1] || []);
@@ -340,17 +358,32 @@ export class BrowseRoutes {
         }
 
         while (session.pages.length < page) {
+          if (session.inflightContinuation) {
+            await session.inflightContinuation;
+            continue;
+          }
           if (!session.lastResult?.has_continuation) {
             return Response.json([]);
           }
-          const next: any = await session.lastResult.getContinuation();
-          const more = (next.videos || next.posts || [])
-            .map((n: unknown) =>
-              mapYoutubeiVideoNode(n, origin, { author: channelAuthor, authorId: channelId }),
-            )
-            .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
-          session.pages.push(more);
-          session.lastResult = next;
+          const activeSession = session;
+          const step = (async () => {
+            const next: any = await activeSession.lastResult.getContinuation();
+            const more = (next.videos || next.posts || [])
+              .map((n: unknown) =>
+                mapYoutubeiVideoNode(n, origin, { author: channelAuthor, authorId: channelId }),
+              )
+              .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
+            activeSession.pages.push(more);
+            activeSession.lastResult = next;
+          })();
+          activeSession.inflightContinuation = step;
+          try {
+            await step;
+          } finally {
+            if (activeSession.inflightContinuation === step) {
+              activeSession.inflightContinuation = undefined;
+            }
+          }
         }
 
         return Response.json(session.pages[page - 1] || []);
@@ -522,23 +555,42 @@ export class BrowseRoutes {
         this.playlistSessions.set(playlistId, session);
       }
 
-      // Fetch continuations if caller asked past currently buffered items
+      // Fetch continuations if caller asked past currently buffered items (serialized per session)
       while (
         session.videos.length < startOffset + pageSize &&
-        session.lastFeed?.has_continuation
+        !session.exhausted &&
+        (session.inflightContinuation || session.lastFeed?.has_continuation)
       ) {
-        const next: any = await session.lastFeed.getContinuation();
-        const more = (next.items || [])
-          .map((v: unknown) =>
-            mapYoutubeiVideoNode(v, origin, {
-              author: session!.meta.author,
-              authorId: session!.meta.authorId,
-            }),
-          )
-          .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
-        if (more.length === 0) break;
-        session.videos.push(...more);
-        session.lastFeed = next;
+        if (session.inflightContinuation) {
+          await session.inflightContinuation;
+          continue;
+        }
+        const activeSession = session;
+        const step = (async () => {
+          const next: any = await activeSession.lastFeed.getContinuation();
+          const more = (next.items || [])
+            .map((v: unknown) =>
+              mapYoutubeiVideoNode(v, origin, {
+                author: activeSession.meta.author,
+                authorId: activeSession.meta.authorId,
+              }),
+            )
+            .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
+          if (more.length === 0) {
+            activeSession.exhausted = true;
+            return;
+          }
+          activeSession.videos.push(...more);
+          activeSession.lastFeed = next;
+        })();
+        activeSession.inflightContinuation = step;
+        try {
+          await step;
+        } finally {
+          if (activeSession.inflightContinuation === step) {
+            activeSession.inflightContinuation = undefined;
+          }
+        }
       }
 
       const slice = session.videos.slice(startOffset, startOffset + pageSize);
