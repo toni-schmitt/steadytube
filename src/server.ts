@@ -17,6 +17,7 @@ export interface AppOverrides {
   innertube?: AnonymousInnertubeProvider;
   fetchFn?: FetchLike;
   fetchRawFn?: FetchLike;
+  deferCacheScan?: boolean;
 }
 
 export interface RunningApp {
@@ -46,6 +47,7 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
     config.playback.ephemeralBuffer.maxCacheBytes,
     config.playback.ephemeralBuffer.ttlSeconds * 1000,
     logger,
+    { deferScan: overrides.deferCacheScan },
   );
 
   const innertube = overrides.innertube ?? new AnonymousInnertubeProvider(logger);
@@ -78,7 +80,7 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
     fetch: handler,
     stop() {
       resolver.stop();
-      ephemeralStore.stopPeriodicCleanup();
+      ephemeralStore.close();
     },
     async awaitShutdown(timeoutMs = 1000): Promise<void> {
       await resolver.awaitShutdown(timeoutMs);
@@ -87,8 +89,9 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
 }
 
 export function startServer(config: AppConfig, overrides: AppOverrides = {}) {
-  const app = createApp(config, overrides);
-  app.ephemeralStore.startPeriodicCleanup();
+  // Defer destructive startup staging-dir cleanup until AFTER the listening port is bound
+  // so an accidental second daemon failing with EADDRINUSE never touches live downloads.
+  const app = createApp(config, { ...overrides, deferCacheScan: true });
 
   const server = Bun.serve({
     hostname: config.host,
@@ -96,6 +99,9 @@ export function startServer(config: AppConfig, overrides: AppOverrides = {}) {
     idleTimeout: 120,
     fetch: app.fetch,
   });
+
+  app.ephemeralStore.initialize();
+  app.ephemeralStore.startPeriodicCleanup();
 
   app.logger.info("steadytube listening", {
     url: `http://${server.hostname}:${server.port}`,

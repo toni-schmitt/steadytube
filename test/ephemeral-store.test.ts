@@ -17,13 +17,15 @@ describe("EphemeralStore & HTTP Range parsing", () => {
     expect(parseHttpRangeHeader("bytes=500-5000", 1000)).toEqual({ start: 500, end: 999, isPartial: true });
     expect(parseHttpRangeHeader("bytes=1000-1200", 1000)).toBe("unsatisfiable");
     expect(parseHttpRangeHeader("bytes=500-200", 1000)).toBe("unsatisfiable");
-    // RFC 9110 §14.2: unknown range units and multi-range lists are ignored -> full representation
+    // RFC 9110 §14.2: unknown range units, multi-range lists, and invalid-syntax specs are ignored -> full representation
     expect(parseHttpRangeHeader("items=0-10", 1000)).toEqual({ start: 0, end: 999, isPartial: false });
     expect(parseHttpRangeHeader("bytes=0-10, 20-30", 1000)).toEqual({
       start: 0,
       end: 999,
       isPartial: false,
     });
+    expect(parseHttpRangeHeader("bytes=abc", 1000)).toEqual({ start: 0, end: 999, isPartial: false });
+    expect(parseHttpRangeHeader("bytes=-", 1000)).toEqual({ start: 0, end: 999, isPartial: false });
   });
 
   test("rejects path traversal segments and enforces baseDir containment", () => {
@@ -470,7 +472,7 @@ describe("EphemeralStore & HTTP Range parsing", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-stage-scan-"));
     try {
       const vidDir = path.join(tmpDir, "vidStage1");
-      const stageDir = path.join(vidDir, ".stage-123-456-1");
+      const stageDir = path.join(vidDir, ".stage-999999-456-1");
       fs.mkdirSync(stageDir, { recursive: true });
       fs.writeFileSync(path.join(stageDir, "media.mp4-Frag1"), new Uint8Array(500));
       fs.writeFileSync(path.join(vidDir, "137.mp4-Frag2"), new Uint8Array(500));
@@ -479,6 +481,68 @@ describe("EphemeralStore & HTTP Range parsing", () => {
       expect(fs.existsSync(stageDir)).toBe(false);
       expect(fs.existsSync(path.join(vidDir, "137.mp4-Frag2"))).toBe(false);
       expect(store.getStats().fileCount).toBe(0);
+      store.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("retires pinned entries on delete without dropping disk accounting or breaking active readers", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-retire-pin-"));
+    try {
+      const store = new EphemeralStore(tmpDir, 200_000, 60_000);
+      const p1 = store.getPathFor("vidRetire", "137", "mp4");
+      const data = new Uint8Array(150_000).fill(0x42);
+      fs.writeFileSync(p1, data);
+      const entry = store.register("vidRetire", "137", p1, "video/mp4");
+
+      // Start reading (pins entry synchronously and opens FD)
+      const res = store.serveFile(entry, new Request("http://127.0.0.1/videoplayback"));
+      expect(res.status).toBe(200);
+      expect(store.isPinned(entry.key)).toBe(true);
+
+      // Explicit delete retires from lookup immediately, but keeps file & accounting until reader closes!
+      store.delete("vidRetire", "137");
+      expect(store.get("vidRetire", "137")).toBeNull();
+      expect(fs.existsSync(p1)).toBe(true);
+      expect(store.reserveBytes("vidOther:137", 180_000)).toBe(false);
+      expect(store.getAvailableBudgetFor("vidOther:137")).toBe(50_000);
+
+      // Reader completes cleanly with all 150_000 bytes
+      const received = new Uint8Array(await res.arrayBuffer());
+      expect(received.byteLength).toBe(150_000);
+      expect(received[0]).toBe(0x42);
+      expect(received[149_999]).toBe(0x42);
+
+      // Once reader finishes, pin drops to 0 -> retired file is unlinked & budget is freed!
+      expect(store.isPinned(entry.key)).toBe(false);
+      expect(fs.existsSync(p1)).toBe(false);
+      expect(store.reserveBytes("vidOther:137", 180_000)).toBe(true);
+      store.releaseReservation("vidOther:137");
+      store.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("second EphemeralStore on an active cacheDir does not delete live staging directories", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-lock-"));
+    try {
+      const store1 = new EphemeralStore(tmpDir, 10_000, 60_000);
+      const liveStage = path.join(tmpDir, "vidLive", ".stage-live-fixture");
+      fs.mkdirSync(liveStage, { recursive: true });
+      fs.writeFileSync(path.join(liveStage, "media.mp4"), new Uint8Array(128));
+
+      // Second store while store1 holds lock MUST NOT wipe store1's live staging files
+      const store2 = new EphemeralStore(tmpDir, 10_000, 60_000);
+      expect(fs.existsSync(liveStage)).toBe(true);
+      store2.close();
+
+      // After store1 closes and releases lock, a new store cleans orphaned staging dirs
+      store1.close();
+      const store3 = new EphemeralStore(tmpDir, 10_000, 60_000);
+      expect(fs.existsSync(liveStage)).toBe(false);
+      store3.close();
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

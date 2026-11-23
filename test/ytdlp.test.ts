@@ -418,6 +418,107 @@ exec sleep 10`,
       await stopRunner.awaitShutdown?.(1000);
       await expect(pendingDl).rejects.toThrow();
       expect(fs.readdirSync(stopDir)).toEqual([]);
+
+      // 4) Final shared accounting check catches fast-exiting downloads before 100ms poll
+      const fastDir = path.join(tmpRoot, "vid-fast-budget");
+      const fastOut = path.join(fastDir, "137.mp4");
+      const fastStub = writeStub("stub-fast.sh", `head -c 512 /dev/zero > "$OUT"`);
+      const fastCfg = makeTestConfig();
+      fastCfg.binaries.ytDlp = fastStub;
+      fastCfg.playback.enableBgutilPot = false;
+      const fastRunner = createYtDlpRunner(fastCfg);
+      let fastErr: Error | null = null;
+      try {
+        await fastRunner.downloadFormat("dQw4w9WgXcQ", "137", fastOut, {
+          useAuth: false,
+          maxBytes: 10_000,
+          onStagingBytes: () => false, // Shared budget denies immediately
+        });
+      } catch (err) {
+        fastErr = err as Error;
+      }
+      expect(fastErr).not.toBeNull();
+      expect(fastErr!.name).toBe("BudgetExceededError");
+      expect(fs.existsSync(fastOut)).toBe(false);
+      expect(fs.readdirSync(fastDir)).toEqual([]);
+
+      // 5) Shutdown terminates detached descendant processes (process group kill)
+      const descDir = path.join(tmpRoot, "vid-desc");
+      const descOut = path.join(descDir, "137.mp4");
+      const pidFile = path.join(tmpRoot, "grandchild.pid");
+      const descStub = writeStub(
+        "stub-desc.sh",
+        `sleep 30 &
+echo $! > "${pidFile}"
+wait`,
+      );
+      const descCfg = makeTestConfig();
+      descCfg.binaries.ytDlp = descStub;
+      descCfg.playback.enableBgutilPot = false;
+      const descRunner = createYtDlpRunner(descCfg);
+      const descPending = descRunner.downloadFormat("dQw4w9WgXcQ", "137", descOut, {
+        useAuth: false,
+        timeoutMs: 10_000,
+      });
+      // Poll until the stub has forked its grandchild and written its PID
+      const waitDeadline = Date.now() + 3_000;
+      while (!fs.existsSync(pidFile) && Date.now() < waitDeadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(fs.existsSync(pidFile)).toBe(true);
+      const grandchildPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+      expect(grandchildPid).toBeGreaterThan(0);
+      descRunner.stop?.();
+      await descRunner.awaitShutdown?.(1000);
+      await expect(descPending).rejects.toThrow();
+      await new Promise((r) => setTimeout(r, 80));
+      let grandchildAlive = false;
+      try {
+        process.kill(grandchildPid, 0);
+        grandchildAlive = true;
+      } catch {
+        grandchildAlive = false;
+      }
+      expect(grandchildAlive).toBe(false);
+
+      // 6) extractVideoInfo bounds concurrent subprocesses (<= 4 in flight)
+      const concDir = path.join(tmpRoot, "vid-conc-extract");
+      fs.mkdirSync(concDir, { recursive: true });
+      const concScript = path.join(tmpRoot, "stub-extract-conc.sh");
+      fs.writeFileSync(
+        concScript,
+        `#!/bin/sh
+TAG="${concDir}/active-$$"
+touch "$TAG"
+sleep 0.12
+rm -f "$TAG"
+echo '{"id":"dQw4w9WgXcQ","formats":[]}'
+`,
+        { mode: 0o755 },
+      );
+      const concCfg = makeTestConfig();
+      concCfg.binaries.ytDlp = concScript;
+      concCfg.playback.enableBgutilPot = false;
+      const concRunner = createYtDlpRunner(concCfg);
+      let peakActive = 0;
+      const sampler = setInterval(() => {
+        try {
+          const count = fs.readdirSync(concDir).length;
+          if (count > peakActive) peakActive = count;
+        } catch {
+          // ignore
+        }
+      }, 15);
+      try {
+        await Promise.all(
+          Array.from({ length: 10 }, (_, i) =>
+            concRunner.extractVideoInfo(`vidTest000${i}`, { useAuth: false }),
+          ),
+        );
+      } finally {
+        clearInterval(sampler);
+      }
+      expect(peakActive).toBeLessThanOrEqual(4);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }

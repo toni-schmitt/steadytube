@@ -1,11 +1,128 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ProgressiveStreamSource } from "../cache/ephemeral-store.ts";
+import {
+  registerActiveStagingDir,
+  unregisterActiveStagingDir,
+  type ProgressiveStreamSource,
+} from "../cache/ephemeral-store.ts";
+import { Semaphore } from "../cache/memory-cache.ts";
 import type { AppConfig } from "../config.ts";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
 import { ipv4Fetch } from "../net/ipv4-fetch.ts";
+
+const MAX_EXTRACT_STDOUT_BYTES = 32 * 1024 * 1024; // 32 MiB cap on yt-dlp -J JSON
+const MAX_STDERR_BYTES = 2 * 1024 * 1024; // 2 MiB cap on stderr logs
+const MAX_CONCURRENT_EXTRACTIONS = 4;
+
+export interface ProcessGroupHandle {
+  child: ChildProcess;
+  exited: Promise<number>;
+  stdoutPromise: Promise<string>;
+  stderrPromise: Promise<string>;
+  killGroupSync(): void;
+}
+
+/**
+ * Terminate a detached process and its entire POSIX process group (`-pid`)
+ * so descendant processes (e.g. deno/ffmpeg/subshells) never outlive timeout or shutdown.
+ */
+export function killProcessGroupSync(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid && pid > 0) {
+    try {
+      process.kill(-pid, "SIGKILL");
+      return;
+    } catch {
+      // Fall back to direct child kill (e.g. already exited or non-leader)
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // Already exited
+  }
+}
+
+function collectBoundedStream(
+  stream: NodeJS.ReadableStream | null,
+  maxBytes: number,
+): Promise<string> {
+  if (!stream) return Promise.resolve("");
+  return new Promise<string>((resolve) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks, total).toString("utf8"));
+    };
+    stream.on("data", (chunk: Buffer | string) => {
+      if (settled) return;
+      const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      const remaining = maxBytes - total;
+      if (remaining > 0) {
+        const slice = buf.byteLength > remaining ? buf.subarray(0, remaining) : buf;
+        chunks.push(slice);
+        total += slice.byteLength;
+      }
+    });
+    stream.on("end", finish);
+    stream.on("close", finish);
+    stream.on("error", finish);
+  });
+}
+
+export function spawnProcessGroup(
+  cmd: string[],
+  opts: {
+    stdout: "pipe" | "ignore";
+    stderr: "pipe" | "ignore";
+    env?: Record<string, string | undefined>;
+    maxStdoutBytes?: number;
+    maxStderrBytes?: number;
+  },
+): ProcessGroupHandle {
+  const child = spawn(cmd[0]!, cmd.slice(1), {
+    detached: true,
+    stdio: ["ignore", opts.stdout, opts.stderr],
+    env: opts.env,
+  });
+
+  const stdoutPromise = collectBoundedStream(
+    child.stdout,
+    opts.maxStdoutBytes ?? MAX_EXTRACT_STDOUT_BYTES,
+  );
+  const stderrPromise = collectBoundedStream(
+    child.stderr,
+    opts.maxStderrBytes ?? MAX_STDERR_BYTES,
+  );
+
+  const exited = new Promise<number>((resolve, reject) => {
+    let done = false;
+    child.once("error", (err) => {
+      if (done) return;
+      done = true;
+      reject(err);
+    });
+    child.once("exit", (code) => {
+      if (done) return;
+      done = true;
+      resolve(code ?? -1);
+    });
+  });
+
+  return {
+    child,
+    exited,
+    stdoutPromise,
+    stderrPromise,
+    killGroupSync: () => killProcessGroupSync(child),
+  };
+}
 
 export const VALID_VIDEO_ID_RE = /^[A-Za-z0-9_-]{6,20}$/;
 // Allows yt-dlp format filter operators including ^= (prefix match, e.g. [vcodec^=avc1]);
@@ -355,6 +472,8 @@ export function createYtDlpRunner(
   let bgutilCheckCache: { available: boolean; expiresAt: number } | null = null;
   let stagingSeq = 0;
   let stopped = false;
+  const stopController = new AbortController();
+  const extractSemaphore = new Semaphore(MAX_CONCURRENT_EXTRACTIONS);
 
   interface TrackedJob {
     killSync: () => void;
@@ -369,6 +488,7 @@ export function createYtDlpRunner(
     const uniq = `${process.pid}-${Date.now()}-${++stagingSeq}`;
     const stagingDir = path.join(parentDir, `.stage-${uniq}`);
     fs.mkdirSync(stagingDir, { recursive: true });
+    registerActiveStagingDir(stagingDir);
     return {
       stagingDir,
       stagingFile: path.join(stagingDir, `media${ext}`),
@@ -376,6 +496,7 @@ export function createYtDlpRunner(
   }
 
   function removeStagingDir(stagingDir: string): void {
+    unregisterActiveStagingDir(stagingDir);
     try {
       fs.rmSync(stagingDir, { recursive: true, force: true });
     } catch {
@@ -451,7 +572,7 @@ export function createYtDlpRunner(
     }
 
     const cmd = [config.binaries.ytDlp, ...args];
-    const proc = Bun.spawn(cmd, {
+    const proc = spawnProcessGroup(cmd, {
       stdout: "pipe",
       stderr: "pipe",
       env: buildSpawnEnv(),
@@ -462,11 +583,7 @@ export function createYtDlpRunner(
 
     const killProc = (reason?: Error) => {
       if (reason && !abortedReason) abortedReason = reason;
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        // Already exited
-      }
+      proc.killGroupSync();
     };
 
     const job: TrackedJob = {
@@ -513,18 +630,17 @@ export function createYtDlpRunner(
     }
 
     try {
-      // Drain pipes concurrently while the process runs, but bound pipe wait after exit
-      // so an orphaned grandchild holding stdout/stderr open cannot hang the daemon.
-      const stdoutPromise = new Response(proc.stdout).text().catch(() => "");
-      const stderrPromise = new Response(proc.stderr).text().catch(() => "");
       const exitCode = await proc.exited;
       clearTimeout(timer);
       if (sizePollTimer) clearInterval(sizePollTimer);
 
+      // Ensure no detached descendants remain alive after the direct child exits
+      proc.killGroupSync();
+
       const graceMs = timedOut || abortedReason ? 100 : 500;
       const [stdout, stderr] = await Promise.all([
-        awaitWithGrace(stdoutPromise, graceMs, ""),
-        awaitWithGrace(stderrPromise, graceMs, ""),
+        awaitWithGrace(proc.stdoutPromise, graceMs, ""),
+        awaitWithGrace(proc.stderrPromise, graceMs, ""),
       ]);
 
       if (abortedReason) {
@@ -544,6 +660,7 @@ export function createYtDlpRunner(
     } catch (err) {
       clearTimeout(timer);
       if (sizePollTimer) clearInterval(sizePollTimer);
+      proc.killGroupSync();
       if (err instanceof YtDlpError) throw err;
       if (abortedReason && err === abortedReason) throw err;
       throw new YtDlpError(
@@ -564,6 +681,9 @@ export function createYtDlpRunner(
 
     stop(): void {
       stopped = true;
+      if (!stopController.signal.aborted) {
+        stopController.abort(new YtDlpError("yt-dlp runner stopped", "unknown", "", null));
+      }
       for (const job of [...activeJobs]) {
         job.killSync();
       }
@@ -576,44 +696,61 @@ export function createYtDlpRunner(
     },
 
     async extractVideoInfo(videoId: string, opts: { useAuth: boolean }): Promise<YtDlpVideoInfo> {
-      const watchUrl = buildWatchUrl(videoId);
-      const bgutilAvailable = await isBgutilAvailable();
-      const args = buildYtDlpBaseArgs(config, {
-        useAuth: opts.useAuth,
-        bgutilAvailable,
-        extraArgs: ["-J", "--skip-download", "--", watchUrl],
-      });
-
-      const startMs = Date.now();
-      const { stdout, stderr, exitCode } = await spawnYtDlp(args, config.playback.ytDlpTimeoutMs);
-      const elapsedMs = Date.now() - startMs;
-
-      if (exitCode !== 0 || !stdout.trim()) {
-        const kind = classifyYtDlpError(stderr);
-        logger.warn("yt-dlp extraction failed", {
-          videoId,
-          useAuth: opts.useAuth,
-          exitCode,
-          kind,
-          elapsedMs,
-          stderr: stderr.slice(0, 400),
-        });
-        throw new YtDlpError(
-          stderr.trim().split("\n").pop() || `yt-dlp exited with code ${exitCode}`,
-          kind,
-          stderr,
-          exitCode,
-        );
+      if (stopped) {
+        throw new YtDlpError("yt-dlp runner stopped", "unknown", "", null);
       }
+      const watchUrl = buildWatchUrl(videoId);
+      const release = await extractSemaphore.acquirePermit(
+        config.playback.ytDlpTimeoutMs,
+        stopController.signal,
+      );
+      try {
+        if (stopped) {
+          throw new YtDlpError("yt-dlp runner stopped", "unknown", "", null);
+        }
+        const bgutilAvailable = await isBgutilAvailable();
+        if (stopped) {
+          throw new YtDlpError("yt-dlp runner stopped", "unknown", "", null);
+        }
+        const args = buildYtDlpBaseArgs(config, {
+          useAuth: opts.useAuth,
+          bgutilAvailable,
+          extraArgs: ["-J", "--skip-download", "--", watchUrl],
+        });
 
-      const parsed = JSON.parse(stdout) as YtDlpVideoInfo;
-      logger.info("yt-dlp extracted video info", {
-        videoId,
-        tier: opts.useAuth ? 2 : 1,
-        formats: parsed.formats?.length ?? 0,
-        elapsedMs,
-      });
-      return parsed;
+        const startMs = Date.now();
+        const { stdout, stderr, exitCode } = await spawnYtDlp(args, config.playback.ytDlpTimeoutMs);
+        const elapsedMs = Date.now() - startMs;
+
+        if (exitCode !== 0 || !stdout.trim()) {
+          const kind = classifyYtDlpError(stderr);
+          logger.warn("yt-dlp extraction failed", {
+            videoId,
+            useAuth: opts.useAuth,
+            exitCode,
+            kind,
+            elapsedMs,
+            stderr: stderr.slice(0, 400),
+          });
+          throw new YtDlpError(
+            stderr.trim().split("\n").pop() || `yt-dlp exited with code ${exitCode}`,
+            kind,
+            stderr,
+            exitCode,
+          );
+        }
+
+        const parsed = JSON.parse(stdout) as YtDlpVideoInfo;
+        logger.info("yt-dlp extracted video info", {
+          videoId,
+          tier: opts.useAuth ? 2 : 1,
+          formats: parsed.formats?.length ?? 0,
+          elapsedMs,
+        });
+        return parsed;
+      } finally {
+        release();
+      }
     },
 
     async downloadFormat(
@@ -628,30 +765,33 @@ export function createYtDlpRunner(
       const watchUrl = buildWatchUrl(videoId);
       const safeSelector = assertSafeFormatSelector(formatSelector);
       const bgutilAvailable = await isBgutilAvailable();
+      if (stopped) {
+        throw new YtDlpError("yt-dlp runner stopped", "unknown", "", null);
+      }
       const { stagingDir, stagingFile } = createStagingLocation(outputPath);
 
-      const args = buildYtDlpBaseArgs(config, {
-        useAuth: opts.useAuth,
-        bgutilAvailable,
-        extraArgs: [
-          "-f",
-          safeSelector,
-          "--fixup",
-          "never", // Keep exact untouched DASH bytes so Shaka sidx/Cues byte offsets match 1:1
-          "--no-part",
-          "--no-continue",
-          "--force-overwrites",
-          "-o",
-          stagingFile,
-          "--",
-          watchUrl,
-        ],
-      });
-
-      const timeoutMs = opts.timeoutMs ?? 180_000;
-      const startMs = Date.now();
-
       try {
+        const args = buildYtDlpBaseArgs(config, {
+          useAuth: opts.useAuth,
+          bgutilAvailable,
+          extraArgs: [
+            "-f",
+            safeSelector,
+            "--fixup",
+            "never", // Keep exact untouched DASH bytes so Shaka sidx/Cues byte offsets match 1:1
+            "--no-part",
+            "--no-continue",
+            "--force-overwrites",
+            "-o",
+            stagingFile,
+            "--",
+            watchUrl,
+          ],
+        });
+
+        const timeoutMs = opts.timeoutMs ?? 180_000;
+        const startMs = Date.now();
+
         const { stderr, exitCode } = await spawnYtDlp(args, timeoutMs, {
           stagingDir,
           maxBytes: opts.maxBytes,
@@ -673,6 +813,14 @@ export function createYtDlpRunner(
         if (opts.maxBytes && opts.maxBytes > 0 && finalSize > opts.maxBytes) {
           const budgetErr = new Error(
             `Tier 3 download exceeded maxCacheBytes (${finalSize} > ${opts.maxBytes})`,
+          );
+          budgetErr.name = "BudgetExceededError";
+          throw budgetErr;
+        }
+        // Final shared accounting check before rename (catches fast downloads finishing before the 100ms poll)
+        if (opts.onStagingBytes && !opts.onStagingBytes(finalSize)) {
+          const budgetErr = new Error(
+            `Tier 3 download exceeded shared ephemeral disk budget (${finalSize} bytes)`,
           );
           budgetErr.name = "BudgetExceededError";
           throw budgetErr;
@@ -705,36 +853,48 @@ export function createYtDlpRunner(
       const watchUrl = buildWatchUrl(videoId);
       const safeSelector = assertSafeFormatSelector(formatSelector);
       const bgutilAvailable = await isBgutilAvailable();
-      const { stagingDir, stagingFile } = createStagingLocation(outputPath);
+      // Recheck stopped immediately after async bgutil probe so stop() never races startup
+      if (stopped) {
+        throw new YtDlpError("yt-dlp runner stopped", "unknown", "", null);
+      }
 
-      const args = buildYtDlpBaseArgs(config, {
-        useAuth: opts.useAuth,
-        bgutilAvailable,
-        extraArgs: [
-          "-f",
-          safeSelector,
-          "--fixup",
-          "never",
-          "--no-part",
-          "--no-continue",
-          "--force-overwrites",
-          "-o",
-          stagingFile,
-          "--",
-          watchUrl,
-        ],
-      });
+      const { stagingDir, stagingFile } = createStagingLocation(outputPath);
+      let proc: ProcessGroupHandle;
+      try {
+        const args = buildYtDlpBaseArgs(config, {
+          useAuth: opts.useAuth,
+          bgutilAvailable,
+          extraArgs: [
+            "-f",
+            safeSelector,
+            "--fixup",
+            "never",
+            "--no-part",
+            "--no-continue",
+            "--force-overwrites",
+            "-o",
+            stagingFile,
+            "--",
+            watchUrl,
+          ],
+        });
+        if (stopped) {
+          throw new YtDlpError("yt-dlp runner stopped", "unknown", "", null);
+        }
+        const cmd = [config.binaries.ytDlp, ...args];
+        proc = spawnProcessGroup(cmd, {
+          stdout: "ignore",
+          stderr: "pipe",
+          env: buildSpawnEnv(),
+        });
+      } catch (err) {
+        removeStagingDir(stagingDir);
+        throw err;
+      }
 
       const stallTimeoutMs = opts.stallTimeoutMs ?? Math.max(30_000, config.playback.streamStallTimeoutMs * 2);
       const idleTimeoutMs = opts.idleTimeoutMs ?? 5 * 60_000;
       const maxTotalTimeoutMs = opts.maxTotalTimeoutMs ?? 10 * 60_000;
-
-      const cmd = [config.binaries.ytDlp, ...args];
-      const proc = Bun.spawn(cmd, {
-        stdout: "ignore",
-        stderr: "pipe",
-        env: buildSpawnEnv(),
-      });
 
       let readablePath = stagingFile;
       let availableBytes = 0;
@@ -775,11 +935,7 @@ export function createYtDlpRunner(
         status = "failed";
         failureError = killReason;
         clearInterval(pollTimer);
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          // Process may have already exited
-        }
+        proc.killGroupSync();
         if (cleanupSyncNow && !promoted) {
           removeStagingDir(stagingDir);
         }
@@ -867,15 +1023,15 @@ export function createYtDlpRunner(
 
       const done = (async (): Promise<{ filePath: string; size: number }> => {
         try {
-          const stderrPromise = new Response(proc.stderr).text().catch(() => "");
           const exitCode = await proc.exited;
           clearInterval(pollTimer);
+          proc.killGroupSync();
 
           if (killReason) {
             throw killReason;
           }
 
-          const stderr = await awaitWithGrace(stderrPromise, 500, "");
+          const stderr = await awaitWithGrace(proc.stderrPromise, 500, "");
 
           if (exitCode !== 0 || !fs.existsSync(stagingFile)) {
             const kind = classifyYtDlpError(stderr);
@@ -921,6 +1077,7 @@ export function createYtDlpRunner(
           return { filePath: outputPath, size: finalSize };
         } catch (err) {
           clearInterval(pollTimer);
+          proc.killGroupSync();
           const errorObj = err instanceof Error ? err : new Error(String(err));
           status = "failed";
           failureError = errorObj;

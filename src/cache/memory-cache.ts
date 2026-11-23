@@ -151,8 +151,8 @@ export class Semaphore {
     }
   }
 
-  async run<T>(fn: () => Promise<T>, timeoutMs?: number): Promise<T> {
-    const release = await this.acquirePermit(timeoutMs);
+  async run<T>(fn: () => Promise<T>, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
+    const release = await this.acquirePermit(timeoutMs, signal);
     try {
       return await fn();
     } finally {
@@ -165,8 +165,8 @@ export class Semaphore {
    * Useful for background lifecycles (e.g. progressive downloads) that outlive
    * the initial request handler.
    */
-  async acquirePermit(timeoutMs?: number): Promise<() => void> {
-    await this.acquire(timeoutMs);
+  async acquirePermit(timeoutMs?: number, signal?: AbortSignal): Promise<() => void> {
+    await this.acquire(timeoutMs, signal);
     let released = false;
     return () => {
       if (released) return;
@@ -175,27 +175,52 @@ export class Semaphore {
     };
   }
 
-  private acquire(timeoutMs?: number): Promise<void> {
+  private acquire(timeoutMs?: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      const reason =
+        signal.reason instanceof Error
+          ? signal.reason
+          : new DOMException("The operation was aborted.", "AbortError");
+      return Promise.reject(reason);
+    }
     if (this.active < this.maxConcurrency) {
       this.active++;
       return Promise.resolve();
     }
     return new Promise<void>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | null = null;
-      const grant = () => {
+      const cleanup = () => {
         if (timer) {
           clearTimeout(timer);
           timer = null;
         }
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const grant = () => {
+        cleanup();
         this.active++;
         resolve();
       };
+      const onAbort = () => {
+        const idx = this.queue.indexOf(grant);
+        if (idx !== -1) {
+          this.queue.splice(idx, 1);
+          cleanup();
+          const reason =
+            signal?.reason instanceof Error
+              ? signal.reason
+              : new DOMException("The operation was aborted.", "AbortError");
+          reject(reason);
+        }
+      };
       this.queue.push(grant);
+      signal?.addEventListener("abort", onAbort, { once: true });
       if (timeoutMs !== undefined && timeoutMs > 0) {
         timer = setTimeout(() => {
           const idx = this.queue.indexOf(grant);
           if (idx !== -1) {
             this.queue.splice(idx, 1);
+            cleanup();
             reject(new Error(`Semaphore acquire timed out after ${timeoutMs}ms`));
           }
         }, timeoutMs);

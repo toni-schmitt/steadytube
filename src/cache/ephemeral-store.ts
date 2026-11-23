@@ -35,11 +35,44 @@ export interface ProgressiveStreamSource {
 }
 
 const MAX_PROGRESSIVE_SEEK_AHEAD_BYTES = 64 * 1024 * 1024; // 64 MiB
+const LOCK_FILENAME = ".steadytube.lock";
+
+// Process-local tracking so a second store instance in the same process never deletes
+// live staging directories or active temp artifacts.
+const activeStagingDirs = new Set<string>();
+const activeStoreLocks = new Map<string, symbol>();
+
+export function registerActiveStagingDir(dirPath: string): void {
+  activeStagingDirs.add(path.resolve(dirPath));
+}
+
+export function unregisterActiveStagingDir(dirPath: string): void {
+  activeStagingDirs.delete(path.resolve(dirPath));
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+function extractStagingOwnerPid(name: string): number | null {
+  const m = /^\.stage-(\d+)-/.exec(name) || /\.pid-(\d+)\.dash\.mp4$/.exec(name);
+  if (!m) return null;
+  const pid = Number(m[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
 
 /**
  * Parse HTTP Range header per RFC 9110 §14.2:
- * - Unknown range units or unsupported multi-range specs are ignored (returns full 200).
- * - Invalid/out-of-bounds single byte range returns "unsatisfiable" (416).
+ * - Unknown range units, unsupported multi-range specs, and syntactically invalid
+ *   byte-range specs (e.g. `bytes=abc`, `bytes=-`) are ignored (returns full 200).
+ * - Syntactically valid but unsatisfiable ranges (out of bounds, empty file, `-0`,
+ *   or inverted `bytes=500-200`) return `"unsatisfiable"` (416).
  */
 export function parseHttpRangeHeader(
   rangeHeader: string | null,
@@ -49,15 +82,20 @@ export function parseHttpRangeHeader(
     return { start: 0, end: Math.max(0, totalSize - 1), isPartial: false };
   }
   const trimmed = rangeHeader.trim();
-  // RFC 9110 §14.1.2: ignore unknown range units; ignore multi-range lists (serve full 200)
+  // RFC 9110 §14.1.2 / §14.2: ignore unknown range units and multi-range lists (serve full 200)
   if (!/^bytes=/i.test(trimmed) || trimmed.includes(",")) {
     return { start: 0, end: Math.max(0, totalSize - 1), isPartial: false };
   }
   const match = /^bytes=(\d*)-(\d*)$/i.exec(trimmed);
   if (!match) {
-    return "unsatisfiable";
+    // Syntactically invalid byte-range-spec -> ignore per RFC 9110 §14.2
+    return { start: 0, end: Math.max(0, totalSize - 1), isPartial: false };
   }
   const [, rawStart, rawEnd] = match;
+  if (rawStart === "" && rawEnd === "") {
+    // `bytes=-` is syntactically invalid -> ignore per RFC 9110 §14.2
+    return { start: 0, end: Math.max(0, totalSize - 1), isPartial: false };
+  }
   if (totalSize === 0) {
     return "unsatisfiable";
   }
@@ -65,9 +103,7 @@ export function parseHttpRangeHeader(
   let start: number;
   let end: number;
 
-  if (rawStart === "" && rawEnd === "") {
-    return "unsatisfiable";
-  } else if (rawStart === "") {
+  if (rawStart === "") {
     const suffixLen = Number(rawEnd);
     if (!Number.isFinite(suffixLen) || suffixLen <= 0) return "unsatisfiable";
     start = Math.max(0, totalSize - suffixLen);
@@ -96,11 +132,20 @@ function sanitizeSegment(input: string, label: string): string {
   return cleaned;
 }
 
+export interface EphemeralStoreOptions {
+  /** Skip initial startup scan in constructor (call `initialize()` after binding server port) */
+  deferScan?: boolean;
+}
+
 export class EphemeralStore {
   private readonly resolvedBaseDir: string;
   private readonly entries = new Map<string, EphemeralFileEntry>();
+  private readonly retiredEntriesByKey = new Map<string, EphemeralFileEntry[]>();
   private readonly pinnedCounts = new Map<string, number>();
   private readonly reservedBytesByKey = new Map<string, number>();
+  private readonly lockToken = Symbol("ephemeral-store-lock");
+  private ownsCleanupLock = false;
+  private initialized = false;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -108,9 +153,18 @@ export class EphemeralStore {
     private readonly maxCacheBytes: number,
     private readonly ttlMs: number,
     private readonly logger: Logger = noopLogger,
+    options: EphemeralStoreOptions = {},
   ) {
     fs.mkdirSync(this.baseDir, { recursive: true });
     this.resolvedBaseDir = path.resolve(this.baseDir);
+    if (!options.deferScan) {
+      this.initialize();
+    }
+  }
+
+  initialize(): void {
+    if (this.initialized) return;
+    this.initialized = true;
     this.scanExistingFiles();
   }
 
@@ -126,6 +180,74 @@ export class EphemeralStore {
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
+    }
+  }
+
+  close(): void {
+    this.stopPeriodicCleanup();
+    this.releaseCleanupLock();
+  }
+
+  private tryAcquireCleanupLock(): boolean {
+    if (this.ownsCleanupLock) return true;
+    const existingToken = activeStoreLocks.get(this.resolvedBaseDir);
+    if (existingToken && existingToken !== this.lockToken) {
+      return false;
+    }
+
+    const lockPath = path.join(this.resolvedBaseDir, LOCK_FILENAME);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fd = fs.openSync(lockPath, "wx");
+        try {
+          fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+        } finally {
+          fs.closeSync(fd);
+        }
+        activeStoreLocks.set(this.resolvedBaseDir, this.lockToken);
+        this.ownsCleanupLock = true;
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") {
+          return false;
+        }
+        try {
+          const raw = fs.readFileSync(lockPath, "utf8");
+          const parsed = JSON.parse(raw) as { pid?: number };
+          if (typeof parsed.pid === "number" && parsed.pid > 0) {
+            if (parsed.pid !== process.pid && isPidAlive(parsed.pid)) {
+              return false;
+            }
+            if (parsed.pid === process.pid && activeStoreLocks.has(this.resolvedBaseDir)) {
+              return false;
+            }
+          }
+        } catch {
+          // Corrupt or unreadable lock file from crashed process -> treat as stale
+        }
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+          return false;
+        }
+      }
+    }
+    return false;
+  }
+
+  private releaseCleanupLock(): void {
+    if (!this.ownsCleanupLock) return;
+    this.ownsCleanupLock = false;
+    if (activeStoreLocks.get(this.resolvedBaseDir) === this.lockToken) {
+      activeStoreLocks.delete(this.resolvedBaseDir);
+    }
+    const lockPath = path.join(this.resolvedBaseDir, LOCK_FILENAME);
+    try {
+      if (fs.existsSync(lockPath)) {
+        fs.unlinkSync(lockPath);
+      }
+    } catch {
+      // Ignore
     }
   }
 
@@ -160,6 +282,22 @@ export class EphemeralStore {
     const count = this.pinnedCounts.get(key) ?? 0;
     if (count <= 1) {
       this.pinnedCounts.delete(key);
+      const retired = this.retiredEntriesByKey.get(key);
+      if (retired) {
+        this.retiredEntriesByKey.delete(key);
+        const liveEntry = this.entries.get(key);
+        for (const entry of retired) {
+          if (liveEntry && liveEntry.filePath === entry.filePath) continue;
+          try {
+            if (fs.existsSync(entry.filePath)) {
+              fs.unlinkSync(entry.filePath);
+            }
+          } catch {
+            // Ignore
+          }
+        }
+        this.pruneEmptySubdirs();
+      }
     } else {
       this.pinnedCounts.set(key, count - 1);
     }
@@ -177,6 +315,16 @@ export class EphemeralStore {
     return sum;
   }
 
+  private getRetiredBytes(): number {
+    let sum = 0;
+    for (const list of this.retiredEntriesByKey.values()) {
+      for (const entry of list) {
+        sum += entry.size;
+      }
+    }
+    return sum;
+  }
+
   /**
    * Reserve space in the shared disk budget before starting a Tier 3 writer
    * (progressive download, fallback download, or remux). Evicts unpinned
@@ -186,12 +334,13 @@ export class EphemeralStore {
     const needed = Math.max(0, Math.ceil(bytes));
     const existingForKey = this.reservedBytesByKey.get(key) ?? 0;
     const otherReserved = this.getReservedBytes() - existingForKey;
-    if (otherReserved + needed > this.maxCacheBytes) {
+    const retiredBytes = this.getRetiredBytes();
+    if (retiredBytes + otherReserved + needed > this.maxCacheBytes) {
       return false;
     }
 
-    // Fail before evicting unpinned entries if pinned entries already make the reservation impossible
-    let pinnedBytes = 0;
+    // Fail before evicting unpinned entries if pinned/retired entries already make reservation impossible
+    let pinnedBytes = retiredBytes;
     for (const entry of this.entries.values()) {
       if (entry.key !== key && this.isPinned(entry.key)) {
         pinnedBytes += entry.size;
@@ -207,7 +356,7 @@ export class EphemeralStore {
     // Evict expired/LRU unpinned completed entries to make room for reserved writers
     this.cleanup(otherReserved + needed);
 
-    let registeredBytes = 0;
+    let registeredBytes = retiredBytes;
     for (const entry of this.entries.values()) {
       if (entry.key !== key) {
         registeredBytes += entry.size;
@@ -231,12 +380,12 @@ export class EphemeralStore {
 
   /**
    * Remaining disk budget for an unknown-size writer after accounting for pinned
-   * entries and other active reservations (evicting unpinned entries as needed).
+   * entries, retired pinned entries, and other active reservations.
    */
   getAvailableBudgetFor(key: string): number {
     const existingForKey = this.reservedBytesByKey.get(key) ?? 0;
     const otherReserved = this.getReservedBytes() - existingForKey;
-    let pinnedBytes = 0;
+    let pinnedBytes = this.getRetiredBytes();
     for (const entry of this.entries.values()) {
       if (entry.key !== key && this.isPinned(entry.key)) {
         pinnedBytes += entry.size;
@@ -250,6 +399,12 @@ export class EphemeralStore {
     const stat = fs.statSync(safePath);
     const now = Date.now();
     const key = this.makeKey(videoId, formatId);
+    const prev = this.entries.get(key);
+    if (prev && prev.filePath !== safePath && this.isPinned(key)) {
+      const list = this.retiredEntriesByKey.get(key) ?? [];
+      list.push(prev);
+      this.retiredEntriesByKey.set(key, list);
+    }
     const entry: EphemeralFileEntry = {
       key,
       filePath: safePath,
@@ -266,9 +421,17 @@ export class EphemeralStore {
   delete(videoId: string, formatId: string): void {
     const key = this.makeKey(videoId, formatId);
     const entry = this.entries.get(key);
-    if (entry) {
-      this.removeEntry(key, entry);
+    if (!entry) return;
+    if (this.isPinned(key)) {
+      // Retire from lookup immediately, but defer unlink and accounting release until
+      // the last active reader unpins this key so readers and disk budget stay consistent.
+      this.entries.delete(key);
+      const list = this.retiredEntriesByKey.get(key) ?? [];
+      list.push(entry);
+      this.retiredEntriesByKey.set(key, list);
+      return;
     }
+    this.removeEntry(key, entry);
   }
 
   get(videoId: string, formatId: string): EphemeralFileEntry | null {
@@ -332,76 +495,102 @@ export class EphemeralStore {
       });
     }
 
-    // Pin the entry for the lifetime of this stream so quota cleanup cannot
-    // unlink it before fs.createReadStream opens the descriptor.
+    // Open the descriptor synchronously BEFORE committing 200/206 headers so
+    // evicted/unlinked files return a clean 503 instead of a truncated 206 stream.
+    let openFd: number;
+    try {
+      this.assertContainedPath(entry.filePath);
+      openFd = fs.openSync(entry.filePath, "r");
+    } catch {
+      return new Response("Cached stream expired; reload required", { status: 503 });
+    }
+
+    // Pin the entry for the lifetime of this open descriptor so quota cleanup or
+    // explicit retirement keeps disk accounting accurate until the reader closes.
     this.pin(entry.key);
+    let fd: number | null = openFd;
+    let cursor = parsed.start;
+    const end = parsed.end;
+    let closed = false;
     let unpinned = false;
-    const unpinOnce = () => {
+    const signal = req.signal;
+
+    const closeFd = () => {
+      if (fd !== null) {
+        const toClose = fd;
+        fd = null;
+        try {
+          fs.closeSync(toClose);
+        } catch {
+          // Already closed
+        }
+      }
       if (!unpinned) {
         unpinned = true;
         this.unpin(entry.key);
       }
+      signal.removeEventListener("abort", onAbort);
     };
 
-    // Backpressure-aware bounded ReadStream so slow players never pull huge files into RAM
-    const nodeStream = parsed.isPartial
-      ? fs.createReadStream(entry.filePath, {
-          start: parsed.start,
-          end: parsed.end,
-          highWaterMark: 64 * 1024,
-        })
-      : fs.createReadStream(entry.filePath, {
-          highWaterMark: 64 * 1024,
-        });
+    const onAbort = () => {
+      closed = true;
+      closeFd();
+    };
+    if (signal.aborted) {
+      closed = true;
+      closeFd();
+      return new Response(null, { status: 499 });
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    // Backpressure-aware bounded reads directly from the opened FD
     const body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        let closed = false;
-        nodeStream.on("data", (chunk: string | Buffer) => {
-          if (closed) return;
-          const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      pull(controller) {
+        if (closed || signal.aborted || fd === null) {
+          closeFd();
+          if (signal.aborted) {
+            try {
+              controller.error(
+                signal.reason instanceof Error
+                  ? signal.reason
+                  : new DOMException("The operation was aborted.", "AbortError"),
+              );
+            } catch {
+              // Already closed
+            }
+          }
+          return;
+        }
+        try {
+          const toRead = Math.min(64 * 1024, end - cursor + 1);
+          const buf = Buffer.allocUnsafe(toRead);
+          const bytesRead = fs.readSync(fd, buf, 0, toRead, cursor);
+          if (bytesRead <= 0) {
+            closed = true;
+            closeFd();
+            controller.error(new Error("Cached ephemeral file truncated mid-stream"));
+            return;
+          }
+          cursor += bytesRead;
+          controller.enqueue(new Uint8Array(buf.buffer, buf.byteOffset, bytesRead));
+          if (cursor > end) {
+            closed = true;
+            closeFd();
+            controller.close();
+          }
+        } catch (err) {
+          closed = true;
+          closeFd();
           try {
-            controller.enqueue(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
-            if (controller.desiredSize !== null && controller.desiredSize <= 0) {
-              nodeStream.pause();
-            }
+            controller.error(err);
           } catch {
-            closed = true;
-            nodeStream.destroy();
-            unpinOnce();
+            // Already closed
           }
-        });
-        nodeStream.on("end", () => {
-          unpinOnce();
-          if (!closed) {
-            closed = true;
-            try {
-              controller.close();
-            } catch {
-              // Already closed
-            }
-          }
-        });
-        nodeStream.on("close", () => {
-          unpinOnce();
-        });
-        nodeStream.on("error", (err) => {
-          unpinOnce();
-          if (!closed) {
-            closed = true;
-            try {
-              controller.error(err);
-            } catch {
-              // Already closed
-            }
-          }
-        });
-      },
-      pull() {
-        nodeStream.resume();
+        }
       },
       cancel() {
-        nodeStream.destroy();
-        unpinOnce();
+        closed = true;
+        closeFd();
       },
     });
 
@@ -713,7 +902,7 @@ export class EphemeralStore {
       }
     }
 
-    let totalBytes = 0;
+    let totalBytes = this.getRetiredBytes();
     for (const entry of this.entries.values()) {
       totalBytes += entry.size;
     }
@@ -742,7 +931,7 @@ export class EphemeralStore {
   }
 
   getStats(): { fileCount: number; totalBytes: number; baseDir: string } {
-    let totalBytes = 0;
+    let totalBytes = this.getRetiredBytes();
     for (const entry of this.entries.values()) {
       totalBytes += entry.size;
     }
@@ -769,6 +958,12 @@ export class EphemeralStore {
   }
 
   private scanExistingFiles(): void {
+    const canCleanStaging = this.tryAcquireCleanupLock();
+    if (!canCleanStaging) {
+      this.logger.warn("Another SteadyTube instance owns cacheDir; skipping staging cleanup on startup", {
+        baseDir: this.resolvedBaseDir,
+      });
+    }
     try {
       const videoDirs = fs.readdirSync(this.resolvedBaseDir, { withFileTypes: true });
       const now = Date.now();
@@ -779,8 +974,15 @@ export class EphemeralStore {
         for (const f of files) {
           const filePath = path.join(dirPath, f.name);
           if (f.isDirectory()) {
-            // Delete orphaned private staging directories (and any -FragN sidecars inside)
-            if (f.name.startsWith(".stage-")) {
+            // Delete orphaned private staging directories ONLY when we own the cache lock
+            // and the staging owner process is verified dead (and not active in this process).
+            if (canCleanStaging && f.name.startsWith(".stage-")) {
+              const resolvedStage = path.resolve(filePath);
+              if (activeStagingDirs.has(resolvedStage)) continue;
+              const ownerPid = extractStagingOwnerPid(f.name);
+              if (ownerPid !== null && ownerPid !== process.pid && isPidAlive(ownerPid)) {
+                continue;
+              }
               try {
                 fs.rmSync(filePath, { recursive: true, force: true });
               } catch {
@@ -800,8 +1002,19 @@ export class EphemeralStore {
               /\.tmp\.[^.]+$/.test(f.name) ||
               /-Frag\d+/.test(f.name) ||
               f.name.endsWith(".dash.mp4");
-            if (isStaging || now - stat.mtimeMs >= this.ttlMs) {
+            if (isStaging) {
+              if (!canCleanStaging) continue;
+              const ownerPid = extractStagingOwnerPid(f.name);
+              if (ownerPid !== null && ownerPid !== process.pid && isPidAlive(ownerPid)) {
+                continue;
+              }
               fs.unlinkSync(filePath);
+              continue;
+            }
+            if (now - stat.mtimeMs >= this.ttlMs) {
+              if (canCleanStaging) {
+                fs.unlinkSync(filePath);
+              }
               continue;
             }
             const formatId = f.name.replace(/\.[^.]+$/, "");
@@ -824,8 +1037,10 @@ export class EphemeralStore {
           }
         }
       }
-      this.cleanup();
-      this.pruneEmptySubdirs();
+      if (canCleanStaging) {
+        this.cleanup();
+        this.pruneEmptySubdirs();
+      }
     } catch {
       // Base dir empty or inaccessible
     }
@@ -837,6 +1052,9 @@ export class EphemeralStore {
       if (key.startsWith(prefix)) return true;
     }
     for (const key of this.reservedBytesByKey.keys()) {
+      if (key.startsWith(prefix)) return true;
+    }
+    for (const key of this.retiredEntriesByKey.keys()) {
       if (key.startsWith(prefix)) return true;
     }
     return false;

@@ -3,12 +3,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  computeFileRangeSha256,
   hasValidGlobalMp4Sidx,
   parseCuesElementHeaderAt,
   parseMp4DashRanges,
   parseWebmDashRanges,
   probeLocalFileDashRanges,
+  probeMp4TrackMetadata,
   probeRemoteDashRanges,
+  sha256Hex,
 } from "../src/media/container-probe.ts";
 import type { Ipv4FetchOptions } from "../src/net/ipv4-fetch.ts";
 
@@ -238,6 +241,34 @@ describe("container-probe", () => {
       );
       expect(hasValidGlobalMp4Sidx(hierPath)).toBe(false);
 
+      // sidx skipping fragment 1 via firstOffset -> MUST be rejected!
+      const skippedFirstPath = path.join(tmpDir, "skip-first.mp4");
+      fs.writeFileSync(
+        skippedFirstPath,
+        concatBytes(
+          ftyp,
+          moov,
+          makeSidxBox([frag2.byteLength], { firstOffset: frag1.byteLength }),
+          frag1,
+          frag2,
+        ),
+      );
+      expect(hasValidGlobalMp4Sidx(skippedFirstPath)).toBe(false);
+
+      // sidx with shifted reference boundary not landing on moof -> MUST be rejected!
+      const shiftedPath = path.join(tmpDir, "shifted.mp4");
+      fs.writeFileSync(
+        shiftedPath,
+        concatBytes(
+          ftyp,
+          moov,
+          makeSidxBox([frag1.byteLength - 10, frag2.byteLength + 10]),
+          frag1,
+          frag2,
+        ),
+      );
+      expect(hasValidGlobalMp4Sidx(shiftedPath)).toBe(false);
+
       // Real FFmpeg verification if ffmpeg is installed locally
       const ffmpegBin =
         Bun.which("ffmpeg") ||
@@ -291,7 +322,20 @@ describe("container-probe", () => {
           ]);
           expect(hasValidGlobalMp4Sidx(badRemux)).toBe(false);
           expect(hasValidGlobalMp4Sidx(goodRemux)).toBe(true);
-          expect(probeLocalFileDashRanges(goodRemux, "video/mp4")).not.toBeNull();
+          const probedRanges = probeLocalFileDashRanges(goodRemux, "video/mp4");
+          expect(probedRanges).not.toBeNull();
+          const probedMeta = probeMp4TrackMetadata(goodRemux);
+          expect(probedMeta).not.toBeNull();
+          expect(probedMeta!.codec).toMatch(/^avc1\./);
+          expect(probedMeta!.width).toBe(160);
+          expect(probedMeta!.height).toBe(90);
+          expect(probedMeta!.durationSec).toBeGreaterThan(2);
+          expect(probedMeta!.durationSec).toBeLessThan(3.5);
+          // Verify SHA-256 range helper
+          const fileBytes = fs.readFileSync(goodRemux);
+          expect(computeFileRangeSha256(goodRemux, 0, probedRanges!.initEnd)).toBe(
+            sha256Hex(fileBytes.subarray(0, probedRanges!.initEnd + 1)),
+          );
         }
       }
     } finally {
