@@ -1,10 +1,20 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import type { AppConfig } from "../config.ts";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
 import { parseHttpRangeHeader, type EphemeralStore } from "../cache/ephemeral-store.ts";
 import {
+  MAX_DASH_HEADER_PROBE_BYTES,
+  probeLocalFileDashRanges,
+} from "../media/container-probe.ts";
+import {
+  doesTargetMatchRequestIdentity,
+  type ExpectedTargetIdentity,
   findStreamTargetInRecord,
+  formatDashLayoutKey,
+  MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES,
+  parseRangeBounds,
   type StreamTarget,
   type StreamTargetRemote,
   type VideoResolver,
@@ -17,6 +27,98 @@ const MAX_RECOVERY_ATTEMPTS = 4;
 
 function isRecoverableStatus(status: number): boolean {
   return status === 403 || status === 404 || status === 410 || status === 429 || status >= 500;
+}
+
+function parseContentRangeHeader(
+  header: string | null,
+): { start: number; end: number; total: number | null } | { unsatisfiableTotal: number } | null {
+  if (!header) return null;
+  const trimmed = header.trim();
+  const rangeMatch = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(trimmed);
+  if (rangeMatch) {
+    const start = Number(rangeMatch[1]);
+    const end = Number(rangeMatch[2]);
+    const total = rangeMatch[3] === "*" ? null : Number(rangeMatch[3]);
+    if (Number.isFinite(start) && Number.isFinite(end) && (total === null || Number.isFinite(total))) {
+      return { start, end, total };
+    }
+    return null;
+  }
+  const unsatMatch = /^bytes\s+\*\/(\d+)$/i.exec(trimmed);
+  if (unsatMatch) {
+    const total = Number(unsatMatch[1]);
+    if (Number.isFinite(total)) return { unsatisfiableTotal: total };
+  }
+  return null;
+}
+
+/**
+ * Verify that an upstream 200 / 206 / 416 response does not contradict the
+ * authoritative exact `expectedTotal` length bound to the issued playback URL.
+ */
+function doesUpstreamResponseMatchExpectedLength(res: Response, expectedTotal: number): boolean {
+  if (!expectedTotal || expectedTotal <= 0) return true;
+  if (res.status === 206) {
+    const parsed = parseContentRangeHeader(res.headers.get("content-range"));
+    if (parsed && "total" in parsed && parsed.total !== null && parsed.total !== expectedTotal) {
+      return false;
+    }
+    return true;
+  }
+  if (res.status === 416) {
+    const parsed = parseContentRangeHeader(res.headers.get("content-range"));
+    if (parsed && "unsatisfiableTotal" in parsed && parsed.unsatisfiableTotal !== expectedTotal) {
+      return false;
+    }
+    return true;
+  }
+  if (res.status === 200) {
+    const cl = res.headers.get("content-length");
+    if (cl && /^\d+$/.test(cl.trim())) {
+      const len = Number(cl.trim());
+      if (len !== expectedTotal) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Pass-through incremental SHA-256 tap for small init/index byte ranges so
+ * mid-playback Tier 3 recovery can verify not just range bounds but also
+ * exact init/index bytes against what Shaka already parsed.
+ */
+function tapStreamHash(
+  source: ReadableStream<Uint8Array>,
+  expectedLength: number,
+  onDigest: (hex: string) => void,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  const hash = crypto.createHash("sha256");
+  let seen = 0;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          if (seen === expectedLength) {
+            onDigest(hash.digest("hex"));
+          }
+          controller.close();
+          return;
+        }
+        if (value && value.byteLength > 0) {
+          seen += value.byteLength;
+          hash.update(value);
+          controller.enqueue(value);
+        }
+      } catch (err) {
+        controller.error(err);
+      }
+    },
+    async cancel(reason) {
+      await reader.cancel(reason).catch(() => {});
+    },
+  });
 }
 
 function parseRequestedRangeStart(req: Request, totalSize: number): number | undefined {
@@ -219,8 +321,15 @@ export class VideoPlaybackRoute {
     const clenParam = url.searchParams.get("clen");
     const urlClen = clenParam && /^\d+$/.test(clenParam) ? Number(clenParam) : 0;
     const urlLayout = url.searchParams.get("layout") || null;
-    const expectedIdentity =
-      urlClen > 0 || urlLayout ? { clen: urlClen > 0 ? urlClen : undefined, layout: urlLayout } : undefined;
+    const urlXtags = url.searchParams.get("xtags") || null;
+    const expectedIdentity: ExpectedTargetIdentity | undefined =
+      urlClen > 0 || urlLayout || urlXtags
+        ? {
+            clen: urlClen > 0 ? urlClen : undefined,
+            layout: urlLayout,
+            xtags: urlXtags,
+          }
+        : undefined;
 
     // Case 1: Standard daemon-issued proxy URL (?v=<id>&fid=<fid>&itag=<itag>...)
     if (videoId !== null) {
@@ -235,8 +344,39 @@ export class VideoPlaybackRoute {
       let resolvedAfterMiss = false;
 
       if (!target && !cachedRecord) {
+        // First check if an already-available compatible local file exists on disk (no download needed!)
+        if (formatId) {
+          const diskEntry = this.ephemeralStore.get(videoId, formatId);
+          if (diskEntry) {
+            const sizeOk = urlClen === 0 || diskEntry.size === urlClen;
+            let layoutOk = !urlLayout;
+            if (sizeOk && urlLayout) {
+              const probed = probeLocalFileDashRanges(
+                diskEntry.filePath,
+                diskEntry.mimeType,
+                MAX_DASH_HEADER_PROBE_BYTES,
+              );
+              layoutOk = formatDashLayoutKey(probed) === urlLayout;
+            }
+            if (sizeOk && layoutOk) {
+              return this.ephemeralStore.serveFile(diskEntry, req);
+            }
+          }
+        }
+
+        // Apply far-seek guardrail on cache miss so a >64 MiB request NEVER triggers cold Tier 3 download
+        // from byte 0; also cap remote-issued fids to maxTier: 2 since cold Tier 3 keys are `tier3-*`.
+        const requestedStart = parseRequestedRangeStart(req, urlClen);
+        const isFarSeek =
+          requestedStart !== undefined && requestedStart > MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES;
+        const isNonTier3IssuedUrl = Boolean(formatId && !formatId.startsWith("tier3-") && expectedIdentity);
+        const missMaxTier = isFarSeek || isNonTier3IssuedUrl ? 2 : 3;
+
         try {
-          const rec = await raceWithAbort(this.resolver.resolveVideo(videoId, origin), req.signal);
+          const rec = await raceWithAbort(
+            this.resolver.resolveVideo(videoId, origin, { maxTier: missMaxTier }),
+            req.signal,
+          );
           resolvedAfterMiss = true;
           target = findStreamTargetInRecord(rec, formatId, itag, expectedIdentity);
         } catch (err) {
@@ -258,7 +398,7 @@ export class VideoPlaybackRoute {
         return Response.json({ error: "Stream format not found" }, { status: 404 });
       }
 
-      return await this.serveTarget(req, target, origin);
+      return await this.serveTarget(req, target, origin, expectedIdentity);
     }
 
     // Case 2: Invidious-style ?host=rrX.googlevideo.com fallback proxy (strictly validated host)
@@ -276,7 +416,12 @@ export class VideoPlaybackRoute {
     return Response.json({ error: "Missing video stream parameters" }, { status: 400 });
   }
 
-  private async serveTarget(req: Request, target: StreamTarget, origin: string): Promise<Response> {
+  private async serveTarget(
+    req: Request,
+    target: StreamTarget,
+    origin: string,
+    expectedIdentity?: ExpectedTargetIdentity,
+  ): Promise<Response> {
     if (req.signal.aborted) {
       return new Response(null, { status: 499 });
     }
@@ -321,7 +466,7 @@ export class VideoPlaybackRoute {
             current.itag,
             origin,
             current,
-            { requestedRangeStart: parseRequestedRangeStart(req, current.clen) },
+            { requestedRangeStart: parseRequestedRangeStart(req, expectedIdentity?.clen || current.clen) },
           ),
           req.signal,
         );
@@ -334,6 +479,9 @@ export class VideoPlaybackRoute {
         return new Response(null, { status: 499 });
       }
       if (preRecovered) {
+        if (!doesTargetMatchRequestIdentity(preRecovered, expectedIdentity)) {
+          return new Response("Stream representation changed; reload required", { status: 410 });
+        }
         if (preRecovered.kind === "local") {
           return this.serveLocalTargetOr503(preRecovered, req);
         }
@@ -353,6 +501,12 @@ export class VideoPlaybackRoute {
       try {
         const res = await this.fetchUpstreamSegment(req, current);
         if (res.status === 200 || res.status === 206 || res.status === 416) {
+          const expectedTotal = expectedIdentity?.clen || current.clen || 0;
+          if (!doesUpstreamResponseMatchExpectedLength(res, expectedTotal)) {
+            await res.body?.cancel().catch(() => {});
+            this.resolver.markNeedsMetadataRefresh(current.videoId, current.formatId, current);
+            return new Response("Stream representation changed; reload required", { status: 410 });
+          }
           return this.buildStreamResponse(req, res, current);
         }
 
@@ -397,7 +551,7 @@ export class VideoPlaybackRoute {
             current.itag,
             origin,
             current,
-            { requestedRangeStart: parseRequestedRangeStart(req, current.clen) },
+            { requestedRangeStart: parseRequestedRangeStart(req, expectedIdentity?.clen || current.clen) },
           ),
           req.signal,
         );
@@ -412,6 +566,9 @@ export class VideoPlaybackRoute {
       }
       if (!recovered) {
         return new Response("Upstream stream unavailable", { status: 503 });
+      }
+      if (!doesTargetMatchRequestIdentity(recovered, expectedIdentity)) {
+        return new Response("Stream representation changed; reload required", { status: 410 });
       }
       if (recovered.kind === "local") {
         return this.serveLocalTargetOr503(recovered, req);
@@ -438,13 +595,17 @@ export class VideoPlaybackRoute {
       return this.ephemeralStore.serveFile(entry, req);
     }
     if (fs.existsSync(target.filePath)) {
-      const reRegistered = this.ephemeralStore.register(
+      this.ephemeralStore.register(
         target.videoId,
         target.formatId,
         target.filePath,
         target.mimeType,
       );
-      return this.ephemeralStore.serveFile(reRegistered, req);
+      // Verify the entry wasn't immediately evicted by register()'s budget cleanup
+      const verified = this.ephemeralStore.get(target.videoId, target.formatId);
+      if (verified) {
+        return this.ephemeralStore.serveFile(verified, req);
+      }
     }
     this.resolver.invalidateVideoIfTargetMatches(target.videoId, target.formatId, target);
     return new Response("Cached stream expired; reload required", { status: 503 });
@@ -494,7 +655,7 @@ export class VideoPlaybackRoute {
       return new Response(null, { status: upstream.status, headers: outHeaders });
     }
 
-    const guardedBody = withStallWatchdog(
+    let guardedBody = withStallWatchdog(
       upstream.body,
       this.config.playback.streamStallTimeoutMs,
       req.signal,
@@ -508,6 +669,39 @@ export class VideoPlaybackRoute {
         });
       },
     );
+
+    // Opportunistically fingerprint exact init/index ranges as Shaka fetches them
+    if (upstream.status === 206 && target.dashRanges && contentRange) {
+      const parsedCr = parseContentRangeHeader(contentRange);
+      if (parsedCr && "start" in parsedCr) {
+        const rangeLen = parsedCr.end - parsedCr.start + 1;
+        if (rangeLen > 0 && rangeLen <= MAX_DASH_HEADER_PROBE_BYTES) {
+          const initB = parseRangeBounds(target.dashRanges.init);
+          const indexB = parseRangeBounds(target.dashRanges.index);
+          if (
+            initB &&
+            !target.dashRanges.initHash &&
+            parsedCr.start === initB.start &&
+            parsedCr.end === initB.end
+          ) {
+            const dr = target.dashRanges;
+            guardedBody = tapStreamHash(guardedBody, rangeLen, (hex) => {
+              if (!dr.initHash) dr.initHash = hex;
+            });
+          } else if (
+            indexB &&
+            !target.dashRanges.indexHash &&
+            parsedCr.start === indexB.start &&
+            parsedCr.end === indexB.end
+          ) {
+            const dr = target.dashRanges;
+            guardedBody = tapStreamHash(guardedBody, rangeLen, (hex) => {
+              if (!dr.indexHash) dr.indexHash = hex;
+            });
+          }
+        }
+      }
+    }
 
     return new Response(guardedBody, {
       status: upstream.status,

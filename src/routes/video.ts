@@ -1,7 +1,7 @@
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
 import { buildStaticDashMpdXml } from "../innertube/mappers.ts";
-import type { VideoResolver } from "../media/video-resolver.ts";
+import { hasCompleteDashPair, type VideoResolver } from "../media/video-resolver.ts";
 import { VALID_VIDEO_ID_RE } from "../media/ytdlp.ts";
 import { ipv4Fetch, readBoundedResponseBytes, type FetchLike } from "../net/ipv4-fetch.ts";
 
@@ -43,7 +43,13 @@ export class VideoRoutes {
     }
 
     try {
-      const record = await this.resolver.resolveVideo(videoId, origin);
+      const record = await this.resolver.resolveVideo(videoId, origin, { requireDashPair: true });
+      if (!hasCompleteDashPair(record.adaptiveFormats)) {
+        return Response.json(
+          { error: "Video lacks complete DASH video and audio representations" },
+          { status: 503 },
+        );
+      }
       const xml = buildStaticDashMpdXml(record.durationSec, record.adaptiveFormats);
       return new Response(xml, {
         status: 200,
