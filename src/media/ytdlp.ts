@@ -407,6 +407,8 @@ export interface ProgressiveDownloadOptions {
   maxBytes: number;
   /** Optional logical cache formatId when yt-dlp selector differs from client fid */
   cacheFormatId?: string;
+  /** Called with total bytes inside the job's staging dir; return false to abort download */
+  onStagingBytes?: (bytes: number) => boolean;
   stallTimeoutMs?: number;
   idleTimeoutMs?: number;
   maxTotalTimeoutMs?: number;
@@ -810,17 +812,18 @@ export function createYtDlpRunner(
         }
 
         const finalSize = fs.statSync(stagingFile).size;
-        if (opts.maxBytes && opts.maxBytes > 0 && finalSize > opts.maxBytes) {
+        const totalStagedBytes = Math.max(finalSize, getDirectoryBytes(stagingDir));
+        if (opts.maxBytes && opts.maxBytes > 0 && totalStagedBytes > opts.maxBytes) {
           const budgetErr = new Error(
-            `Tier 3 download exceeded maxCacheBytes (${finalSize} > ${opts.maxBytes})`,
+            `Tier 3 download exceeded maxCacheBytes (${totalStagedBytes} > ${opts.maxBytes})`,
           );
           budgetErr.name = "BudgetExceededError";
           throw budgetErr;
         }
-        // Final shared accounting check before rename (catches fast downloads finishing before the 100ms poll)
-        if (opts.onStagingBytes && !opts.onStagingBytes(finalSize)) {
+        // Final shared accounting check against full staging dir (media + any sidecars) before rename
+        if (opts.onStagingBytes && !opts.onStagingBytes(totalStagedBytes)) {
           const budgetErr = new Error(
-            `Tier 3 download exceeded shared ephemeral disk budget (${finalSize} bytes)`,
+            `Tier 3 download exceeded shared ephemeral disk budget (${totalStagedBytes} bytes)`,
           );
           budgetErr.name = "BudgetExceededError";
           throw budgetErr;
@@ -948,6 +951,7 @@ export function createYtDlpRunner(
       };
       activeJobs.add(trackedJob);
 
+      let stagingHighWater = 0;
       const pollTimer = setInterval(() => {
         if (status !== "downloading") return;
         const now = Date.now();
@@ -975,13 +979,25 @@ export function createYtDlpRunner(
         }
 
         const dirBytes = getDirectoryBytes(stagingDir);
-        if (opts.maxBytes > 0 && Math.max(availableBytes, dirBytes) > opts.maxBytes) {
-          terminateProc(
-            new Error(
-              `Tier 3 progressive download exceeded maxCacheBytes (${Math.max(availableBytes, dirBytes)} > ${opts.maxBytes})`,
-            ),
+        const totalBytes = Math.max(availableBytes, dirBytes);
+        if (opts.maxBytes > 0 && totalBytes > opts.maxBytes) {
+          const budgetErr = new Error(
+            `Tier 3 progressive download exceeded maxCacheBytes (${totalBytes} > ${opts.maxBytes})`,
           );
+          budgetErr.name = "BudgetExceededError";
+          terminateProc(budgetErr);
           return;
+        }
+        if (totalBytes > stagingHighWater && opts.onStagingBytes) {
+          stagingHighWater = totalBytes;
+          if (!opts.onStagingBytes(totalBytes)) {
+            const budgetErr = new Error(
+              `Tier 3 progressive download exceeded shared cache budget (${totalBytes} bytes)`,
+            );
+            budgetErr.name = "BudgetExceededError";
+            terminateProc(budgetErr);
+            return;
+          }
         }
         if (opts.expectedSize > 0 && availableBytes > opts.expectedSize) {
           terminateProc(
@@ -1044,13 +1060,23 @@ export function createYtDlpRunner(
           }
 
           const finalSize = fs.statSync(stagingFile).size;
+          const totalStagedBytes = Math.max(finalSize, getDirectoryBytes(stagingDir));
           if (finalSize <= 0) {
             throw new Error("Tier 3 progressive download produced empty file");
           }
-          if (opts.maxBytes > 0 && finalSize > opts.maxBytes) {
-            throw new Error(
-              `Tier 3 progressive download exceeded maxCacheBytes (${finalSize} > ${opts.maxBytes})`,
+          if (opts.maxBytes > 0 && totalStagedBytes > opts.maxBytes) {
+            const budgetErr = new Error(
+              `Tier 3 progressive download exceeded maxCacheBytes (${totalStagedBytes} > ${opts.maxBytes})`,
             );
+            budgetErr.name = "BudgetExceededError";
+            throw budgetErr;
+          }
+          if (opts.onStagingBytes && !opts.onStagingBytes(totalStagedBytes)) {
+            const budgetErr = new Error(
+              `Tier 3 progressive download exceeded shared cache budget (${totalStagedBytes} bytes)`,
+            );
+            budgetErr.name = "BudgetExceededError";
+            throw budgetErr;
           }
           if (opts.expectedSize > 0 && finalSize !== opts.expectedSize) {
             const mismatchErr = new Error(

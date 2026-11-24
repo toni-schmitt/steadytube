@@ -442,6 +442,66 @@ exec sleep 10`,
       expect(fs.existsSync(fastOut)).toBe(false);
       expect(fs.readdirSync(fastDir)).toEqual([]);
 
+      // 4b) Fast-exiting writer leaving small media file + huge -Frag1 sidecar is rejected
+      // under BOTH maxBytes and onStagingBytes in downloadFormat AND startProgressiveDownload!
+      const sidecarDir = path.join(tmpRoot, "vid-sidecar-fast");
+      const sidecarOut = path.join(sidecarDir, "137.mp4");
+      const sidecarStub = writeStub(
+        "stub-sidecar-fast.sh",
+        `head -c 200 /dev/zero > "$OUT"
+head -c 1500 /dev/zero > "$OUT-Frag1"`,
+      );
+      const sidecarCfg = makeTestConfig();
+      sidecarCfg.binaries.ytDlp = sidecarStub;
+      sidecarCfg.playback.enableBgutilPot = false;
+      const sidecarRunner = createYtDlpRunner(sidecarCfg);
+
+      let dlSidecarErr: Error | null = null;
+      try {
+        await sidecarRunner.downloadFormat("dQw4w9WgXcQ", "137", sidecarOut, {
+          useAuth: false,
+          maxBytes: 1000,
+        });
+      } catch (err) {
+        dlSidecarErr = err as Error;
+      }
+      expect(dlSidecarErr).not.toBeNull();
+      expect(dlSidecarErr!.name).toBe("BudgetExceededError");
+      expect(fs.existsSync(sidecarOut)).toBe(false);
+      expect(fs.readdirSync(sidecarDir)).toEqual([]);
+
+      const progSidecarOut = path.join(sidecarDir, "137-prog.mp4");
+      let sawStagingBytes = 0;
+      const progSidecarHandle = await sidecarRunner.startProgressiveDownload!(
+        "dQw4w9WgXcQ",
+        "137",
+        progSidecarOut,
+        {
+          useAuth: false,
+          mimeType: "video/mp4",
+          expectedSize: 200,
+          maxBytes: 10_000,
+          onStagingBytes: (bytes) => {
+            if (bytes > sawStagingBytes) sawStagingBytes = bytes;
+            return bytes <= 1000;
+          },
+          stallTimeoutMs: 5_000,
+          idleTimeoutMs: 5_000,
+          maxTotalTimeoutMs: 10_000,
+        },
+      );
+      let progSidecarErr: Error | null = null;
+      try {
+        await progSidecarHandle.done;
+      } catch (err) {
+        progSidecarErr = err as Error;
+      }
+      expect(progSidecarErr).not.toBeNull();
+      expect(progSidecarErr!.name).toBe("BudgetExceededError");
+      expect(sawStagingBytes).toBeGreaterThanOrEqual(1700);
+      expect(fs.existsSync(progSidecarOut)).toBe(false);
+      expect(fs.readdirSync(sidecarDir)).toEqual([]);
+
       // 5) Shutdown terminates detached descendant processes (process group kill)
       const descDir = path.join(tmpRoot, "vid-desc");
       const descOut = path.join(descDir, "137.mp4");

@@ -438,13 +438,27 @@ describe("EphemeralStore & HTTP Range parsing", () => {
       const store1 = new EphemeralStore(tmpDir, 1500, 60_000);
       const p1 = store1.getPathFor("vidA", "251-en.4", "webm");
       fs.writeFileSync(p1, new Uint8Array(1000).fill(7));
-      store1.register("vidA", "251-en.4", p1, "audio/webm");
+      store1.register("vidA", "251-en.4", p1, "audio/webm", {
+        formatId: "251-en.4",
+        layout: "0-99_100-199",
+        rev: "1700000000",
+        xtags: "acont=original:lang=en",
+      });
+      // Cleanly shut down the previous daemon instance before simulating restart
+      store1.close();
 
-      // Reopen store from disk: scanExistingFiles must recover the same normalized key
+      // Reopen store from disk: scanExistingFiles must recover normalized key and persisted sidecar metadata
       const store2 = new EphemeralStore(tmpDir, 1500, 60_000);
+      expect(store2.hasExclusiveLock()).toBe(true);
       const recovered = store2.get("vidA", "251-en.4");
       expect(recovered).not.toBeNull();
       expect(recovered!.filePath).toBe(p1);
+      expect(recovered!.meta).toEqual({
+        formatId: "251-en.4",
+        layout: "0-99_100-199",
+        rev: "1700000000",
+        xtags: "acont=original:lang=en",
+      });
 
       // Start serving a partial response; entry must stay pinned until body finishes/cancels
       const res = store2.serveFile(
@@ -463,6 +477,7 @@ describe("EphemeralStore & HTTP Range parsing", () => {
       expect(bytes.byteLength).toBe(500);
       // After stream completes, pin is released
       expect(store2.isPinned(recovered!.key)).toBe(false);
+      store2.close();
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -534,15 +549,99 @@ describe("EphemeralStore & HTTP Range parsing", () => {
       fs.writeFileSync(path.join(liveStage, "media.mp4"), new Uint8Array(128));
 
       // Second store while store1 holds lock MUST NOT wipe store1's live staging files
-      const store2 = new EphemeralStore(tmpDir, 10_000, 60_000);
+      // OR evict store1's pinned/live files via cleanup() OR accept Tier 3 reservations.
+      const p1 = store1.getPathFor("vidLive", "137", "mp4");
+      fs.writeFileSync(p1, new Uint8Array(6000).fill(1));
+      store1.register("vidLive", "137", p1, "video/mp4");
+      store1.pin(store1.makeKey("vidLive", "137"));
+
+      const store2 = new EphemeralStore(tmpDir, 1000, 1); // tiny cap & 1ms TTL!
+      expect(store2.hasExclusiveLock()).toBe(false);
       expect(fs.existsSync(liveStage)).toBe(true);
+      expect(fs.existsSync(p1)).toBe(true);
+      expect(store2.cleanup()).toEqual({ removedCount: 0, freedBytes: 0 });
+      expect(store2.reserveBytes("vidOther:137", 100)).toBe(false);
+      expect(store2.getAvailableBudgetFor("vidOther:137")).toBe(0);
+      expect(fs.existsSync(p1)).toBe(true);
       store2.close();
+      store1.unpin(store1.makeKey("vidLive", "137"));
 
       // After store1 closes and releases lock, a new store cleans orphaned staging dirs
       store1.close();
       const store3 = new EphemeralStore(tmpDir, 10_000, 60_000);
+      expect(store3.hasExclusiveLock()).toBe(true);
       expect(fs.existsSync(liveStage)).toBe(false);
       store3.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("unpinned different-path register unlinks previous file and refuses re-registering a retired path", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-replace-"));
+    try {
+      const store = new EphemeralStore(tmpDir, 50_000, 60_000);
+      const pMp4 = store.getPathFor("vidSwap", "137", "mp4");
+      const pWebm = store.getPathFor("vidSwap", "137", "webm");
+      fs.writeFileSync(pMp4, new Uint8Array(500).fill(1));
+      store.register("vidSwap", "137", pMp4, "video/mp4", { layout: "0-9_10-19" });
+      expect(fs.existsSync(pMp4)).toBe(true);
+      expect(fs.existsSync(`${pMp4}.meta.json`)).toBe(true);
+
+      // Replacing unpinned entry with a different path must unlink the previous file & sidecar
+      fs.writeFileSync(pWebm, new Uint8Array(600).fill(2));
+      const next = store.register("vidSwap", "137", pWebm, "video/webm", { layout: "0-19_20-29" });
+      expect(fs.existsSync(pMp4)).toBe(false);
+      expect(fs.existsSync(`${pMp4}.meta.json`)).toBe(false);
+      expect(fs.existsSync(pWebm)).toBe(true);
+
+      // While pinned & retired via delete(), re-registering the retired path MUST throw
+      const res = store.serveFile(next, new Request("http://127.0.0.1/videoplayback"));
+      expect(res.status).toBe(200);
+      store.delete("vidSwap", "137");
+      expect(store.isRetired(next.key, pWebm)).toBe(true);
+      expect(() => store.register("vidSwap", "137", pWebm, "video/webm")).toThrow(/retired/i);
+
+      await res.arrayBuffer();
+      expect(fs.existsSync(pWebm)).toBe(false);
+      store.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("saturates huge positive suffix ranges to full 206 and includes Content-Length: 0 on 416", async () => {
+    const hugeSuffix = `bytes=-${"9".repeat(400)}`;
+    expect(parseHttpRangeHeader(hugeSuffix, 1000)).toEqual({
+      start: 0,
+      end: 999,
+      isPartial: true,
+    });
+    expect(parseHttpRangeHeader("bytes=-000000000000000000000", 1000)).toBe("unsatisfiable");
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-416-"));
+    try {
+      const store = new EphemeralStore(tmpDir, 10_000, 60_000);
+      const p1 = store.getPathFor("vid416", "137", "mp4");
+      fs.writeFileSync(p1, new Uint8Array(100).fill(3));
+      const entry = store.register("vid416", "137", p1, "video/mp4");
+
+      const hugeRes = store.serveFile(
+        entry,
+        new Request("http://127.0.0.1/videoplayback", { headers: { Range: hugeSuffix } }),
+      );
+      expect(hugeRes.status).toBe(206);
+      expect(hugeRes.headers.get("content-range")).toBe("bytes 0-99/100");
+      expect((await hugeRes.arrayBuffer()).byteLength).toBe(100);
+
+      const oobRes = store.serveFile(
+        entry,
+        new Request("http://127.0.0.1/videoplayback", { headers: { Range: "bytes=200-300" } }),
+      );
+      expect(oobRes.status).toBe(416);
+      expect(oobRes.headers.get("content-range")).toBe("bytes */100");
+      expect(oobRes.headers.get("content-length")).toBe("0");
+      store.close();
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

@@ -101,7 +101,14 @@ export function startServer(config: AppConfig, overrides: AppOverrides = {}) {
   });
 
   app.ephemeralStore.initialize();
-  app.ephemeralStore.startPeriodicCleanup();
+  if (app.ephemeralStore.hasExclusiveLock()) {
+    app.ephemeralStore.startPeriodicCleanup();
+  } else {
+    app.logger.warn(
+      "Ephemeral cache directory is locked by another live SteadyTube instance; Tier 3 disk writes and cleanup are disabled for this instance",
+      { cacheDir: config.cacheDir },
+    );
+  }
 
   app.logger.info("steadytube listening", {
     url: `http://${server.hostname}:${server.port}`,

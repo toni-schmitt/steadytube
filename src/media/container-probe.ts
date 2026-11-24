@@ -152,12 +152,13 @@ export function parseMp4DashRanges(buf: Uint8Array): DashByteRanges | null {
 }
 
 const MAX_SIDX_BOX_BYTES = 2 * 1024 * 1024; // 2 MiB sanity cap
+const MAX_MP4_TOP_LEVEL_BOXES = 250_000; // Bound synchronous top-level box walks
 
 /**
  * Verify that an MP4/M4A file on disk contains a SINGLE global `sidx` box
- * placed after `moov` and before the first `moof`/`mdat` whose leaf subsegment
- * references cover every `moof`/`mdat` in the file (with no per-fragment `sidx`
- * boxes later in the file).
+ * placed after `moov` and before the first `moof`/`mdat` with valid timescale,
+ * subsegment durations, and direct media references covering every complete
+ * `moof`+`mdat` fragment in the file (with no per-fragment `sidx` boxes later).
  *
  * FFmpeg without `+global_sidx` emits one `sidx` per fragment; parsing only the
  * first `sidx` box would truncate DASH playback to fragment 1.
@@ -178,18 +179,20 @@ export function hasValidGlobalMp4Sidx(filePath: string): boolean {
     const hdrView = new DataView(hdr.buffer);
 
     let offset = 0;
+    let walkedBoxes = 0;
     let sawMoov = false;
     let sidxCount = 0;
     let sidxOffset = -1;
     let sidxSize = 0;
     let sidxHeaderSize = 8;
-    const moofStarts: number[] = [];
-    const validBoundaries = new Set<number>();
+    const fragments: Array<{ start: number; moofStart: number; end: number; hasMdat: boolean }> = [];
     let pendingStypStart: number | null = null;
-    let firstFragmentStart = -1;
     let lastMediaBoxEnd = 0;
 
     while (offset + 8 <= fileSize) {
+      if (++walkedBoxes > MAX_MP4_TOP_LEVEL_BOXES) {
+        return false;
+      }
       const toRead = Math.min(16, fileSize - offset);
       const n = fs.readSync(fd, hdr, 0, toRead, offset);
       if (n < 8) return false;
@@ -215,12 +218,12 @@ export function hasValidGlobalMp4Sidx(filePath: string): boolean {
       const boxEnd = offset + size;
 
       if (type === "moov") {
-        if (moofStarts.length > 0) return false;
+        if (fragments.length > 0) return false;
         sawMoov = true;
       } else if (type === "sidx") {
         sidxCount++;
         // Must have exactly one global sidx after moov and before any media fragments
-        if (sidxCount > 1 || !sawMoov || moofStarts.length > 0 || lastMediaBoxEnd > 0) {
+        if (sidxCount > 1 || !sawMoov || fragments.length > 0 || lastMediaBoxEnd > 0) {
           return false;
         }
         sidxOffset = offset;
@@ -232,20 +235,16 @@ export function hasValidGlobalMp4Sidx(filePath: string): boolean {
           pendingStypStart = offset;
         }
       } else if (type === "moof") {
-        const fragBoundary = pendingStypStart !== null ? pendingStypStart : offset;
-        if (moofStarts.length === 0) {
-          firstFragmentStart = fragBoundary;
-        }
-        moofStarts.push(offset);
-        validBoundaries.add(offset);
-        if (pendingStypStart !== null) {
-          validBoundaries.add(pendingStypStart);
-          pendingStypStart = null;
-        }
+        const fragStart = pendingStypStart !== null ? pendingStypStart : offset;
+        fragments.push({ start: fragStart, moofStart: offset, end: boxEnd, hasMdat: false });
+        pendingStypStart = null;
         lastMediaBoxEnd = boxEnd;
       } else if (type === "mdat") {
         // Unfragmented mdat before any moof is invalid for fragmented global-sidx DASH
-        if (moofStarts.length === 0) return false;
+        if (fragments.length === 0) return false;
+        const curFrag = fragments[fragments.length - 1]!;
+        curFrag.hasMdat = true;
+        curFrag.end = boxEnd;
         pendingStypStart = null;
         lastMediaBoxEnd = boxEnd;
       } else {
@@ -255,14 +254,22 @@ export function hasValidGlobalMp4Sidx(filePath: string): boolean {
       offset = boxEnd;
     }
 
-    if (!sawMoov || sidxCount !== 1 || moofStarts.length < 1 || sidxOffset < 0 || firstFragmentStart < 0) {
+    if (!sawMoov || sidxCount !== 1 || fragments.length < 1 || sidxOffset < 0) {
       return false;
     }
+    // Every fragment in the media section must contain media payload (mdat)
+    const validBoundaries = new Set<number>();
+    for (const frag of fragments) {
+      if (!frag.hasMdat) return false;
+      validBoundaries.add(frag.start);
+      validBoundaries.add(frag.moofStart);
+      validBoundaries.add(frag.end);
+    }
+    validBoundaries.add(lastMediaBoxEnd);
+
     if (sidxSize > MAX_SIDX_BOX_BYTES || sidxSize < sidxHeaderSize + 24) {
       return false;
     }
-
-    validBoundaries.add(lastMediaBoxEnd);
 
     const sidxBuf = new Uint8Array(sidxSize);
     const readSidx = fs.readSync(fd, sidxBuf, 0, sidxSize, sidxOffset);
@@ -272,6 +279,9 @@ export function hasValidGlobalMp4Sidx(filePath: string): boolean {
     const body = sidxHeaderSize;
     const version = sidxBuf[body]!;
     if (version !== 0 && version !== 1) return false;
+
+    const timescale = view.getUint32(body + 8, false);
+    if (timescale === 0) return false;
 
     let firstOffset: number;
     let refCountPos: number;
@@ -295,8 +305,9 @@ export function hasValidGlobalMp4Sidx(filePath: string): boolean {
 
     const sidxEnd = sidxOffset + sidxSize;
     let cursor = sidxEnd + firstOffset;
+    const firstFrag = fragments[0]!;
     // First reference MUST start at the very first fragment (never skip fragment 1)
-    if (cursor !== firstFragmentStart && cursor !== moofStarts[0]) {
+    if (cursor !== firstFrag.start && cursor !== firstFrag.moofStart) {
       return false;
     }
 
@@ -307,7 +318,8 @@ export function hasValidGlobalMp4Sidx(filePath: string): boolean {
       // Single-range SegmentBase requires direct media references (reference_type === 0)
       if (referenceType !== 0) return false;
       const referencedSize = refWord & 0x7fffffff;
-      if (referencedSize === 0) return false;
+      const subsegmentDuration = view.getUint32(entryOffset + 4, false);
+      if (referencedSize === 0 || subsegmentDuration === 0) return false;
       if (!validBoundaries.has(cursor)) return false;
       cursor += referencedSize;
       if (cursor > fileSize || !validBoundaries.has(cursor)) {
@@ -809,6 +821,13 @@ export function parseWebmDashRanges(buf: Uint8Array): WebmProbeResult {
     };
   }
 
+  if (initEnd !== null) {
+    return {
+      ranges: null,
+      initEnd,
+    };
+  }
+
   return { ranges: null };
 }
 
@@ -841,6 +860,7 @@ export function probeLocalFileDashRanges(
   filePath: string,
   mimeType: string,
   maxHeaderReadBytes = 65536,
+  knownCuesOffset?: number,
 ): DashByteRanges | null {
   const fd = fs.openSync(filePath, "r");
   try {
@@ -853,16 +873,23 @@ export function probeLocalFileDashRanges(
 
     if (mimeType.includes("webm")) {
       const parsed = parseWebmDashRanges(buf);
-      if (parsed.ranges) return parsed.ranges;
-      if (parsed.cuesOffset !== undefined && parsed.initEnd !== undefined && parsed.cuesOffset < stat.size) {
-        const hdrBuf = new Uint8Array(Math.min(32, stat.size - parsed.cuesOffset));
-        fs.readSync(fd, hdrBuf, 0, hdrBuf.byteLength, parsed.cuesOffset);
-        return parseCuesElementHeaderAt(hdrBuf, parsed.cuesOffset, parsed.initEnd);
+      if (parsed.ranges) {
+        return parsed.ranges.indexEnd < stat.size ? parsed.ranges : null;
+      }
+      const cuesOffset = parsed.cuesOffset ?? knownCuesOffset;
+      if (cuesOffset !== undefined && parsed.initEnd !== undefined && cuesOffset >= 0 && cuesOffset < stat.size) {
+        const hdrBuf = new Uint8Array(Math.min(32, stat.size - cuesOffset));
+        fs.readSync(fd, hdrBuf, 0, hdrBuf.byteLength, cuesOffset);
+        const resolved = parseCuesElementHeaderAt(hdrBuf, cuesOffset, parsed.initEnd);
+        if (resolved && resolved.indexEnd < stat.size) {
+          return resolved;
+        }
       }
       return null;
     }
 
-    return parseMp4DashRanges(buf);
+    const mp4 = parseMp4DashRanges(buf);
+    return mp4 && mp4.indexEnd < stat.size ? mp4 : null;
   } finally {
     fs.closeSync(fd);
   }
@@ -928,7 +955,7 @@ export async function probeRemoteDashRanges(
   }
   if (res.status === 206) {
     const cr = res.headers.get("content-range") || "";
-    if (cr && !cr.startsWith("bytes 0-")) {
+    if (!cr || !cr.startsWith("bytes 0-")) {
       await res.body?.cancel().catch(() => {});
       return null;
     }
@@ -967,7 +994,7 @@ export async function probeRemoteDashRanges(
       });
       if (cuesRes.status === 206) {
         const cr = cuesRes.headers.get("content-range") || "";
-        if (!cr || cr.startsWith(`bytes ${parsed.cuesOffset}-`)) {
+        if (cr && cr.startsWith(`bytes ${parsed.cuesOffset}-`)) {
           const hdrBuf = await readBoundedBytes(cuesRes, 32);
           return attachHashes(parseCuesElementHeaderAt(hdrBuf, parsed.cuesOffset, parsed.initEnd));
         }
@@ -978,4 +1005,83 @@ export async function probeRemoteDashRanges(
   }
 
   return attachHashes(parseMp4DashRanges(buf));
+}
+
+/**
+ * Fetch bounded byte ranges for `init` and/or `index` from a candidate remote URL
+ * over IPv4 and verify their SHA-256 digests match the already-verified digests of
+ * the active playback representation before accepting a remote recovery replacement.
+ */
+export async function verifyRemoteDashRangeDigests(
+  url: string,
+  expected: {
+    initRange?: { start: number; end: number };
+    indexRange?: { start: number; end: number };
+    initHash?: string;
+    indexHash?: string;
+    expectedTotal?: number;
+  },
+  fetchFn: FetchLike,
+  extraHeaders?: Record<string, string>,
+): Promise<{ initHash?: string; indexHash?: string } | null> {
+  const fetchExactRangeHash = async (start: number, end: number): Promise<string | null> => {
+    const len = end - start + 1;
+    if (len <= 0 || len > MAX_DASH_HEADER_PROBE_BYTES) return null;
+    const res = await fetchFn(url, {
+      method: "GET",
+      headers: {
+        ...(extraHeaders || {}),
+        Range: `bytes=${start}-${end}`,
+        "Accept-Encoding": "identity",
+      },
+      timeoutMs: 8_000,
+      signal: AbortSignal.timeout(8_000),
+      httpsOnly: true,
+      publicIpv4Only: true,
+      allowedHost: (h) => ALLOWED_GOOGLEVIDEO_HOST.test(h),
+    });
+    if (res.status !== 206) {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
+    const cr = (res.headers.get("content-range") || "").trim();
+    const crMatch = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(cr);
+    if (!crMatch || Number(crMatch[1]) !== start || Number(crMatch[2]) !== end) {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
+    if (
+      expected.expectedTotal &&
+      expected.expectedTotal > 0 &&
+      (crMatch[3] === "*" || Number(crMatch[3]) !== expected.expectedTotal)
+    ) {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
+    const bytes = await readBoundedBytes(res, len + 1);
+    if (bytes.byteLength !== len) return null;
+    return sha256Hex(bytes);
+  };
+
+  if (!expected.initHash && !expected.indexHash) {
+    return null;
+  }
+
+  let initHash: string | undefined;
+  let indexHash: string | undefined;
+
+  if (expected.initHash) {
+    if (!expected.initRange) return null;
+    const actual = await fetchExactRangeHash(expected.initRange.start, expected.initRange.end);
+    if (!actual || actual !== expected.initHash) return null;
+    initHash = actual;
+  }
+  if (expected.indexHash) {
+    if (!expected.indexRange) return null;
+    const actual = await fetchExactRangeHash(expected.indexRange.start, expected.indexRange.end);
+    if (!actual || actual !== expected.indexHash) return null;
+    indexHash = actual;
+  }
+
+  return { initHash, indexHash };
 }

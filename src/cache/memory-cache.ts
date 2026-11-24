@@ -144,11 +144,13 @@ export class TtlLruCache<K, V> {
 export class Semaphore {
   private active = 0;
   private readonly queue: Array<() => void> = [];
+  private readonly maxQueueSize: number;
 
-  constructor(private readonly maxConcurrency: number) {
+  constructor(private readonly maxConcurrency: number, maxQueueSize = Infinity) {
     if (maxConcurrency < 1) {
       throw new Error("Semaphore maxConcurrency must be >= 1");
     }
+    this.maxQueueSize = maxQueueSize;
   }
 
   async run<T>(fn: () => Promise<T>, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
@@ -186,6 +188,9 @@ export class Semaphore {
     if (this.active < this.maxConcurrency) {
       this.active++;
       return Promise.resolve();
+    }
+    if (this.queue.length >= this.maxQueueSize) {
+      return Promise.reject(new Error(`Semaphore queue full (${this.maxQueueSize})`));
     }
     return new Promise<void>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | null = null;

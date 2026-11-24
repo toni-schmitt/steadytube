@@ -1,7 +1,21 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
+
+export interface EphemeralEntryMeta {
+  /** Logical client formatId (e.g. "137" or "tier3-v-137") */
+  formatId?: string;
+  /** Authoritative DASH layout key ("<init>_<index>") */
+  layout?: string | null;
+  /** Authoritative representation revision (lmt or init/index digest) */
+  rev?: string | null;
+  /** Audio/variant xtags if present */
+  xtags?: string | null;
+  initHash?: string;
+  indexHash?: string;
+}
 
 export interface EphemeralFileEntry {
   key: string;
@@ -10,6 +24,7 @@ export interface EphemeralFileEntry {
   mimeType: string;
   createdAt: number;
   lastAccessedAt: number;
+  meta?: EphemeralEntryMeta;
 }
 
 export interface ParsedByteRange {
@@ -104,7 +119,10 @@ export function parseHttpRangeHeader(
   let end: number;
 
   if (rawStart === "") {
-    const suffixLen = Number(rawEnd);
+    // Reject "-0", but saturate huge positive decimal suffixes (e.g. 400 digits) to totalSize
+    // instead of overflowing to Infinity and returning 416 for a valid suffix covering the whole file.
+    if (/^0+$/.test(rawEnd!)) return "unsatisfiable";
+    const suffixLen = rawEnd!.length > 15 ? totalSize : Number(rawEnd);
     if (!Number.isFinite(suffixLen) || suffixLen <= 0) return "unsatisfiable";
     start = Math.max(0, totalSize - suffixLen);
     end = totalSize - 1;
@@ -137,13 +155,70 @@ export interface EphemeralStoreOptions {
   deferScan?: boolean;
 }
 
+const META_SIDECAR_SUFFIX = ".meta.json";
+
+function getMetaSidecarPath(filePath: string): string {
+  return `${filePath}${META_SIDECAR_SUFFIX}`;
+}
+
+function readMetaSidecar(filePath: string): EphemeralEntryMeta | undefined {
+  const metaPath = getMetaSidecarPath(filePath);
+  try {
+    if (!fs.existsSync(metaPath)) return undefined;
+    const raw = fs.readFileSync(metaPath, "utf8");
+    const parsed = JSON.parse(raw) as EphemeralEntryMeta;
+    return parsed && typeof parsed === "object" ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeMetaSidecar(filePath: string, meta?: EphemeralEntryMeta): void {
+  const metaPath = getMetaSidecarPath(filePath);
+  if (!meta) {
+    try {
+      if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
+    } catch {
+      // Ignore
+    }
+    return;
+  }
+  const tmpPath = `${metaPath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(meta));
+    fs.renameSync(tmpPath, metaPath);
+  } catch {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {
+      // Ignore
+    }
+  }
+}
+
+function unlinkWithMetaSidecar(filePath: string): void {
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {
+    // Ignore
+  }
+  const metaPath = getMetaSidecarPath(filePath);
+  try {
+    if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
+  } catch {
+    // Ignore
+  }
+}
+
 export class EphemeralStore {
   private readonly resolvedBaseDir: string;
   private readonly entries = new Map<string, EphemeralFileEntry>();
   private readonly retiredEntriesByKey = new Map<string, EphemeralFileEntry[]>();
+  private readonly retiredPaths = new Set<string>();
   private readonly pinnedCounts = new Map<string, number>();
   private readonly reservedBytesByKey = new Map<string, number>();
   private readonly lockToken = Symbol("ephemeral-store-lock");
+  private readonly lockId = `${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
   private ownsCleanupLock = false;
   private initialized = false;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -160,6 +235,10 @@ export class EphemeralStore {
     if (!options.deferScan) {
       this.initialize();
     }
+  }
+
+  hasExclusiveLock(): boolean {
+    return this.ownsCleanupLock;
   }
 
   initialize(): void {
@@ -196,24 +275,33 @@ export class EphemeralStore {
     }
 
     const lockPath = path.join(this.resolvedBaseDir, LOCK_FILENAME);
+    const payload = JSON.stringify({ pid: process.pid, lockId: this.lockId, ts: Date.now() });
+
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const fd = fs.openSync(lockPath, "wx");
         try {
-          fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+          fs.writeFileSync(fd, payload);
         } finally {
           fs.closeSync(fd);
         }
-        activeStoreLocks.set(this.resolvedBaseDir, this.lockToken);
-        this.ownsCleanupLock = true;
-        return true;
+        // Verify we still own the on-disk lock file before recording ownership
+        const verified = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { lockId?: string };
+        if (verified.lockId === this.lockId) {
+          activeStoreLocks.set(this.resolvedBaseDir, this.lockToken);
+          this.ownsCleanupLock = true;
+          return true;
+        }
+        return false;
       } catch (err) {
         if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") {
           return false;
         }
+        let staleLockId: string | undefined;
         try {
           const raw = fs.readFileSync(lockPath, "utf8");
-          const parsed = JSON.parse(raw) as { pid?: number };
+          const parsed = JSON.parse(raw) as { pid?: number; lockId?: string };
+          staleLockId = parsed.lockId;
           if (typeof parsed.pid === "number" && parsed.pid > 0) {
             if (parsed.pid !== process.pid && isPidAlive(parsed.pid)) {
               return false;
@@ -225,8 +313,34 @@ export class EphemeralStore {
         } catch {
           // Corrupt or unreadable lock file from crashed process -> treat as stale
         }
+        // Move the stale lock aside before unlinking so we cannot unlink a brand-new lock
+        // created concurrently by another process after our read.
+        const staleTmp = `${lockPath}.stale-${this.lockId}`;
         try {
-          fs.unlinkSync(lockPath);
+          fs.renameSync(lockPath, staleTmp);
+          try {
+            const movedRaw = fs.readFileSync(staleTmp, "utf8");
+            const movedParsed = JSON.parse(movedRaw) as { pid?: number; lockId?: string };
+            if (
+              staleLockId &&
+              movedParsed.lockId &&
+              movedParsed.lockId !== staleLockId &&
+              typeof movedParsed.pid === "number" &&
+              isPidAlive(movedParsed.pid)
+            ) {
+              // Raced with a live contender -> restore best-effort and bail
+              try {
+                fs.linkSync(staleTmp, lockPath);
+              } catch {
+                // Another contender already created lockPath
+              }
+              fs.unlinkSync(staleTmp);
+              return false;
+            }
+          } catch {
+            // Unparseable stale lock
+          }
+          fs.unlinkSync(staleTmp);
         } catch {
           return false;
         }
@@ -244,7 +358,12 @@ export class EphemeralStore {
     const lockPath = path.join(this.resolvedBaseDir, LOCK_FILENAME);
     try {
       if (fs.existsSync(lockPath)) {
-        fs.unlinkSync(lockPath);
+        const raw = fs.readFileSync(lockPath, "utf8");
+        const parsed = JSON.parse(raw) as { lockId?: string };
+        // Only remove the lockfile if it still belongs to THIS store instance
+        if (parsed.lockId === this.lockId) {
+          fs.unlinkSync(lockPath);
+        }
       }
     } catch {
       // Ignore
@@ -287,16 +406,15 @@ export class EphemeralStore {
         this.retiredEntriesByKey.delete(key);
         const liveEntry = this.entries.get(key);
         for (const entry of retired) {
+          this.retiredPaths.delete(entry.filePath);
           if (liveEntry && liveEntry.filePath === entry.filePath) continue;
-          try {
-            if (fs.existsSync(entry.filePath)) {
-              fs.unlinkSync(entry.filePath);
-            }
-          } catch {
-            // Ignore
+          if (this.ownsCleanupLock) {
+            unlinkWithMetaSidecar(entry.filePath);
           }
         }
-        this.pruneEmptySubdirs();
+        if (this.ownsCleanupLock) {
+          this.pruneEmptySubdirs();
+        }
       }
     } else {
       this.pinnedCounts.set(key, count - 1);
@@ -305,6 +423,13 @@ export class EphemeralStore {
 
   isPinned(key: string): boolean {
     return (this.pinnedCounts.get(key) ?? 0) > 0;
+  }
+
+  isRetired(key: string, filePath?: string): boolean {
+    if (filePath && this.retiredPaths.has(path.resolve(filePath))) {
+      return true;
+    }
+    return this.retiredEntriesByKey.has(key);
   }
 
   getReservedBytes(): number {
@@ -329,8 +454,13 @@ export class EphemeralStore {
    * Reserve space in the shared disk budget before starting a Tier 3 writer
    * (progressive download, fallback download, or remux). Evicts unpinned
    * completed entries first if needed to fit within `maxCacheBytes`.
+   * Requires exclusive cache-directory ownership so a second daemon cannot
+   * evict or over-subscribe the primary daemon's cache.
    */
   reserveBytes(key: string, bytes: number): boolean {
+    if (!this.ownsCleanupLock && !this.tryAcquireCleanupLock()) {
+      return false;
+    }
     const needed = Math.max(0, Math.ceil(bytes));
     const existingForKey = this.reservedBytesByKey.get(key) ?? 0;
     const otherReserved = this.getReservedBytes() - existingForKey;
@@ -383,6 +513,9 @@ export class EphemeralStore {
    * entries, retired pinned entries, and other active reservations.
    */
   getAvailableBudgetFor(key: string): number {
+    if (!this.ownsCleanupLock && !this.tryAcquireCleanupLock()) {
+      return 0;
+    }
     const existingForKey = this.reservedBytesByKey.get(key) ?? 0;
     const otherReserved = this.getReservedBytes() - existingForKey;
     let pinnedBytes = this.getRetiredBytes();
@@ -394,16 +527,37 @@ export class EphemeralStore {
     return Math.max(0, this.maxCacheBytes - pinnedBytes - otherReserved);
   }
 
-  register(videoId: string, formatId: string, filePath: string, mimeType: string): EphemeralFileEntry {
+  register(
+    videoId: string,
+    formatId: string,
+    filePath: string,
+    mimeType: string,
+    meta?: EphemeralEntryMeta,
+  ): EphemeralFileEntry {
     const safePath = this.assertContainedPath(filePath);
+    if (this.retiredPaths.has(safePath)) {
+      throw new Error(`Refusing to re-register retired cache path: ${safePath}`);
+    }
     const stat = fs.statSync(safePath);
     const now = Date.now();
     const key = this.makeKey(videoId, formatId);
     const prev = this.entries.get(key);
-    if (prev && prev.filePath !== safePath && this.isPinned(key)) {
-      const list = this.retiredEntriesByKey.get(key) ?? [];
-      list.push(prev);
-      this.retiredEntriesByKey.set(key, list);
+    if (prev && prev.filePath !== safePath) {
+      if (this.isPinned(key)) {
+        const list = this.retiredEntriesByKey.get(key) ?? [];
+        list.push(prev);
+        this.retiredEntriesByKey.set(key, list);
+        this.retiredPaths.add(prev.filePath);
+      } else if (this.ownsCleanupLock) {
+        // Unpinned replacement at a different path: unlink previous file so it is never orphaned
+        this.removeEntry(key, prev);
+      }
+    }
+    const mergedMeta: EphemeralEntryMeta | undefined = meta
+      ? { formatId, ...meta }
+      : undefined;
+    if (this.ownsCleanupLock) {
+      writeMetaSidecar(safePath, mergedMeta);
     }
     const entry: EphemeralFileEntry = {
       key,
@@ -412,6 +566,7 @@ export class EphemeralStore {
       mimeType,
       createdAt: now,
       lastAccessedAt: now,
+      meta: mergedMeta,
     };
     this.entries.set(key, entry);
     this.cleanup();
@@ -419,7 +574,10 @@ export class EphemeralStore {
   }
 
   delete(videoId: string, formatId: string): void {
-    const key = this.makeKey(videoId, formatId);
+    this.deleteByKey(this.makeKey(videoId, formatId));
+  }
+
+  deleteByKey(key: string): void {
     const entry = this.entries.get(key);
     if (!entry) return;
     if (this.isPinned(key)) {
@@ -429,21 +587,48 @@ export class EphemeralStore {
       const list = this.retiredEntriesByKey.get(key) ?? [];
       list.push(entry);
       this.retiredEntriesByKey.set(key, list);
+      this.retiredPaths.add(entry.filePath);
+      return;
+    }
+    if (!this.ownsCleanupLock) {
+      this.entries.delete(key);
       return;
     }
     this.removeEntry(key, entry);
   }
 
   get(videoId: string, formatId: string): EphemeralFileEntry | null {
-    const key = this.makeKey(videoId, formatId);
+    return this.getByKey(this.makeKey(videoId, formatId));
+  }
+
+  getByKey(key: string): EphemeralFileEntry | null {
     const entry = this.entries.get(key);
     if (!entry) return null;
-    if (!fs.existsSync(entry.filePath)) {
+    if (this.retiredPaths.has(entry.filePath) || !fs.existsSync(entry.filePath)) {
       this.entries.delete(key);
       return null;
     }
     entry.lastAccessedAt = Date.now();
     return entry;
+  }
+
+  /**
+   * Iterate live entries belonging to `videoId` (used for representation-verified lookup
+   * across immutable per-representation storage keys).
+   */
+  findEntriesForVideo(videoId: string): EphemeralFileEntry[] {
+    const safeVideo = videoId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
+    const prefix = `${safeVideo}:`;
+    const out: EphemeralFileEntry[] = [];
+    for (const [key, entry] of this.entries) {
+      if (!key.startsWith(prefix)) continue;
+      if (this.retiredPaths.has(entry.filePath) || !fs.existsSync(entry.filePath)) {
+        this.entries.delete(key);
+        continue;
+      }
+      out.push(entry);
+    }
+    return out;
   }
 
   serveFile(entry: EphemeralFileEntry, req: Request): Response {
@@ -478,6 +663,7 @@ export class EphemeralStore {
         status: 416,
         headers: {
           ...commonHeaders,
+          "Content-Length": "0",
           "Content-Range": `bytes */${totalSize}`,
         },
       });
@@ -649,6 +835,7 @@ export class EphemeralStore {
         status: 416,
         headers: {
           ...commonHeaders,
+          "Content-Length": "0",
           "Content-Range": `bytes */${totalSize}`,
         },
       });
@@ -890,6 +1077,10 @@ export class EphemeralStore {
   }
 
   cleanup(extraReservedBytes = this.getReservedBytes()): { removedCount: number; freedBytes: number } {
+    // Never evict or unlink files from disk unless this instance owns the exclusive cacheDir lock.
+    if (!this.ownsCleanupLock) {
+      return { removedCount: 0, freedBytes: 0 };
+    }
     const now = Date.now();
     let removedCount = 0;
     let freedBytes = 0;
@@ -944,10 +1135,11 @@ export class EphemeralStore {
 
   private removeEntry(key: string, entry: EphemeralFileEntry): number {
     this.entries.delete(key);
+    if (!this.ownsCleanupLock) {
+      return entry.size;
+    }
     try {
-      if (fs.existsSync(entry.filePath)) {
-        fs.unlinkSync(entry.filePath);
-      }
+      unlinkWithMetaSidecar(entry.filePath);
     } catch (err) {
       this.logger.warn("Failed to delete ephemeral cache file", {
         filePath: entry.filePath,
@@ -960,7 +1152,7 @@ export class EphemeralStore {
   private scanExistingFiles(): void {
     const canCleanStaging = this.tryAcquireCleanupLock();
     if (!canCleanStaging) {
-      this.logger.warn("Another SteadyTube instance owns cacheDir; skipping staging cleanup on startup", {
+      this.logger.warn("Another SteadyTube instance owns cacheDir; running read-only without evicting or cleaning staging files", {
         baseDir: this.resolvedBaseDir,
       });
     }
@@ -992,6 +1184,20 @@ export class EphemeralStore {
             continue;
           }
           if (!f.isFile()) continue;
+          // Metadata sidecars are loaded alongside their media file (or cleaned if orphaned)
+          if (f.name.endsWith(META_SIDECAR_SUFFIX)) {
+            if (canCleanStaging) {
+              const mediaPath = filePath.slice(0, -META_SIDECAR_SUFFIX.length);
+              if (!fs.existsSync(mediaPath)) {
+                try {
+                  fs.unlinkSync(filePath);
+                } catch {
+                  // Ignore
+                }
+              }
+            }
+            continue;
+          }
           try {
             const stat = fs.statSync(filePath);
             // Delete orphaned staging/temp files and expired entries on startup
@@ -1000,6 +1206,7 @@ export class EphemeralStore {
               f.name.endsWith(".ytdl") ||
               f.name.endsWith(".downloading") ||
               /\.tmp\.[^.]+$/.test(f.name) ||
+              f.name.endsWith(".tmp") ||
               /-Frag\d+/.test(f.name) ||
               f.name.endsWith(".dash.mp4");
             if (isStaging) {
@@ -1008,12 +1215,12 @@ export class EphemeralStore {
               if (ownerPid !== null && ownerPid !== process.pid && isPidAlive(ownerPid)) {
                 continue;
               }
-              fs.unlinkSync(filePath);
+              unlinkWithMetaSidecar(filePath);
               continue;
             }
             if (now - stat.mtimeMs >= this.ttlMs) {
               if (canCleanStaging) {
-                fs.unlinkSync(filePath);
+                unlinkWithMetaSidecar(filePath);
               }
               continue;
             }
@@ -1024,6 +1231,7 @@ export class EphemeralStore {
               : f.name.endsWith(".m4a")
                 ? "audio/mp4"
                 : "video/mp4";
+            const meta = readMetaSidecar(filePath);
             this.entries.set(key, {
               key,
               filePath,
@@ -1031,6 +1239,7 @@ export class EphemeralStore {
               mimeType,
               createdAt: stat.birthtimeMs || stat.mtimeMs,
               lastAccessedAt: stat.atimeMs || stat.mtimeMs,
+              meta,
             });
           } catch {
             // Ignore unreadable file

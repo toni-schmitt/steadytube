@@ -12,6 +12,7 @@ import {
   probeMp4TrackMetadata,
   probeRemoteDashRanges,
   sha256Hex,
+  verifyRemoteDashRangeDigests,
 } from "../src/media/container-probe.ts";
 import type { Ipv4FetchOptions } from "../src/net/ipv4-fetch.ts";
 
@@ -269,6 +270,29 @@ describe("container-probe", () => {
       );
       expect(hasValidGlobalMp4Sidx(shiftedPath)).toBe(false);
 
+      // sidx with timescale=0 -> MUST be rejected!
+      const zeroTsSidx = makeSidxBox([frag1.byteLength, frag2.byteLength]);
+      new DataView(zeroTsSidx.buffer).setUint32(16, 0, false);
+      const zeroTsPath = path.join(tmpDir, "zero-timescale.mp4");
+      fs.writeFileSync(zeroTsPath, concatBytes(ftyp, moov, zeroTsSidx, frag1, frag2));
+      expect(hasValidGlobalMp4Sidx(zeroTsPath)).toBe(false);
+
+      // sidx with subsegment_duration=0 -> MUST be rejected!
+      const zeroDurSidx = makeSidxBox([frag1.byteLength, frag2.byteLength]);
+      new DataView(zeroDurSidx.buffer).setUint32(36, 0, false);
+      const zeroDurPath = path.join(tmpDir, "zero-subdur.mp4");
+      fs.writeFileSync(zeroDurPath, concatBytes(ftyp, moov, zeroDurSidx, frag1, frag2));
+      expect(hasValidGlobalMp4Sidx(zeroDurPath)).toBe(false);
+
+      // Fragment consisting solely of moof without mdat -> MUST be rejected!
+      const emptyMoof = makeMp4Box("moof", 40);
+      const noMdatPath = path.join(tmpDir, "no-mdat.mp4");
+      fs.writeFileSync(
+        noMdatPath,
+        concatBytes(ftyp, moov, makeSidxBox([emptyMoof.byteLength]), emptyMoof),
+      );
+      expect(hasValidGlobalMp4Sidx(noMdatPath)).toBe(false);
+
       // Real FFmpeg verification if ffmpeg is installed locally
       const ffmpegBin =
         Bun.which("ffmpeg") ||
@@ -388,5 +412,107 @@ describe("container-probe", () => {
       expect(opts.allowedHost!("evil.example.com")).toBe(false);
       expect(opts.allowedHost!("127.0.0.1")).toBe(false);
     }
+
+    // 206 with missing Content-Range header must be rejected rather than parsed as offset 0
+    const noCrRes = await probeRemoteDashRanges(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=251",
+      "audio/webm",
+      async () => new Response(headerChunk, { status: 206 }),
+    );
+    expect(noCrRes).toBeNull();
+  });
+
+  test("probeLocalFileDashRanges resolves late WebM Cues via knownCuesOffset when SeekHead is absent", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-webm-latecues-"));
+    try {
+      const ebml = makeEbmlElement([0x1a, 0x45, 0xdf, 0xa3], new Uint8Array(12));
+      const segHeader = new Uint8Array([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+      const tracks = makeEbmlElement([0x16, 0x54, 0xae, 0x6b], new Uint8Array(24));
+      // Large cluster pushes Cues past the 64 KiB header read window, and NO SeekHead is present!
+      const cluster = makeEbmlElement([0x1f, 0x43, 0xb6, 0x75], new Uint8Array(70_000));
+      const cues = makeEbmlElement([0x1c, 0x53, 0xbb, 0x6b], new Uint8Array(80));
+      const full = concatBytes(ebml, segHeader, tracks, cluster, cues);
+
+      const webmPath = path.join(tmpDir, "late-cues.webm");
+      fs.writeFileSync(webmPath, full);
+
+      const expectedInitEnd = ebml.byteLength + segHeader.byteLength + tracks.byteLength - 1;
+      const expectedCuesStart = ebml.byteLength + segHeader.byteLength + tracks.byteLength + cluster.byteLength;
+      const expectedCuesEnd = expectedCuesStart + cues.byteLength - 1;
+
+      // Without knownCuesOffset (and no SeekHead), probing 64 KiB returns null
+      expect(probeLocalFileDashRanges(webmPath, "video/webm", 65536)).toBeNull();
+      // With knownCuesOffset, probing resolves exact init & index ranges cleanly
+      const probed = probeLocalFileDashRanges(webmPath, "video/webm", 65536, expectedCuesStart);
+      expect(probed).not.toBeNull();
+      expect(probed!.init).toBe(`0-${expectedInitEnd}`);
+      expect(probed!.index).toBe(`${expectedCuesStart}-${expectedCuesEnd}`);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("verifyRemoteDashRangeDigests verifies exact byte digests and rejects mismatches or bad totals", async () => {
+    const payload = new Uint8Array(300);
+    for (let i = 0; i < payload.byteLength; i++) payload[i] = (i * 7 + 3) & 0xff;
+    const initSlice = payload.subarray(0, 100);
+    const indexSlice = payload.subarray(100, 180);
+    const expectedInitHash = sha256Hex(initSlice);
+    const expectedIndexHash = sha256Hex(indexSlice);
+
+    const serveSlice = (data: Uint8Array, totalHeader: string) => {
+      return async (_url: string | URL | Request, init?: Ipv4FetchOptions) => {
+        const range = (init?.headers as Record<string, string> | undefined)?.Range || "";
+        const m = /^bytes=(\d+)-(\d+)$/.exec(range);
+        if (!m) return new Response(null, { status: 400 });
+        const s = Number(m[1]);
+        const e = Number(m[2]);
+        return new Response(data.slice(s, e + 1), {
+          status: 206,
+          headers: { "Content-Range": `bytes ${s}-${e}/${totalHeader}` },
+        });
+      };
+    };
+
+    const ok = await verifyRemoteDashRangeDigests(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+      {
+        initRange: { start: 0, end: 99 },
+        indexRange: { start: 100, end: 179 },
+        initHash: expectedInitHash,
+        indexHash: expectedIndexHash,
+        expectedTotal: 300,
+      },
+      serveSlice(payload, "300"),
+    );
+    expect(ok).toEqual({ initHash: expectedInitHash, indexHash: expectedIndexHash });
+
+    // Mutate one byte inside index range -> MUST reject!
+    const mutated = new Uint8Array(payload);
+    mutated[120] = (mutated[120] ?? 0) ^ 0xff;
+    const badDigest = await verifyRemoteDashRangeDigests(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+      {
+        initRange: { start: 0, end: 99 },
+        indexRange: { start: 100, end: 179 },
+        initHash: expectedInitHash,
+        indexHash: expectedIndexHash,
+        expectedTotal: 300,
+      },
+      serveSlice(mutated, "300"),
+    );
+    expect(badDigest).toBeNull();
+
+    // Wrong total in Content-Range -> MUST reject!
+    const badTotal = await verifyRemoteDashRangeDigests(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+      {
+        initRange: { start: 0, end: 99 },
+        initHash: expectedInitHash,
+        expectedTotal: 300,
+      },
+      serveSlice(payload, "999"),
+    );
+    expect(badTotal).toBeNull();
   });
 });
