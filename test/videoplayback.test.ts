@@ -773,7 +773,7 @@ describe("Mid-playback recovery state machine", () => {
 
           return {
             videoId,
-            formatId: formatSelector,
+            formatId: opts.cacheFormatId || formatSelector,
             mimeType: opts.mimeType,
             expectedSize: opts.expectedSize,
             done,
@@ -1756,7 +1756,13 @@ describe("Mid-playback recovery state machine", () => {
         innertube: makeMockInnertube(),
         fetchRawFn: async (input) => {
           if (input.toString().includes("old-tier1")) return new Response("Forbidden", { status: 403 });
-          return new Response(mp4Bytes.slice(0, 50), { status: 206, headers: { "Content-Length": "50" } });
+          return new Response(mp4Bytes.slice(0, 50), {
+            status: 206,
+            headers: {
+              "Content-Range": `bytes 0-49/${mp4Bytes.byteLength}`,
+              "Content-Length": "50",
+            },
+          });
         },
       });
 
@@ -2690,6 +2696,553 @@ describe("Mid-playback recovery state machine", () => {
       expect(mpdXml).toContain('mimeType="audio/mp4"');
       expect(tierCalls).toEqual([false, true]);
       appM9.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("Round 4 C1/C2/C3/M12: isolates per-rep storage & reservations, verifies remote recovery digests, enforces rev/xtags, and never re-registers retired files", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-r4-c1c2c3-"));
+    try {
+      const mp4A = makeMp4StreamBytes(600);
+      const mp4B = makeMp4StreamBytes(600);
+      // Same length & same box boundaries (0-231 / 232-303), but different sidx payload byte!
+      mp4B[250] = (mp4B[250] ?? 0) ^ 0xff;
+
+      // 1) C2: Remote recovery candidate with matching (clen, layout) but tampered sidx bytes MUST be rejected!
+      let phase = 1;
+      let candidateBytes = mp4B;
+      const ytDlpC2: YtDlpRunner = {
+        async isBgutilAvailable() { return false; },
+        async extractVideoInfo(videoId, { useAuth }): Promise<YtDlpVideoInfo> {
+          const hostTag = useAuth ? `tier2-p${phase}` : "tier1";
+          return {
+            id: videoId,
+            title: "Digest Verify Recovery",
+            duration: 60,
+            formats: [
+              {
+                format_id: "137",
+                ext: "mp4",
+                protocol: "https",
+                container: "mp4_dash",
+                vcodec: "avc1.640028",
+                acodec: "none",
+                width: 1920,
+                height: 1080,
+                fps: 30,
+                tbr: 2000,
+                filesize: mp4A.byteLength,
+                url: `https://rr1---${hostTag}.googlevideo.com/videoplayback?itag=137&dur=60&expire=1999999999&clen=${mp4A.byteLength}&lmt=1700000111&xtags=acont%3Doriginal`,
+              },
+            ],
+          };
+        },
+        async downloadFormat() { throw new Error("unused"); },
+      };
+
+      let failTier1 = false;
+      const appC2 = createApp(makeTestConfig(tmpDir, { authEnabled: true }), {
+        logger: noopLogger,
+        ytDlp: ytDlpC2,
+        innertube: makeMockInnertube(),
+        fetchRawFn: async (input, init) => {
+          const u = input.toString();
+          const range = new Headers(init?.headers).get("range") || "";
+          if (u.includes("tier1") && failTier1) {
+            return new Response("Forbidden", { status: 403 });
+          }
+          const src = u.includes("tier1") ? mp4A : candidateBytes;
+          const m = /^bytes=(\d+)-(\d+)$/.exec(range);
+          if (!m) {
+            return new Response(src, {
+              status: 200,
+              headers: { "Content-Length": String(src.byteLength) },
+            });
+          }
+          const s = Number(m[1]);
+          const e = Number(m[2]);
+          const slice = src.slice(s, e + 1);
+          return new Response(slice, {
+            status: 206,
+            headers: {
+              "Content-Range": `bytes ${s}-${e}/${src.byteLength}`,
+              "Content-Length": String(slice.byteLength),
+            },
+          });
+        },
+      });
+      // Disable Tier 3 so we isolate remote recovery verification
+      appC2.config.playback.ephemeralBuffer.enabled = false;
+
+      const vJson = (await (await appC2.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"))).json()) as any;
+      const playUrl = vJson.adaptiveFormats[0].url as string;
+      // C3: Issued URL must bind rev (lmt) and xtags!
+      expect(playUrl).toContain("rev=1700000111");
+      expect(playUrl).toContain("xtags=acont%3Doriginal");
+
+      // Mismatched rev or xtags MUST return 410 Gone
+      const badRevUrl = playUrl.replace("rev=1700000111", "rev=1700000999");
+      expect((await appC2.fetch(new Request(badRevUrl, { headers: { Range: "bytes=0-49" } }))).status).toBe(410);
+      const badXtagsUrl = playUrl.replace("xtags=acont%3Doriginal", "xtags=acont%3Ddubbed");
+      expect((await appC2.fetch(new Request(badXtagsUrl, { headers: { Range: "bytes=0-49" } }))).status).toBe(410);
+
+      // Shaka fetches sidx range 232-303 -> daemon captures authoritative indexHash for mp4A
+      const idxRes = await appC2.fetch(new Request(playUrl, { headers: { Range: "bytes=232-303" } }));
+      expect(idxRes.status).toBe(206);
+      await idxRes.arrayBuffer();
+
+      // Now Tier 1 returns 403; Tier 2 returns SAME clen/layout/lmt/xtags, DIFFERENT sidx bytes (mp4B) -> MUST reject!
+      failTier1 = true;
+      candidateBytes = mp4B;
+      const rejRes = await appC2.fetch(new Request(playUrl, { headers: { Range: "bytes=304-353" } }));
+      expect(rejRes.status).toBe(503);
+      const tAfterReject = appC2.resolver.getStreamTarget("abc123XYZ99", "137", 137);
+      expect(tAfterReject?.kind === "remote" && tAfterReject.url.includes("tier1")).toBe(true);
+
+      // Next, fresh record with matching Tier 2 bytes (mp4A) MUST pass remote digest verification and serve 206!
+      phase = 2;
+      failTier1 = false;
+      appC2.resolver.invalidateVideo("abc123XYZ99");
+      const vJson2 = (await (await appC2.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"))).json()) as any;
+      const playUrl2 = vJson2.adaptiveFormats[0].url as string;
+      const idxRes2 = await appC2.fetch(new Request(playUrl2, { headers: { Range: "bytes=232-303" } }));
+      expect(idxRes2.status).toBe(206);
+      await idxRes2.arrayBuffer();
+
+      failTier1 = true;
+      candidateBytes = mp4A;
+      const okRes = await appC2.fetch(new Request(playUrl2, { headers: { Range: "bytes=304-353" } }));
+      expect(okRes.status).toBe(206);
+      expect(okRes.headers.get("x-steadytube-tier")).toBe("2");
+      appC2.stop();
+
+      // 2) C1 & M12: Two distinct representations for same (vid, fid) use distinct disk paths AND retired local file is NEVER re-registered
+      const subDir = path.join(tmpDir, "c1-m12");
+      const writtenPaths: string[] = [];
+      let revPhase = 1;
+      const appC1 = createApp(makeTestConfig(subDir, { authEnabled: false }), {
+        logger: noopLogger,
+        innertube: makeMockInnertube(),
+        fetchRawFn: async () => new Response("Forbidden", { status: 403 }),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+            const bytes = revPhase === 1 ? mp4A : mp4B;
+            return {
+              id: videoId,
+              title: "Distinct Rep Storage",
+              duration: 60,
+              formats: [
+                {
+                  format_id: "137",
+                  ext: "mp4",
+                  protocol: "https",
+                  container: "mp4_dash",
+                  vcodec: "avc1.640028",
+                  acodec: "none",
+                  width: 1920,
+                  height: 1080,
+                  fps: 30,
+                  tbr: 2000,
+                  filesize: bytes.byteLength,
+                  url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=137&dur=60&expire=1999999999&clen=${bytes.byteLength}&lmt=${revPhase === 1 ? "111" : "222"}`,
+                },
+              ],
+            };
+          },
+          async downloadFormat(_id, _sel, outPath) {
+            writtenPaths.push(outPath);
+            fs.writeFileSync(outPath, revPhase === 1 ? mp4A : mp4B);
+            return outPath;
+          },
+        },
+      });
+
+      const u1 = ((await (await appC1.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"))).json()) as any).adaptiveFormats[0].url as string;
+      const r1 = await appC1.fetch(new Request(u1, { headers: { Range: "bytes=232-303" } }));
+      expect(r1.status).toBe(206);
+      expect(new Uint8Array(await r1.arrayBuffer())).toEqual(mp4A.subarray(232, 304));
+
+      revPhase = 2;
+      appC1.resolver.invalidateVideo("abc123XYZ99");
+      const u2 = ((await (await appC1.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"))).json()) as any).adaptiveFormats[0].url as string;
+      const r2 = await appC1.fetch(new Request(u2, { headers: { Range: "bytes=232-303" } }));
+      expect(r2.status).toBe(206);
+      expect(new Uint8Array(await r2.arrayBuffer())).toEqual(mp4B.subarray(232, 304));
+
+      // Two distinct immutable paths on disk, and BOTH files survive simultaneously!
+      expect(writtenPaths.length).toBe(2);
+      expect(writtenPaths[0]).not.toBe(writtenPaths[1]);
+      expect(fs.existsSync(writtenPaths[0]!)).toBe(true);
+      expect(fs.existsSync(writtenPaths[1]!)).toBe(true);
+
+      // Cache-miss disk shortcut honors persisted rev & serves exact rep without mismatch
+      appC1.resolver.invalidateVideo("abc123XYZ99");
+      const missR1 = await appC1.fetch(new Request(u1, { headers: { Range: "bytes=232-303" } }));
+      expect(missR1.status).toBe(206);
+      expect(new Uint8Array(await missR1.arrayBuffer())).toEqual(mp4A.subarray(232, 304));
+
+      // M12: Retire a pinned local entry -> serveLocalTargetOr503 MUST return 503 and NEVER re-register retired path!
+      const localRec = await appC1.resolver.resolveVideo("abc123XYZ99", "http://127.0.0.1:8787");
+      const r2Live = await appC1.fetch(new Request(u2, { headers: { Range: "bytes=0-49" } }));
+      expect(r2Live.status).toBe(206);
+      await r2Live.arrayBuffer();
+      const target2 = localRec.targetsByFid.get("137");
+      expect(target2?.kind).toBe("local");
+      if (target2?.kind === "local") {
+        const key2 = target2.storeKey!;
+        appC1.ephemeralStore.pin(key2);
+        appC1.ephemeralStore.deleteByKey(key2); // Retired while still on disk!
+        expect(fs.existsSync(target2.filePath)).toBe(true);
+        const retiredRes = await appC1.fetch(new Request(u2, { headers: { Range: "bytes=0-49" } }));
+        expect(retiredRes.status).toBe(503);
+        expect(appC1.ephemeralStore.getByKey(key2)).toBeNull();
+        appC1.ephemeralStore.unpin(key2);
+        expect(fs.existsSync(target2.filePath)).toBe(false);
+      }
+      appC1.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("Round 4 C4/C5/M6/M7/M8: strict upstream 206/body framing, progressive multi-binding settle, publishPrimaryRecord, range guardrails, and cold Tier 3 auth/probe precedence", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-r4-c4c5m678-"));
+    try {
+      const mp4Bytes = makeMp4StreamBytes(600);
+
+      // 1) C4: withStallWatchdog detects truncated EOF & over-length upstream body and calls onStall
+      let truncStalls = 0;
+      const shortBody = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(10));
+          controller.close();
+        },
+      });
+      const guardedShort = withStallWatchdog(shortBody, 500, undefined, () => { truncStalls++; }, 50);
+      await expect(new Response(guardedShort).arrayBuffer()).rejects.toThrow(/truncated/i);
+      expect(truncStalls).toBe(1);
+
+      let overStalls = 0;
+      const overBody = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(60));
+          controller.close();
+        },
+      });
+      const guardedOver = withStallWatchdog(overBody, 500, undefined, () => { overStalls++; }, 50);
+      await expect(new Response(guardedOver).arrayBuffer()).rejects.toThrow(/exceeded expected/i);
+      expect(overStalls).toBe(1);
+
+      // 2) C4 + M7: Malformed/mismatched upstream 206 rejected (never forwarded), and unsatisfiable Range returns 416 locally
+      let upstreamMode: "missing-cr" | "wrong-interval" | "wildcard-total" | "bad-cl" | "ok" = "missing-cr";
+      let upstreamCalls = 0;
+      const appC4 = createApp(makeTestConfig(path.join(tmpDir, "c4"), { authEnabled: false }), {
+        logger: noopLogger,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+            return {
+              id: videoId,
+              title: "Framing Check",
+              duration: 60,
+              formats: [
+                {
+                  format_id: "137",
+                  ext: "mp4",
+                  protocol: "https",
+                  container: "mp4_dash",
+                  vcodec: "avc1.640028",
+                  acodec: "none",
+                  width: 1920,
+                  height: 1080,
+                  fps: 30,
+                  tbr: 2000,
+                  filesize: mp4Bytes.byteLength,
+                  url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=137&dur=60&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+                },
+              ],
+            };
+          },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+        fetchRawFn: async () => {
+          upstreamCalls++;
+          if (upstreamMode === "missing-cr") {
+            return new Response(mp4Bytes.slice(0, 50), { status: 206, headers: { "Content-Length": "50" } });
+          }
+          if (upstreamMode === "wrong-interval") {
+            return new Response(mp4Bytes.slice(10, 60), {
+              status: 206,
+              headers: { "Content-Range": `bytes 10-59/${mp4Bytes.byteLength}`, "Content-Length": "50" },
+            });
+          }
+          if (upstreamMode === "wildcard-total") {
+            return new Response(mp4Bytes.slice(0, 50), {
+              status: 206,
+              headers: { "Content-Range": "bytes 0-49/*", "Content-Length": "50" },
+            });
+          }
+          if (upstreamMode === "bad-cl") {
+            return new Response(mp4Bytes.slice(0, 50), {
+              status: 206,
+              headers: { "Content-Range": `bytes 0-49/${mp4Bytes.byteLength}`, "Content-Length": "40" },
+            });
+          }
+          return new Response(mp4Bytes.slice(0, 50), {
+            status: 206,
+            headers: { "Content-Range": `bytes 0-49/${mp4Bytes.byteLength}`, "Content-Length": "50" },
+          });
+        },
+      });
+      appC4.config.playback.ephemeralBuffer.enabled = false;
+
+      const uC4 = ((await (await appC4.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"))).json()) as any).adaptiveFormats[0].url as string;
+
+      // M7: Unsatisfiable range returns 416 immediately WITHOUT hitting upstream!
+      const unsatRes = await appC4.fetch(
+        new Request(uC4, { headers: { Range: `bytes=${mp4Bytes.byteLength + 100}-` } }),
+      );
+      expect(unsatRes.status).toBe(416);
+      expect(unsatRes.headers.get("content-range")).toBe(`bytes */${mp4Bytes.byteLength}`);
+      expect(unsatRes.headers.get("content-length")).toBe("0");
+      expect(upstreamCalls).toBe(0);
+
+      for (const mode of ["missing-cr", "wrong-interval", "wildcard-total", "bad-cl"] as const) {
+        upstreamMode = mode;
+        const badRes = await appC4.fetch(new Request(uC4, { headers: { Range: "bytes=0-49" } }));
+        expect(badRes.status).not.toBe(206);
+      }
+      upstreamMode = "ok";
+      const okC4 = await appC4.fetch(new Request(uC4, { headers: { Range: "bytes=0-49" } }));
+      expect(okC4.status).toBe(206);
+      appC4.stop();
+
+      // 3) C5: Reused progressive handle settles ALL bound cache slots on failure (restoring fallbackRemote, not stuck at 503!)
+      let rejectProg!: (err: Error) => void;
+      let progStarts = 0;
+      const appC5 = createApp(makeTestConfig(path.join(tmpDir, "c5"), { authEnabled: false }), {
+        logger: noopLogger,
+        innertube: makeMockInnertube(),
+        fetchRawFn: async () => new Response("Forbidden", { status: 403 }),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+            return {
+              id: videoId,
+              title: "Progressive Multi-Binding",
+              duration: 60,
+              formats: [
+                {
+                  format_id: "137",
+                  ext: "mp4",
+                  protocol: "https",
+                  container: "mp4_dash",
+                  vcodec: "avc1.640028",
+                  acodec: "none",
+                  width: 1920,
+                  height: 1080,
+                  fps: 30,
+                  tbr: 2000,
+                  filesize: mp4Bytes.byteLength,
+                  url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=137&dur=60&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+                },
+              ],
+            };
+          },
+          async downloadFormat() { throw new Error("unused"); },
+          async startProgressiveDownload(videoId, sel, outPath, opts): Promise<ProgressiveDownloadHandle> {
+            progStarts++;
+            const tmpPath = `${outPath}.c5.tmp.mp4`;
+            fs.writeFileSync(tmpPath, mp4Bytes);
+            let status: "downloading" | "completed" | "failed" = "downloading";
+            const done = new Promise<{ filePath: string; size: number }>((_, reject) => {
+              rejectProg = (err) => {
+                status = "failed";
+                reject(err);
+              };
+            });
+            return {
+              videoId,
+              formatId: opts.cacheFormatId || sel,
+              mimeType: opts.mimeType,
+              expectedSize: opts.expectedSize,
+              done,
+              getReadablePath: () => tmpPath,
+              getAvailableBytes: () => mp4Bytes.byteLength,
+              getStatus: () => status,
+              getError: () => (status === "failed" ? new Error("idle") : null),
+              touch: () => {},
+              cancel: () => { status = "failed"; },
+              waitForBytes: () => Promise.resolve(),
+            };
+          },
+        },
+      });
+
+      const uC5 = ((await (await appC5.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"))).json()) as any).adaptiveFormats[0].url as string;
+      const pRes1 = await appC5.fetch(new Request(uC5, { headers: { Range: "bytes=0-49" } }));
+      expect(pRes1.status).toBe(206);
+      expect(progStarts).toBe(1);
+
+      // Invalidate cache & resolve fresh record gen 2 -> reuses the SAME active progressive handle!
+      appC5.resolver.invalidateVideo("abc123XYZ99");
+      await appC5.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"));
+      const pRes2 = await appC5.fetch(new Request(uC5, { headers: { Range: "bytes=0-49" } }));
+      expect(pRes2.status).toBe(206);
+      expect(progStarts).toBe(1); // Reused!
+
+      // Fail progressive handle with IdleCancelledError -> MUST restore gen 2's cache slot back to remote target!
+      const idleErr = new Error("idle cancelled");
+      idleErr.name = "IdleCancelledError";
+      rejectProg(idleErr);
+      await new Promise((r) => setTimeout(r, 20));
+      const slotAfterFail = appC5.resolver.getStreamTarget("abc123XYZ99", "137", 137);
+      expect(slotAfterFail?.kind).toBe("remote");
+      appC5.stop();
+
+      // 4) M6: Slower incomplete resolveVideo MUST NOT overwrite a faster complete DASH record
+      let releaseSlowMuxed!: () => void;
+      let slowMuxedStarted!: () => void;
+      const slowStartedPromise = new Promise<void>((r) => { slowMuxedStarted = r; });
+      let extractIdx = 0;
+      const appM6 = createApp(makeTestConfig(path.join(tmpDir, "m6"), { authEnabled: false }), {
+        logger: noopLogger,
+        innertube: {
+          async getClient() {
+            return {
+              async getInfo() {
+                return {
+                  streaming_data: {
+                    adaptive_formats: [
+                      { itag: 137, init_range: { start: 0, end: 231 }, index_range: { start: 232, end: 303 } },
+                      { itag: 140, init_range: { start: 0, end: 231 }, index_range: { start: 232, end: 303 } },
+                    ],
+                  },
+                  basic_info: {},
+                  watch_next_feed: [],
+                };
+              },
+            };
+          },
+          reset() {},
+        } as unknown as AnonymousInnertubeProvider,
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+            const myCall = ++extractIdx;
+            if (myCall === 1) {
+              slowMuxedStarted();
+              await new Promise<void>((r) => { releaseSlowMuxed = r; });
+              // Slow call returns muxed-only (no complete DASH pair!)
+              return {
+                id: videoId,
+                title: "Slow Muxed",
+                duration: 60,
+                formats: [
+                  {
+                    format_id: "18",
+                    ext: "mp4",
+                    protocol: "https",
+                    vcodec: "avc1.42001E",
+                    acodec: "mp4a.40.2",
+                    width: 640,
+                    height: 360,
+                    fps: 30,
+                    tbr: 500,
+                    url: "https://rr1---muxed.googlevideo.com/videoplayback?itag=18&dur=60&expire=1999999999",
+                  },
+                ],
+              };
+            }
+            // Fast DASH call returns complete video + audio DASH pair
+            return {
+              id: videoId,
+              title: "Fast Complete DASH",
+              duration: 60,
+              formats: [
+                {
+                  format_id: "137",
+                  ext: "mp4",
+                  protocol: "https",
+                  container: "mp4_dash",
+                  vcodec: "avc1.640028",
+                  acodec: "none",
+                  width: 1920,
+                  height: 1080,
+                  fps: 30,
+                  tbr: 2000,
+                  filesize: mp4Bytes.byteLength,
+                  url: `https://rr1---dash.googlevideo.com/videoplayback?itag=137&dur=60&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+                },
+                {
+                  format_id: "140",
+                  ext: "m4a",
+                  protocol: "https",
+                  container: "m4a_dash",
+                  vcodec: "none",
+                  acodec: "mp4a.40.2",
+                  tbr: 128,
+                  filesize: mp4Bytes.byteLength,
+                  url: `https://rr1---dash.googlevideo.com/videoplayback?itag=140&dur=60&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+                },
+              ],
+            };
+          },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+      });
+
+      const slowVideoPromise = appM6.resolver.resolveVideo("abc123XYZ99", "http://127.0.0.1:8787");
+      await slowStartedPromise;
+      const fastDashRec = await appM6.resolver.resolveVideo("abc123XYZ99", "http://127.0.0.1:8787", {
+        requireDashPair: true,
+      });
+      expect(fastDashRec.adaptiveFormats.length).toBe(2);
+      releaseSlowMuxed();
+      const slowResolved = await slowVideoPromise;
+      // Primary cache MUST remain the complete DASH record (NOT overwritten by slower muxed-only call!)
+      expect(slowResolved.adaptiveFormats.length).toBe(2);
+      expect(appM6.resolver.getCached("abc123XYZ99")?.adaptiveFormats.length).toBe(2);
+      appM6.stop();
+
+      // 5) M8: Cold Tier 3 uses same auth mode as ytInfo for downloadWithAuthFallback
+      const coldAuthOrder: boolean[] = [];
+      const coldVidBytes = makeGlobalSidxMp4Bytes(200);
+      const coldAudBytes = makeGlobalSidxMp4Bytes(120);
+      const appM8 = createApp(makeTestConfig(path.join(tmpDir, "m8"), { authEnabled: true }), {
+        logger: noopLogger,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo(videoId, { useAuth }): Promise<YtDlpVideoInfo> {
+            if (!useAuth) throw new Error("bot check");
+            return {
+              id: videoId,
+              title: "Auth-Aligned Cold Tier 3",
+              duration: 60,
+              formats: [
+                { format_id: "137", ext: "mp4", protocol: "m3u8_native", vcodec: "avc1.640028", acodec: "none", width: 1920, height: 1080, fps: 30, tbr: 2000 },
+                { format_id: "140", ext: "m4a", protocol: "m3u8_native", vcodec: "none", acodec: "mp4a.40.2", abr: 128 },
+              ],
+            };
+          },
+          async downloadFormat(_id, sel, outPath, opts) {
+            coldAuthOrder.push(opts.useAuth);
+            fs.writeFileSync(outPath, sel === "137" ? coldVidBytes : coldAudBytes);
+            return outPath;
+          },
+        },
+      });
+      const coldRec = await appM8.resolver.resolveVideo("abc123XYZ99", "http://127.0.0.1:8787");
+      expect(coldRec.tier).toBe(3);
+      // Both video & audio downloads used auth=true FIRST, matching ytInfoUsedAuth!
+      expect(coldAuthOrder).toEqual([true, true]);
+      // Cold Tier 3 URLs MUST carry rev=h:<digest>
+      expect(coldRec.adaptiveFormats[0]!.url).toContain("rev=h%3A");
+      appM8.stop();
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

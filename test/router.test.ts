@@ -769,7 +769,11 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
         },
       });
 
-      // 1) Captions enforce timeout signal + 2 MiB body cap
+      // 1) Captions enforce timeout signal + 2 MiB body cap, and unmatched explicit lang/label returns 404 (not captions[0])
+      const missingCap = await app.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/captions/dQw4w9WgXcQ?lang=fr"),
+      );
+      expect(missingCap.status).toBe(404);
       const hugeCap = await app.fetch(
         new Request("http://127.0.0.1:8787/api/v1/captions/dQw4w9WgXcQ?lang=en"),
       );

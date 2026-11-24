@@ -963,6 +963,7 @@ export function buildProxyPlaybackUrl(params: {
   expireSec: number;
   clen: number;
   layout?: string | null;
+  rev?: string | null;
   xtags?: string | null;
 }): string {
   const u = new URL("/videoplayback", params.origin);
@@ -976,6 +977,9 @@ export function buildProxyPlaybackUrl(params: {
   }
   if (params.layout) {
     u.searchParams.set("layout", params.layout);
+  }
+  if (params.rev) {
+    u.searchParams.set("rev", params.rev);
   }
   if (params.xtags) {
     u.searchParams.set("xtags", params.xtags);

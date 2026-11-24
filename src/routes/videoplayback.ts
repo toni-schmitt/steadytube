@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
 import type { AppConfig } from "../config.ts";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
@@ -15,6 +14,7 @@ import {
   formatDashLayoutKey,
   MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES,
   parseRangeBounds,
+  type RequestedRangeInfo,
   type StreamTarget,
   type StreamTargetRemote,
   type VideoResolver,
@@ -39,7 +39,13 @@ function parseContentRangeHeader(
     const start = Number(rangeMatch[1]);
     const end = Number(rangeMatch[2]);
     const total = rangeMatch[3] === "*" ? null : Number(rangeMatch[3]);
-    if (Number.isFinite(start) && Number.isFinite(end) && (total === null || Number.isFinite(total))) {
+    if (
+      Number.isFinite(start) &&
+      Number.isFinite(end) &&
+      start >= 0 &&
+      end >= start &&
+      (total === null || (Number.isFinite(total) && end < total))
+    ) {
       return { start, end, total };
     }
     return null;
@@ -52,34 +58,101 @@ function parseContentRangeHeader(
   return null;
 }
 
+type UpstreamValidationResult =
+  | { ok: true; expectedBodyBytes: number | null }
+  | { ok: false; reason: "layout_mismatch" | "recoverable_protocol" };
+
 /**
- * Verify that an upstream 200 / 206 / 416 response does not contradict the
- * authoritative exact `expectedTotal` length bound to the issued playback URL.
+ * Strictly validate upstream 200 / 206 / 416 headers BEFORE forwarding headers/bytes to Shaka:
+ * - 206 MUST carry a valid single-range Content-Range matching the requested interval,
+ *   exact `expectedTotal` (rejecting `*` when exact total is known), and exact Content-Length.
+ * - 200 MUST match `expectedTotal` when Content-Length is supplied.
+ * - 416 MUST match `expectedTotal` when `bytes *\/total` is supplied.
  */
-function doesUpstreamResponseMatchExpectedLength(res: Response, expectedTotal: number): boolean {
-  if (!expectedTotal || expectedTotal <= 0) return true;
-  if (res.status === 206) {
-    const parsed = parseContentRangeHeader(res.headers.get("content-range"));
-    if (parsed && "total" in parsed && parsed.total !== null && parsed.total !== expectedTotal) {
-      return false;
+function validateUpstreamSegmentResponse(
+  req: Request,
+  res: Response,
+  expectedTotal: number,
+): UpstreamValidationResult {
+  const rawCl = res.headers.get("content-length");
+  let parsedCl: number | null = null;
+  if (rawCl !== null) {
+    const trimmed = rawCl.trim();
+    if (!/^\d+$/.test(trimmed)) {
+      return { ok: false, reason: "recoverable_protocol" };
     }
-    return true;
+    parsedCl = Number(trimmed);
+    if (!Number.isFinite(parsedCl) || parsedCl < 0) {
+      return { ok: false, reason: "recoverable_protocol" };
+    }
   }
+
+  if (res.status === 206) {
+    const parsedCr = parseContentRangeHeader(res.headers.get("content-range"));
+    if (!parsedCr || !("start" in parsedCr)) {
+      return { ok: false, reason: "recoverable_protocol" };
+    }
+    if (expectedTotal > 0) {
+      if (parsedCr.total === null) {
+        return { ok: false, reason: "recoverable_protocol" };
+      }
+      if (parsedCr.total !== expectedTotal) {
+        return { ok: false, reason: "layout_mismatch" };
+      }
+    }
+    const rangeLen = parsedCr.end - parsedCr.start + 1;
+    if (parsedCl !== null && parsedCl !== rangeLen) {
+      return { ok: false, reason: "recoverable_protocol" };
+    }
+
+    // Verify returned interval matches the client's requested single Range (when no If-Range)
+    if (!req.headers.get("if-range")) {
+      const reqRange = req.headers.get("range");
+      if (reqRange && reqRange.trim()) {
+        const refTotal = expectedTotal > 0 ? expectedTotal : (parsedCr.total ?? 0);
+        if (refTotal > 0) {
+          const parsedReq = parseHttpRangeHeader(reqRange, refTotal);
+          if (parsedReq === "unsatisfiable") {
+            return { ok: false, reason: "recoverable_protocol" };
+          }
+          if (parsedReq.isPartial && (parsedCr.start !== parsedReq.start || parsedCr.end !== parsedReq.end)) {
+            return { ok: false, reason: "recoverable_protocol" };
+          }
+        } else {
+          const m = /^bytes=(\d+)-(\d*)$/i.exec(reqRange.trim());
+          if (m) {
+            const reqStart = Number(m[1]);
+            const reqEnd = m[2] ? Number(m[2]) : null;
+            if (parsedCr.start !== reqStart || (reqEnd !== null && parsedCr.end > reqEnd)) {
+              return { ok: false, reason: "recoverable_protocol" };
+            }
+          }
+        }
+      }
+    }
+
+    return { ok: true, expectedBodyBytes: rangeLen };
+  }
+
   if (res.status === 416) {
     const parsed = parseContentRangeHeader(res.headers.get("content-range"));
-    if (parsed && "unsatisfiableTotal" in parsed && parsed.unsatisfiableTotal !== expectedTotal) {
-      return false;
+    if (expectedTotal > 0 && parsed && "unsatisfiableTotal" in parsed && parsed.unsatisfiableTotal !== expectedTotal) {
+      return { ok: false, reason: "layout_mismatch" };
     }
-    return true;
+    return { ok: true, expectedBodyBytes: 0 };
   }
+
   if (res.status === 200) {
-    const cl = res.headers.get("content-length");
-    if (cl && /^\d+$/.test(cl.trim())) {
-      const len = Number(cl.trim());
-      if (len !== expectedTotal) return false;
+    if (expectedTotal > 0 && parsedCl !== null && parsedCl !== expectedTotal) {
+      return { ok: false, reason: "layout_mismatch" };
     }
+    return {
+      ok: true,
+      expectedBodyBytes: parsedCl ?? (expectedTotal > 0 ? expectedTotal : null),
+    };
   }
-  return true;
+
+  return { ok: false, reason: "recoverable_protocol" };
 }
 
 /**
@@ -121,23 +194,39 @@ function tapStreamHash(
   });
 }
 
-function parseRequestedRangeStart(req: Request, totalSize: number): number | undefined {
-  if (req.headers.get("if-range")) return 0;
+function classifyRequestedRange(req: Request, totalSize: number): RequestedRangeInfo {
+  if (req.headers.get("if-range")) return { kind: "offset", start: 0 };
   const range = req.headers.get("range");
-  if (!range || !range.trim()) return 0;
+  if (!range || !range.trim()) return { kind: "offset", start: 0 };
+  const trimmed = range.trim();
+  if (!/^bytes=/i.test(trimmed) || trimmed.includes(",")) {
+    return { kind: "offset", start: 0 };
+  }
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(trimmed);
+  if (!match || (match[1] === "" && match[2] === "")) {
+    return { kind: "offset", start: 0 };
+  }
+
   if (totalSize > 0) {
-    const parsed = parseHttpRangeHeader(range, totalSize);
-    if (parsed !== "unsatisfiable") {
-      return parsed.start;
+    const parsed = parseHttpRangeHeader(trimmed, totalSize);
+    if (parsed === "unsatisfiable") {
+      return { kind: "unsatisfiable" };
     }
-    return undefined;
+    return { kind: "offset", start: parsed.start };
   }
-  const m = /^bytes=(\d+)-/i.exec(range.trim());
-  if (m) {
-    const n = Number(m[1]);
-    if (Number.isFinite(n) && n >= 0) return n;
+
+  const [, rawStart, rawEnd] = match;
+  if (rawStart === "") {
+    if (/^0+$/.test(rawEnd!)) return { kind: "unsatisfiable" };
+    return { kind: "indeterminate_suffix" };
   }
-  return undefined;
+  const start = Number(rawStart);
+  if (!Number.isFinite(start) || start < 0) return { kind: "unsatisfiable" };
+  if (rawEnd !== "") {
+    const end = Number(rawEnd);
+    if (!Number.isFinite(end) || end < start) return { kind: "unsatisfiable" };
+  }
+  return { kind: "offset", start };
 }
 
 function getSignalAbortError(signal: AbortSignal | undefined): Error {
@@ -171,9 +260,9 @@ function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined):
 }
 
 /**
- * Wraps an upstream ReadableStream with a per-chunk stall watchdog so that if
- * googlevideo.com stops sending bytes mid-segment, we abort cleanly and mark
- * the cached target stale for recovery on retry.
+ * Wraps an upstream ReadableStream with a per-chunk stall watchdog and optional
+ * exact `expectedBodyBytes` enforcement so truncated EOFs or over-length upstream
+ * bodies fail cleanly and mark the cached target stale for recovery on retry.
  *
  * Client-initiated aborts (`signal.aborted` or stream `cancel()`) never invoke
  * `onStall`, avoiding false stale-marking when FreeTube/Shaka cancels a seek,
@@ -184,6 +273,7 @@ export function withStallWatchdog(
   stallTimeoutMs: number,
   signal: AbortSignal | undefined,
   onStall: () => void,
+  expectedBodyBytes?: number | null,
 ): ReadableStream<Uint8Array> {
   const reader = source.getReader();
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -191,6 +281,7 @@ export function withStallWatchdog(
   let cancelled = false;
   let clientAborted = Boolean(signal?.aborted);
   let stallReported = false;
+  let totalRead = 0;
 
   const clearTimer = () => {
     if (timer) {
@@ -274,8 +365,33 @@ export function withStallWatchdog(
         }
         if (done) {
           cleanup();
+          if (
+            expectedBodyBytes !== null &&
+            expectedBodyBytes !== undefined &&
+            totalRead < expectedBodyBytes
+          ) {
+            reportStallOnce();
+            controller.error(
+              new Error(`Upstream stream truncated early (${totalRead} < ${expectedBodyBytes} bytes)`),
+            );
+            return;
+          }
           controller.close();
         } else if (value) {
+          totalRead += value.byteLength;
+          if (
+            expectedBodyBytes !== null &&
+            expectedBodyBytes !== undefined &&
+            totalRead > expectedBodyBytes
+          ) {
+            cleanup();
+            reportStallOnce();
+            await reader.cancel(new Error("Upstream stream exceeded expected byte length")).catch(() => {});
+            controller.error(
+              new Error(`Upstream stream exceeded expected length (${totalRead} > ${expectedBodyBytes} bytes)`),
+            );
+            return;
+          }
           controller.enqueue(value);
         }
       } catch (err) {
@@ -321,12 +437,14 @@ export class VideoPlaybackRoute {
     const clenParam = url.searchParams.get("clen");
     const urlClen = clenParam && /^\d+$/.test(clenParam) ? Number(clenParam) : 0;
     const urlLayout = url.searchParams.get("layout") || null;
+    const urlRev = url.searchParams.get("rev") || null;
     const urlXtags = url.searchParams.get("xtags") || null;
     const expectedIdentity: ExpectedTargetIdentity | undefined =
-      urlClen > 0 || urlLayout || urlXtags
+      urlClen > 0 || urlLayout || urlRev || urlXtags
         ? {
             clen: urlClen > 0 ? urlClen : undefined,
             layout: urlLayout,
+            rev: urlRev,
             xtags: urlXtags,
           }
         : undefined;
@@ -345,32 +463,44 @@ export class VideoPlaybackRoute {
 
       if (!target && !cachedRecord) {
         // First check if an already-available compatible local file exists on disk (no download needed!)
+        // Verify persisted metadata (`formatId`, `clen`, `layout`, `rev`, `xtags`) without re-probing on every segment.
         if (formatId) {
-          const diskEntry = this.ephemeralStore.get(videoId, formatId);
-          if (diskEntry) {
-            const sizeOk = urlClen === 0 || diskEntry.size === urlClen;
-            let layoutOk = !urlLayout;
-            if (sizeOk && urlLayout) {
-              const probed = probeLocalFileDashRanges(
-                diskEntry.filePath,
-                diskEntry.mimeType,
-                MAX_DASH_HEADER_PROBE_BYTES,
-              );
-              layoutOk = formatDashLayoutKey(probed) === urlLayout;
+          const legacyKey = this.ephemeralStore.makeKey(videoId, formatId);
+          for (const diskEntry of this.ephemeralStore.findEntriesForVideo(videoId)) {
+            const fidMatches =
+              diskEntry.meta?.formatId === formatId ||
+              (!diskEntry.meta?.formatId && diskEntry.key === legacyKey);
+            if (!fidMatches) continue;
+            if (urlClen > 0 && diskEntry.size !== urlClen) continue;
+            if (urlRev && diskEntry.meta?.rev !== urlRev) continue;
+            if (urlXtags && diskEntry.meta?.xtags !== urlXtags) continue;
+            if (urlLayout) {
+              if (diskEntry.meta?.layout !== undefined) {
+                if (diskEntry.meta.layout !== urlLayout) continue;
+              } else {
+                const probed = probeLocalFileDashRanges(
+                  diskEntry.filePath,
+                  diskEntry.mimeType,
+                  MAX_DASH_HEADER_PROBE_BYTES,
+                );
+                const probedLayout = formatDashLayoutKey(probed);
+                diskEntry.meta = { ...(diskEntry.meta ?? {}), formatId, layout: probedLayout };
+                if (probedLayout !== urlLayout) continue;
+              }
             }
-            if (sizeOk && layoutOk) {
-              return this.ephemeralStore.serveFile(diskEntry, req);
-            }
+            return this.ephemeralStore.serveFile(diskEntry, req);
           }
         }
 
-        // Apply far-seek guardrail on cache miss so a >64 MiB request NEVER triggers cold Tier 3 download
-        // from byte 0; also cap remote-issued fids to maxTier: 2 since cold Tier 3 keys are `tier3-*`.
-        const requestedStart = parseRequestedRangeStart(req, urlClen);
-        const isFarSeek =
-          requestedStart !== undefined && requestedStart > MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES;
+        // Apply far-seek / suffix / unsatisfiable range guardrails on cache miss so they NEVER
+        // trigger cold Tier 3 download from byte 0; also cap remote-issued fids to maxTier: 2.
+        const missRange = classifyRequestedRange(req, urlClen);
+        const isTier3DisallowedRange =
+          missRange.kind === "unsatisfiable" ||
+          missRange.kind === "indeterminate_suffix" ||
+          (missRange.kind === "offset" && missRange.start > MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES);
         const isNonTier3IssuedUrl = Boolean(formatId && !formatId.startsWith("tier3-") && expectedIdentity);
-        const missMaxTier = isFarSeek || isNonTier3IssuedUrl ? 2 : 3;
+        const missMaxTier = isTier3DisallowedRange || isNonTier3IssuedUrl ? 2 : 3;
 
         try {
           const rec = await raceWithAbort(
@@ -432,30 +562,60 @@ export class VideoPlaybackRoute {
     }
 
     // Tier 3 actively downloading progressive stream
+    let current: StreamTargetRemote;
     if (target.kind === "progressive") {
-      return await this.ephemeralStore.serveProgressive(
-        target.source,
-        req,
-        this.config.playback.streamStallTimeoutMs,
-      );
+      if (target.source.getStatus() !== "failed") {
+        return await this.ephemeralStore.serveProgressive(
+          target.source,
+          req,
+          this.config.playback.streamStallTimeoutMs,
+        );
+      }
+      // Failed progressive stream: recover cleanly via its fallback remote target if available
+      if (target.fallbackRemote) {
+        current = target.fallbackRemote;
+      } else {
+        this.resolver.invalidateVideoIfTargetMatches(target.videoId, target.formatId, target);
+        return new Response("Tier 3 progressive stream failed", { status: 503 });
+      }
+    } else {
+      current = target;
     }
 
     // Fast path for non-ranged HEAD when we already know authoritative exact content length
-    if (req.method === "HEAD" && target.clen > 0 && !target.stale && !req.headers.get("range")) {
+    if (req.method === "HEAD" && current.clen > 0 && !current.stale && !req.headers.get("range")) {
       return new Response(null, {
         status: 200,
         headers: {
-          "Content-Type": target.mimeType,
-          "Content-Length": String(target.clen),
+          "Content-Type": current.mimeType,
+          "Content-Length": String(current.clen),
           "Accept-Ranges": "bytes",
           "Cache-Control": "private, max-age=300",
-          "X-SteadyTube-Tier": String(target.tier),
+          "X-SteadyTube-Tier": String(current.tier),
         },
       });
     }
 
+    // Immediately reject unsatisfiable byte ranges locally when exact total size is known
+    const knownTotal = expectedIdentity?.clen || current.clen || 0;
+    if (req.method === "GET" && knownTotal > 0) {
+      const classified = classifyRequestedRange(req, knownTotal);
+      if (classified.kind === "unsatisfiable") {
+        return new Response(null, {
+          status: 416,
+          headers: {
+            "Content-Type": current.mimeType,
+            "Accept-Ranges": "bytes",
+            "Content-Length": "0",
+            "Content-Range": `bytes */${knownTotal}`,
+            "Cache-Control": "private, max-age=300",
+            "X-SteadyTube-Tier": String(current.tier),
+          },
+        });
+      }
+    }
+
     // If a previous body stalled on this target, immediately escalate before trying it again
-    let current: StreamTargetRemote = target;
     if (current.stale) {
       let preRecovered: StreamTarget | null = null;
       try {
@@ -466,7 +626,7 @@ export class VideoPlaybackRoute {
             current.itag,
             origin,
             current,
-            { requestedRangeStart: parseRequestedRangeStart(req, expectedIdentity?.clen || current.clen) },
+            { requestedRange: classifyRequestedRange(req, expectedIdentity?.clen || current.clen) },
           ),
           req.signal,
         );
@@ -496,33 +656,46 @@ export class VideoPlaybackRoute {
       }
     }
 
-    // Try current remote target over IPv4; transparently recover on 403/410/429/5xx/network error
+    // Try current remote target over IPv4; transparently recover on 403/410/429/5xx/network/protocol error
     for (let attempt = 0; attempt < MAX_RECOVERY_ATTEMPTS; attempt++) {
       try {
         const res = await this.fetchUpstreamSegment(req, current);
         if (res.status === 200 || res.status === 206 || res.status === 416) {
           const expectedTotal = expectedIdentity?.clen || current.clen || 0;
-          if (!doesUpstreamResponseMatchExpectedLength(res, expectedTotal)) {
+          const validation = validateUpstreamSegmentResponse(req, res, expectedTotal);
+          if (!validation.ok) {
             await res.body?.cancel().catch(() => {});
-            this.resolver.markNeedsMetadataRefresh(current.videoId, current.formatId, current);
-            return new Response("Stream representation changed; reload required", { status: 410 });
+            if (validation.reason === "layout_mismatch") {
+              this.resolver.markNeedsMetadataRefresh(current.videoId, current.formatId, current);
+              return new Response("Stream representation changed; reload required", { status: 410 });
+            }
+            if (attempt === MAX_RECOVERY_ATTEMPTS - 1) {
+              return new Response("Invalid upstream segment response", { status: 502 });
+            }
+            this.logger.warn("Upstream /videoplayback returned malformed/mismatched 206/200 headers; recovering", {
+              videoId: current.videoId,
+              formatId: current.formatId,
+              status: res.status,
+              attempt,
+            });
+          } else {
+            return this.buildStreamResponse(req, res, current, validation.expectedBodyBytes);
           }
-          return this.buildStreamResponse(req, res, current);
+        } else {
+          await res.body?.cancel().catch(() => {});
+
+          if (!isRecoverableStatus(res.status) || attempt === MAX_RECOVERY_ATTEMPTS - 1) {
+            return new Response(null, { status: res.status });
+          }
+
+          this.logger.warn("Upstream /videoplayback returned recoverable error", {
+            videoId: current.videoId,
+            formatId: current.formatId,
+            status: res.status,
+            tier: current.tier,
+            attempt,
+          });
         }
-
-        await res.body?.cancel().catch(() => {});
-
-        if (!isRecoverableStatus(res.status) || attempt === MAX_RECOVERY_ATTEMPTS - 1) {
-          return new Response(null, { status: res.status });
-        }
-
-        this.logger.warn("Upstream /videoplayback returned recoverable error", {
-          videoId: current.videoId,
-          formatId: current.formatId,
-          status: res.status,
-          tier: current.tier,
-          attempt,
-        });
       } catch (err) {
         if (req.signal.aborted) {
           return new Response(null, { status: 499 });
@@ -551,7 +724,7 @@ export class VideoPlaybackRoute {
             current.itag,
             origin,
             current,
-            { requestedRangeStart: parseRequestedRangeStart(req, expectedIdentity?.clen || current.clen) },
+            { requestedRange: classifyRequestedRange(req, expectedIdentity?.clen || current.clen) },
           ),
           req.signal,
         );
@@ -590,22 +763,10 @@ export class VideoPlaybackRoute {
     target: Extract<StreamTarget, { kind: "local" }>,
     req: Request,
   ): Response {
-    const entry = this.ephemeralStore.get(target.videoId, target.formatId);
-    if (entry) {
+    const storeKey = target.storeKey ?? this.ephemeralStore.makeKey(target.videoId, target.formatId);
+    const entry = this.ephemeralStore.getByKey(storeKey);
+    if (entry && entry.filePath === target.filePath && entry.size === target.size) {
       return this.ephemeralStore.serveFile(entry, req);
-    }
-    if (fs.existsSync(target.filePath)) {
-      this.ephemeralStore.register(
-        target.videoId,
-        target.formatId,
-        target.filePath,
-        target.mimeType,
-      );
-      // Verify the entry wasn't immediately evicted by register()'s budget cleanup
-      const verified = this.ephemeralStore.get(target.videoId, target.formatId);
-      if (verified) {
-        return this.ephemeralStore.serveFile(verified, req);
-      }
     }
     this.resolver.invalidateVideoIfTargetMatches(target.videoId, target.formatId, target);
     return new Response("Cached stream expired; reload required", { status: 503 });
@@ -637,13 +798,18 @@ export class VideoPlaybackRoute {
     req: Request,
     upstream: Response,
     target: StreamTargetRemote,
+    expectedBodyBytes: number | null,
   ): Response {
     const outHeaders = new Headers();
     outHeaders.set("Content-Type", upstream.headers.get("content-type") || target.mimeType);
     outHeaders.set("Accept-Ranges", upstream.headers.get("accept-ranges") || "bytes");
 
     const contentLength = upstream.headers.get("content-length");
-    if (contentLength) outHeaders.set("Content-Length", contentLength);
+    if (contentLength) {
+      outHeaders.set("Content-Length", contentLength);
+    } else if (upstream.status === 206 && expectedBodyBytes !== null) {
+      outHeaders.set("Content-Length", String(expectedBodyBytes));
+    }
 
     const contentRange = upstream.headers.get("content-range");
     if (contentRange) outHeaders.set("Content-Range", contentRange);
@@ -668,6 +834,7 @@ export class VideoPlaybackRoute {
           tier: target.tier,
         });
       },
+      expectedBodyBytes,
     );
 
     // Opportunistically fingerprint exact init/index ranges as Shaka fetches them

@@ -91,9 +91,10 @@ export class VideoRoutes {
       }
 
       const track =
-        captions.find((c) => label && c.label === label) ||
-        captions.find((c) => lang && c.languageCode === lang) ||
-        captions[0];
+        label || lang
+          ? captions.find((c) => label && c.label === label) ||
+            captions.find((c) => lang && c.languageCode === lang)
+          : captions[0];
 
       if (!track) {
         return new Response("WEBVTT\n\n", {
