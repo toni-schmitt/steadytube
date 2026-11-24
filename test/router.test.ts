@@ -933,4 +933,232 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test("Round 4 M14/M15/m16/m17/m18/m20: scrubs UTC offset, cancels abandoned media-proxy work, binds channel tabs/tokens, handles page-2-before-page-1 refresh, and escapes playlist HTML", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-r4-misc-"));
+    try {
+      // 1) m18: createGuardedInnertubeFetch scrubs local utcOffsetMinutes & timeZone on JSON POST Request & init bodies
+      let capturedBody = "";
+      const guarded = createGuardedInnertubeFetch(async (_input, init) => {
+        capturedBody = typeof init?.body === "string" ? init.body : "";
+        return new Response("{}", { status: 200 });
+      });
+      const cfgReq = new Request("https://www.youtube.com/youtubei/v1/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: "PREF=tz=Europe.Berlin" },
+        body: JSON.stringify({
+          context: { client: { clientName: "WEB", timeZone: "Europe/Berlin", utcOffsetMinutes: 120 } },
+        }),
+      });
+      await guarded(cfgReq);
+      const parsedBody = JSON.parse(capturedBody);
+      expect(parsedBody.context.client.timeZone).toBe("UTC");
+      expect(parsedBody.context.client.utcOffsetMinutes).toBe(0);
+
+      // 2) M15 + Q1: Abandoned queued/inflight feed requests abort immediately without starving live work; encoded ggpht traversal returns 400
+      let liveFeedCalls = 0;
+      let abortedUpstreamSignals = 0;
+      let releaseHolder!: () => void;
+      const cfgM15 = makeTestConfig(path.join(tmpDir, "m15"), false);
+      cfgM15.rss.maxConcurrentUpstream = 1; // 1 slot so we deterministically test semaphore queuing
+      const appM15 = createApp(cfgM15, {
+        logger: noopLogger,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo() { throw new Error("unused"); },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+        fetchFn: async (input, init) => {
+          const u = input.toString();
+          if (u.includes("UULF_HOLDER")) {
+            await new Promise<void>((resolve) => { releaseHolder = resolve; });
+            return new Response("<feed>holder</feed>", { status: 200 });
+          }
+          if (u.includes("UULF_CANCELLED")) {
+            abortedUpstreamSignals++;
+            return new Response("<feed>should-not-run</feed>", { status: 200 });
+          }
+          if (u.includes("UULF_SHARED")) {
+            await new Promise((r) => setTimeout(r, 25));
+            if (init?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+            liveFeedCalls++;
+            return new Response("<feed>shared</feed>", { status: 200 });
+          }
+          return new Response("<feed>live</feed>", { status: 200 });
+        },
+      });
+
+      // Encoded traversal / separator on /ggpht returns 400
+      expect((await appM15.fetch(new Request("http://127.0.0.1:8787/ggpht/a%2fb/secret"))).status).toBe(400);
+      expect((await appM15.fetch(new Request("http://127.0.0.1:8787/ggpht/a%2e%2eb/secret"))).status).toBe(400);
+
+      // Hold the single semaphore slot, enqueue a request and abort it while queued -> MUST NOT invoke upstream once slot frees!
+      const holderReq = appM15.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_HOLDER1"));
+      await new Promise((r) => setTimeout(r, 15));
+      const cancelCtrl = new AbortController();
+      const queuedCancelledReq = appM15.fetch(
+        new Request("http://127.0.0.1:8787/feed/playlist/UULF_CANCELLED1", { signal: cancelCtrl.signal }),
+      );
+      await new Promise((r) => setTimeout(r, 10));
+      cancelCtrl.abort();
+      expect((await queuedCancelledReq).status).toBe(499);
+
+      releaseHolder();
+      expect((await holderReq).status).toBe(200);
+      await new Promise((r) => setTimeout(r, 15));
+      expect(abortedUpstreamSignals).toBe(0);
+
+      // Shared waiters: aborting 1 of 2 callers keeps shared fetch alive for the 2nd caller!
+      const c1 = new AbortController();
+      const s1 = appM15.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_SHARED1", { signal: c1.signal }));
+      const s2 = appM15.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_SHARED1"));
+      c1.abort();
+      expect((await s1).status).toBe(499);
+      expect((await s2).status).toBe(200);
+      expect(liveFeedCalls).toBe(1);
+      appM15.stop();
+
+      // 3) m16 + GLM m4 + m17 + m20: Channel tab allowlist before client init, "home" supported,
+      // continuation bound to channel+tab, page-2-before-page-1 switches to gen 2, playlist descriptionHtml escaped!
+      let getClientCalls = 0;
+      let searchGen = 0;
+      let releaseGen1Cont!: () => void;
+      let gen1ContStarted!: () => void;
+      const gen1ContStartedPromise = new Promise<void>((r) => { gen1ContStarted = r; });
+
+      const makeVid = (id: string, title: string) => ({
+        type: "Video",
+        id,
+        title: { text: title },
+        author: { name: "Author", id: "UC1111111111111111111111" },
+        duration: { seconds: 60 },
+        view_count: { text: "100 views" },
+        published: { text: "1 day ago" },
+      });
+
+      const appBrowse = createApp(makeTestConfig(path.join(tmpDir, "browse"), false), {
+        logger: noopLogger,
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo() { throw new Error("unused"); },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+        innertube: {
+          async getClient() {
+            getClientCalls++;
+            return {
+              async getChannel(id: string) {
+                return {
+                  metadata: { title: `Chan ${id}`, external_id: id },
+                  async getVideos() {
+                    return {
+                      videos: [makeVid("vid_home_1", "Home Video 1")],
+                      has_continuation: true,
+                      async getContinuation() {
+                        return { videos: [makeVid("vid_home_2", "Home Video 2")], has_continuation: false };
+                      },
+                    };
+                  },
+                };
+              },
+              async search() {
+                const myGen = ++searchGen;
+                return {
+                  results: [makeVid(`gen${myGen}_page1`, `G${myGen} P1`)],
+                  has_continuation: true,
+                  async getContinuation() {
+                    if (myGen === 1) {
+                      gen1ContStarted();
+                      await new Promise<void>((r) => { releaseGen1Cont = r; });
+                    }
+                    return {
+                      results: [makeVid(`gen${myGen}_page2`, `G${myGen} P2`)],
+                      has_continuation: false,
+                    };
+                  },
+                };
+              },
+              async getPlaylist() {
+                return {
+                  info: {
+                    title: { text: "XSS Test Playlist" },
+                    description: { text: '<script>alert("x")</script> https://example.com' },
+                    author: { name: { text: "Auth" }, id: "UC1111111111111111111111" },
+                    total_items: "1",
+                  },
+                  items: [makeVid("pl_vid_001", "PL Video")],
+                  has_continuation: false,
+                };
+              },
+            };
+          },
+          reset() {},
+        } as unknown as AnonymousInnertubeProvider,
+      });
+
+      // Unknown tab returns 404 WITHOUT calling innertube.getClient()!
+      const badTab = await appBrowse.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/channels/UC1111111111111111111111/nonexistent_tab"),
+      );
+      expect(badTab.status).toBe(404);
+      expect(getClientCalls).toBe(0);
+
+      // "home" tab works and issues continuation token bound to channel+tab
+      const homeRes = await appBrowse.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/channels/UC1111111111111111111111/home"),
+      );
+      expect(homeRes.status).toBe(200);
+      const homeJson = (await homeRes.json()) as any;
+      expect(homeJson.videos[0].videoId).toBe("vid_home_1");
+      const token = homeJson.continuation as string;
+      expect(typeof token).toBe("string");
+
+      // Replaying token against a DIFFERENT channel or DIFFERENT tab MUST return empty (not cross-channel leak)
+      const wrongChanRes = (await (
+        await appBrowse.fetch(
+          new Request(`http://127.0.0.1:8787/api/v1/channels/UC2222222222222222222222/home?continuation=${encodeURIComponent(token)}`),
+        )
+      ).json()) as any;
+      expect(wrongChanRes.videos).toEqual([]);
+
+      const wrongTabRes = (await (
+        await appBrowse.fetch(
+          new Request(`http://127.0.0.1:8787/api/v1/channels/UC1111111111111111111111/playlists?continuation=${encodeURIComponent(token)}`),
+        )
+      ).json()) as any;
+      expect(wrongTabRes.playlists).toEqual([]);
+
+      // Matching channel + tab succeeds!
+      const rightContRes = (await (
+        await appBrowse.fetch(
+          new Request(`http://127.0.0.1:8787/api/v1/channels/UC1111111111111111111111/home?continuation=${encodeURIComponent(token)}`),
+        )
+      ).json()) as any;
+      expect(rightContRes.videos[0].videoId).toBe("vid_home_2");
+
+      // m17: Page-2 starts on warm gen-1 BEFORE page-1 installs gen-2 -> page-2 switches to gen-2!
+      const s1Gen1 = (await (await appBrowse.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=race&page=1"))).json()) as any[];
+      expect(s1Gen1[0].videoId).toBe("gen1_page1");
+
+      const p2Req = appBrowse.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=race&page=2"));
+      await gen1ContStartedPromise;
+      const p1Gen2 = (await (await appBrowse.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=race&page=1"))).json()) as any[];
+      expect(p1Gen2[0].videoId).toBe("gen2_page1");
+
+      releaseGen1Cont();
+      const p2Result = (await (await p2Req).json()) as any[];
+      expect(p2Result[0].videoId).toBe("gen2_page2");
+
+      // m20: Playlist descriptionHtml escapes HTML and linkifies URLs
+      const plJson = (await (await appBrowse.fetch(new Request("http://127.0.0.1:8787/api/v1/playlists/PLxss123"))).json()) as any;
+      expect(plJson.descriptionHtml).toContain("&lt;script&gt;");
+      expect(plJson.descriptionHtml).not.toContain("<script>");
+      expect(plJson.descriptionHtml).toContain('<a href="https://example.com"');
+
+      appBrowse.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

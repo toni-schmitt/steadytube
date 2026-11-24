@@ -24,6 +24,9 @@ describe("ipv4-fetch", () => {
             host: req.headers.get("host"),
             method: req.method,
             range: req.headers.get("range"),
+            cookie: req.headers.get("cookie"),
+            xNew: req.headers.get("x-new"),
+            xOld: req.headers.get("x-old"),
           });
         }
         if (url.pathname === "/redirect") {
@@ -210,5 +213,19 @@ describe("ipv4-fetch", () => {
     expect(isPrivateOrReservedIpv4("203.0.113.9")).toBe(true);
     const cappedRes = await ipv4Fetch(`${baseUrl}/range`, { maxBodyBytes: 8 });
     await expect(cappedRes.text()).rejects.toThrow(/exceeded limit/i);
+
+    // 5) Fetch-spec header replacement: explicit init.headers replaces Request.headers so deleted Cookie never leaks
+    const reqWithCookie = new Request(`${baseUrl}/echo-host`, {
+      headers: { Cookie: "PREF=tz=Europe.Berlin", "X-Old": "stale" },
+    });
+    const replacedHeaders = new Headers(reqWithCookie.headers);
+    replacedHeaders.delete("cookie");
+    replacedHeaders.delete("x-old");
+    replacedHeaders.set("x-new", "clean");
+    const noCookieRes = await ipv4Fetch(reqWithCookie, { headers: replacedHeaders });
+    const echoed = (await noCookieRes.json()) as { cookie: string | null; xNew: string | null; xOld: string | null };
+    expect(echoed.cookie).toBeNull();
+    expect(echoed.xOld).toBeNull();
+    expect(echoed.xNew).toBe("clean");
   });
 });

@@ -30,24 +30,45 @@ const MAX_FEED_BODY_BYTES = 5 * 1024 * 1024; // 5 MiB cap for Atom/XML RSS feeds
 const MIN_MAX_IMAGE_PROXY_BYTES = 10 * 1024 * 1024; // 10 MiB hard cap for uncached image proxying
 const MAX_THUMB_CACHE_BYTES = 64 * 1024 * 1024; // 64 MiB total RAM cap for thumbnail cache
 const MAX_FEED_CACHE_BYTES = 32 * 1024 * 1024; // 32 MiB total RAM cap for RSS feed cache
+const MAX_SEMAPHORE_QUEUE_SIZE = 256;
+const SEMAPHORE_WAIT_TIMEOUT_MS = 15_000;
+
+interface SharedInflightEntry<T> {
+  promise: Promise<T>;
+  waiters: number;
+  controller: AbortController;
+}
+
+function getAbortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The operation was aborted.", "AbortError");
+}
+
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(getAbortError(signal));
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(getAbortError(signal!));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) {
     promise.catch(() => {});
-    return Promise.reject(
-      signal.reason instanceof Error
-        ? signal.reason
-        : new DOMException("The operation was aborted.", "AbortError"),
-    );
+    return Promise.reject(getAbortError(signal));
   }
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => {
-      reject(
-        signal.reason instanceof Error
-          ? signal.reason
-          : new DOMException("The operation was aborted.", "AbortError"),
-      );
+      reject(getAbortError(signal));
     };
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
@@ -66,8 +87,10 @@ function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined):
 export class MediaProxyRoutes {
   private readonly thumbCache: TtlLruCache<string, CachedBinary>;
   private readonly feedCache: TtlLruCache<string, CachedFeed>;
+  private readonly feedInflight = new Map<string, SharedInflightEntry<CachedFeed>>();
+  private readonly thumbInflight = new Map<string, SharedInflightEntry<CachedBinary>>();
   private readonly feedSemaphore: Semaphore;
-  private readonly thumbSemaphore = new Semaphore(48);
+  private readonly thumbSemaphore = new Semaphore(48, MAX_SEMAPHORE_QUEUE_SIZE);
 
   constructor(
     private readonly config: AppConfig,
@@ -91,7 +114,78 @@ export class MediaProxyRoutes {
         sizeOf: (v) => v.body.length * 2,
       },
     );
-    this.feedSemaphore = new Semaphore(config.rss.maxConcurrentUpstream);
+    this.feedSemaphore = new Semaphore(config.rss.maxConcurrentUpstream, MAX_SEMAPHORE_QUEUE_SIZE);
+  }
+
+  /**
+   * Single-flight cache compute with ref-counted live waiters:
+   * - Concurrent callers share one upstream work item.
+   * - If one caller aborts while others remain, the shared work stays alive.
+   * - If the LAST caller aborts, the shared AbortController aborts immediately,
+   *   cancelling queued semaphore waits and upstream fetches without starving live work.
+   */
+  private async runSharedCached<T>(
+    cache: TtlLruCache<string, T>,
+    inflightMap: Map<string, SharedInflightEntry<T>>,
+    cacheKey: string,
+    reqSignal: AbortSignal | undefined,
+    compute: (sharedSignal: AbortSignal) => Promise<{ value: T; ttlMs?: number; cache?: boolean }>,
+  ): Promise<T> {
+    const cached = cache.get(cacheKey);
+    if (cached !== undefined) return cached;
+    if (reqSignal?.aborted) {
+      throw getAbortError(reqSignal);
+    }
+
+    let entry = inflightMap.get(cacheKey);
+    if (!entry || entry.controller.signal.aborted) {
+      const controller = new AbortController();
+      const created: SharedInflightEntry<T> = {
+        waiters: 0,
+        controller,
+        promise: Promise.resolve(undefined as unknown as T),
+      };
+      created.promise = (async () => {
+        try {
+          const result = await compute(controller.signal);
+          if (result.cache !== false) {
+            cache.set(cacheKey, result.value, result.ttlMs);
+          }
+          return result.value;
+        } finally {
+          if (inflightMap.get(cacheKey) === created) {
+            inflightMap.delete(cacheKey);
+          }
+        }
+      })();
+      // Prevent unhandled rejection if last waiter detaches before rejection settles
+      created.promise.catch(() => {});
+      inflightMap.set(cacheKey, created);
+      entry = created;
+    }
+
+    const activeEntry = entry;
+    activeEntry.waiters++;
+    let detached = false;
+    const detach = () => {
+      if (detached) return;
+      detached = true;
+      reqSignal?.removeEventListener("abort", detach);
+      activeEntry.waiters = Math.max(0, activeEntry.waiters - 1);
+      if (activeEntry.waiters === 0) {
+        activeEntry.controller.abort(new DOMException("All callers aborted", "AbortError"));
+        if (inflightMap.get(cacheKey) === activeEntry) {
+          inflightMap.delete(cacheKey);
+        }
+      }
+    };
+    reqSignal?.addEventListener("abort", detach, { once: true });
+
+    try {
+      return await raceWithAbort(activeEntry.promise, reqSignal);
+    } finally {
+      detach();
+    }
   }
 
   /**
@@ -120,7 +214,13 @@ export class MediaProxyRoutes {
     reqSignal?: AbortSignal,
   ): Promise<Response> {
     const rest = pathname.slice("/ggpht".length);
-    if (!rest || !rest.startsWith("/") || rest.includes("..") || rest.includes("@")) {
+    if (
+      !rest ||
+      !rest.startsWith("/") ||
+      rest.includes("..") ||
+      rest.includes("@") ||
+      /%2e|%2f|%5c|%00/i.test(rest)
+    ) {
       return Response.json({ error: "Invalid image proxy path" }, { status: 400 });
     }
 
@@ -157,75 +257,90 @@ export class MediaProxyRoutes {
     const cacheKey = `feed:${kind}:${id}`;
 
     try {
-      const entry = await raceWithAbort(
-        this.feedCache.getOrCompute(cacheKey, async () => {
-        return await this.feedSemaphore.run(async () => {
-          let lastStatus = 502;
-          let lastBody = "";
-          let lastContentType = "application/atom+xml; charset=utf-8";
-
-          // Up to 2 attempts for transient network/5xx errors during 200-feed bursts
-          for (let attempt = 0; attempt < 2; attempt++) {
-            try {
-              const res = await this.fetchFn(upstreamUrl, {
-                method: "GET",
-                timeoutMs: UPSTREAM_PROXY_TIMEOUT_MS,
-                signal: AbortSignal.timeout(UPSTREAM_PROXY_TIMEOUT_MS),
-                httpsOnly: true,
-                publicIpv4Only: true,
-                allowedHost: (h) => ALLOWED_FEED_HOST.test(h),
-                headers: {
-                  "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-                  Accept: "application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
-                },
-              });
-              lastStatus = res.status;
-              lastContentType = res.headers.get("content-type") || "application/atom+xml; charset=utf-8";
-
-              if (res.status === 404) {
-                await res.body?.cancel().catch(() => {});
-                lastBody = "Not Found";
-                break;
-              }
-              if (res.status >= 500 && attempt === 0) {
-                await res.body?.cancel().catch(() => {});
-                await new Promise((r) => setTimeout(r, 250));
-                continue;
-              }
-
-              const bodyBytes = await readBoundedResponseBytes(res, MAX_FEED_BODY_BYTES);
-              lastBody = new TextDecoder("utf-8").decode(bodyBytes);
-              break;
-            } catch (err) {
-              if (attempt === 0) {
-                await new Promise((r) => setTimeout(r, 250));
-                continue;
-              }
-              throw err;
-            }
-          }
-
-          if (lastStatus === 200) {
-            return {
-              value: { status: 200, contentType: lastContentType, body: lastBody },
-              ttlMs: this.config.rss.cacheTtlSec * 1000,
-              cache: true,
-            };
-          }
-          if (lastStatus === 404) {
-            return {
-              value: { status: 404, contentType: "text/plain; charset=utf-8", body: "Not Found" },
-              ttlMs: this.config.rss.negativeCacheTtlSec * 1000,
-              cache: true,
-            };
-          }
-          return {
-            value: { status: lastStatus, contentType: lastContentType, body: lastBody },
-            cache: false,
-          };
-        });
-      }),
+      const entry = await this.runSharedCached(
+        this.feedCache,
+        this.feedInflight,
+        cacheKey,
         reqSignal,
+        async (sharedSignal) => {
+          return await this.feedSemaphore.run(
+            async () => {
+              let lastStatus = 502;
+              let lastBody = "";
+              let lastContentType = "application/atom+xml; charset=utf-8";
+
+              // Up to 2 attempts for transient network/5xx errors during 200-feed bursts
+              for (let attempt = 0; attempt < 2; attempt++) {
+                if (sharedSignal.aborted) {
+                  throw getAbortError(sharedSignal);
+                }
+                try {
+                  const attemptSignal = AbortSignal.any([
+                    sharedSignal,
+                    AbortSignal.timeout(UPSTREAM_PROXY_TIMEOUT_MS),
+                  ]);
+                  const res = await this.fetchFn(upstreamUrl, {
+                    method: "GET",
+                    timeoutMs: UPSTREAM_PROXY_TIMEOUT_MS,
+                    signal: attemptSignal,
+                    httpsOnly: true,
+                    publicIpv4Only: true,
+                    allowedHost: (h) => ALLOWED_FEED_HOST.test(h),
+                    headers: {
+                      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                      Accept: "application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+                    },
+                  });
+                  lastStatus = res.status;
+                  lastContentType = res.headers.get("content-type") || "application/atom+xml; charset=utf-8";
+
+                  if (res.status === 404) {
+                    await res.body?.cancel().catch(() => {});
+                    lastBody = "Not Found";
+                    break;
+                  }
+                  if (res.status >= 500 && attempt === 0) {
+                    await res.body?.cancel().catch(() => {});
+                    await sleepWithAbort(250, sharedSignal);
+                    continue;
+                  }
+
+                  const bodyBytes = await readBoundedResponseBytes(res, MAX_FEED_BODY_BYTES);
+                  lastBody = new TextDecoder("utf-8").decode(bodyBytes);
+                  break;
+                } catch (err) {
+                  if (sharedSignal.aborted) throw err;
+                  if (attempt === 0) {
+                    await sleepWithAbort(250, sharedSignal);
+                    continue;
+                  }
+                  throw err;
+                }
+              }
+
+              if (lastStatus === 200) {
+                return {
+                  value: { status: 200, contentType: lastContentType, body: lastBody },
+                  ttlMs: this.config.rss.cacheTtlSec * 1000,
+                  cache: true,
+                };
+              }
+              if (lastStatus === 404) {
+                return {
+                  value: { status: 404, contentType: "text/plain; charset=utf-8", body: "Not Found" },
+                  ttlMs: this.config.rss.negativeCacheTtlSec * 1000,
+                  cache: true,
+                };
+              }
+              return {
+                value: { status: lastStatus, contentType: lastContentType, body: lastBody },
+                cache: false,
+              };
+            },
+            SEMAPHORE_WAIT_TIMEOUT_MS,
+            sharedSignal,
+          );
+        },
       );
 
       return new Response(method === "HEAD" ? null : entry.body, {
@@ -239,10 +354,17 @@ export class MediaProxyRoutes {
       if (reqSignal?.aborted) {
         return new Response(null, { status: 499 });
       }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes("Semaphore")) {
+        return new Response("Upstream feed proxy busy", {
+          status: 503,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        });
+      }
       this.logger.warn("RSS feed IPv4 proxy error", {
         kind,
         id,
-        error: err instanceof Error ? err.message : String(err),
+        error: errMsg,
       });
       return new Response("Upstream feed fetch failed", {
         status: 502,
@@ -261,54 +383,68 @@ export class MediaProxyRoutes {
       return new Response(null, { status: 499 });
     }
     try {
-      const entry = await raceWithAbort(
-        this.thumbCache.getOrCompute(cacheKey, async () => {
-        return await this.thumbSemaphore.run(async () => {
-          let lastStatus = 404;
-          let lastType = "image/jpeg";
-          let lastBytes = new Uint8Array(0);
-
-          const maxProxyImageBytes = Math.max(
-            this.config.thumbnails.maxEntryBytes,
-            MIN_MAX_IMAGE_PROXY_BYTES,
-          );
-
-          for (const url of candidateUrls) {
-            const res = await this.fetchRawFn(url, {
-              method: "GET",
-              timeoutMs: UPSTREAM_PROXY_TIMEOUT_MS,
-              signal: AbortSignal.timeout(UPSTREAM_PROXY_TIMEOUT_MS),
-              httpsOnly: true,
-              publicIpv4Only: true,
-              allowedHost: (h) => ALLOWED_IMAGE_HOST.test(h),
-              headers: {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                Accept: "image/webp,image/apng,image/*,*/*;q=0.8",
-              },
-            });
-            lastStatus = res.status;
-            lastType = res.headers.get("content-type") || "image/jpeg";
-            if (res.ok) {
-              lastBytes = await readBoundedResponseBytes(res, maxProxyImageBytes);
-              const shouldCache = lastBytes.byteLength <= this.config.thumbnails.maxEntryBytes;
-              return {
-                value: { status: 200, contentType: lastType, body: lastBytes },
-                ttlMs: this.config.thumbnails.cacheTtlSec * 1000,
-                cache: shouldCache,
-              };
-            }
-            await res.body?.cancel().catch(() => {});
-            if (res.status !== 404) break;
-          }
-
-          return {
-            value: { status: lastStatus, contentType: lastType, body: new Uint8Array(0) },
-            ttlMs: 60_000,
-            cache: lastStatus === 404,
-          };
-        });
-      }),
+      const entry = await this.runSharedCached(
+        this.thumbCache,
+        this.thumbInflight,
+        cacheKey,
         reqSignal,
+        async (sharedSignal) => {
+          return await this.thumbSemaphore.run(
+            async () => {
+              let lastStatus = 404;
+              let lastType = "image/jpeg";
+              let lastBytes = new Uint8Array(0);
+
+              const maxProxyImageBytes = Math.max(
+                this.config.thumbnails.maxEntryBytes,
+                MIN_MAX_IMAGE_PROXY_BYTES,
+              );
+
+              for (const url of candidateUrls) {
+                if (sharedSignal.aborted) {
+                  throw getAbortError(sharedSignal);
+                }
+                const attemptSignal = AbortSignal.any([
+                  sharedSignal,
+                  AbortSignal.timeout(UPSTREAM_PROXY_TIMEOUT_MS),
+                ]);
+                const res = await this.fetchRawFn(url, {
+                  method: "GET",
+                  timeoutMs: UPSTREAM_PROXY_TIMEOUT_MS,
+                  signal: attemptSignal,
+                  httpsOnly: true,
+                  publicIpv4Only: true,
+                  allowedHost: (h) => ALLOWED_IMAGE_HOST.test(h),
+                  headers: {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                    Accept: "image/webp,image/apng,image/*,*/*;q=0.8",
+                  },
+                });
+                lastStatus = res.status;
+                lastType = res.headers.get("content-type") || "image/jpeg";
+                if (res.ok) {
+                  lastBytes = await readBoundedResponseBytes(res, maxProxyImageBytes);
+                  const shouldCache = lastBytes.byteLength <= this.config.thumbnails.maxEntryBytes;
+                  return {
+                    value: { status: 200, contentType: lastType, body: lastBytes },
+                    ttlMs: this.config.thumbnails.cacheTtlSec * 1000,
+                    cache: shouldCache,
+                  };
+                }
+                await res.body?.cancel().catch(() => {});
+                if (res.status !== 404) break;
+              }
+
+              return {
+                value: { status: lastStatus, contentType: lastType, body: new Uint8Array(0) },
+                ttlMs: 60_000,
+                cache: lastStatus === 404,
+              };
+            },
+            SEMAPHORE_WAIT_TIMEOUT_MS,
+            sharedSignal,
+          );
+        },
       );
 
       if (entry.status !== 200) {
@@ -327,9 +463,13 @@ export class MediaProxyRoutes {
       if (reqSignal?.aborted) {
         return new Response(null, { status: 499 });
       }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes("Semaphore")) {
+        return new Response("Upstream image proxy busy", { status: 503 });
+      }
       this.logger.warn("Image IPv4 proxy error", {
         cacheKey,
-        error: err instanceof Error ? err.message : String(err),
+        error: errMsg,
       });
       return new Response(null, { status: 502 });
     }

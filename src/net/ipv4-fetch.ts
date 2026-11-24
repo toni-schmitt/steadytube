@@ -582,13 +582,11 @@ export async function ipv4Fetch(
   const allowedHost = init.allowedHost;
   const maxBodyBytes = init.maxBodyBytes;
 
-  const headers = new Headers(isRequest ? input.headers : undefined);
-  if (init.headers) {
-    const overrides = new Headers(init.headers);
-    overrides.forEach((value, key) => {
-      headers.set(key, value);
-    });
-  }
+  // Per Fetch spec, explicit `init.headers` replaces `input.headers` rather than merging on top
+  // (preventing deleted headers such as stripped `Cookie` from resurfacing via `input.headers`).
+  const headers = new Headers(
+    init.headers !== undefined ? init.headers : isRequest ? input.headers : undefined,
+  );
 
   let bodyBuf: Buffer | null = null;
   if (init.body !== undefined) {
