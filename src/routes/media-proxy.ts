@@ -31,6 +31,38 @@ const MIN_MAX_IMAGE_PROXY_BYTES = 10 * 1024 * 1024; // 10 MiB hard cap for uncac
 const MAX_THUMB_CACHE_BYTES = 64 * 1024 * 1024; // 64 MiB total RAM cap for thumbnail cache
 const MAX_FEED_CACHE_BYTES = 32 * 1024 * 1024; // 32 MiB total RAM cap for RSS feed cache
 
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(
+      signal.reason instanceof Error
+        ? signal.reason
+        : new DOMException("The operation was aborted.", "AbortError"),
+    );
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      reject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new DOMException("The operation was aborted.", "AbortError"),
+      );
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (val) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(val);
+      },
+      (err) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
 export class MediaProxyRoutes {
   private readonly thumbCache: TtlLruCache<string, CachedBinary>;
   private readonly feedCache: TtlLruCache<string, CachedFeed>;
@@ -65,19 +97,28 @@ export class MediaProxyRoutes {
   /**
    * GET /vi/<videoId>/<file>.jpg -> https://i.ytimg.com/vi/<videoId>/<file>.jpg (IPv4 + LRU cache)
    */
-  async handleVideoThumbnail(pathname: string, method: string): Promise<Response> {
+  async handleVideoThumbnail(
+    pathname: string,
+    method: string,
+    reqSignal?: AbortSignal,
+  ): Promise<Response> {
     if (!VALID_VI_PATH.test(pathname)) {
       return Response.json({ error: "Invalid thumbnail path" }, { status: 400 });
     }
 
     const upstreamUrl = `https://i.ytimg.com${pathname}`;
-    return await this.serveCachedImage(`vi:${pathname}`, [upstreamUrl], method);
+    return await this.serveCachedImage(`vi:${pathname}`, [upstreamUrl], method, reqSignal);
   }
 
   /**
    * GET /ggpht/<rest> -> https://yt3.ggpht.com/<rest> (fallback yt3.googleusercontent.com or i.ytimg.com)
    */
-  async handleGgphtProxy(pathname: string, search: string, method: string): Promise<Response> {
+  async handleGgphtProxy(
+    pathname: string,
+    search: string,
+    method: string,
+    reqSignal?: AbortSignal,
+  ): Promise<Response> {
     const rest = pathname.slice("/ggpht".length);
     if (!rest || !rest.startsWith("/") || rest.includes("..") || rest.includes("@")) {
       return Response.json({ error: "Invalid image proxy path" }, { status: 400 });
@@ -91,16 +132,24 @@ export class MediaProxyRoutes {
           `https://yt3.googleusercontent.com${pathWithQuery}`,
         ];
 
-    return await this.serveCachedImage(`ggpht:${pathWithQuery}`, candidates, method);
+    return await this.serveCachedImage(`ggpht:${pathWithQuery}`, candidates, method, reqSignal);
   }
 
   /**
    * GET/HEAD /feed/playlist/:id and /feed/channel/:id
    * Concurrency-safe for 200+ simultaneous FreeTube subscription refreshes.
    */
-  async handleFeed(kind: "playlist" | "channel", id: string, method: string): Promise<Response> {
+  async handleFeed(
+    kind: "playlist" | "channel",
+    id: string,
+    method: string,
+    reqSignal?: AbortSignal,
+  ): Promise<Response> {
     if (!VALID_FEED_ID.test(id)) {
       return Response.json({ error: `Invalid ${kind} feed id` }, { status: 400 });
+    }
+    if (reqSignal?.aborted) {
+      return new Response(null, { status: 499 });
     }
 
     const paramKey = kind === "playlist" ? "playlist_id" : "channel_id";
@@ -108,7 +157,8 @@ export class MediaProxyRoutes {
     const cacheKey = `feed:${kind}:${id}`;
 
     try {
-      const entry = await this.feedCache.getOrCompute(cacheKey, async () => {
+      const entry = await raceWithAbort(
+        this.feedCache.getOrCompute(cacheKey, async () => {
         return await this.feedSemaphore.run(async () => {
           let lastStatus = 502;
           let lastBody = "";
@@ -174,7 +224,9 @@ export class MediaProxyRoutes {
             cache: false,
           };
         });
-      });
+      }),
+        reqSignal,
+      );
 
       return new Response(method === "HEAD" ? null : entry.body, {
         status: entry.status,
@@ -184,6 +236,9 @@ export class MediaProxyRoutes {
         },
       });
     } catch (err) {
+      if (reqSignal?.aborted) {
+        return new Response(null, { status: 499 });
+      }
       this.logger.warn("RSS feed IPv4 proxy error", {
         kind,
         id,
@@ -200,9 +255,14 @@ export class MediaProxyRoutes {
     cacheKey: string,
     candidateUrls: string[],
     method: string,
+    reqSignal?: AbortSignal,
   ): Promise<Response> {
+    if (reqSignal?.aborted) {
+      return new Response(null, { status: 499 });
+    }
     try {
-      const entry = await this.thumbCache.getOrCompute(cacheKey, async () => {
+      const entry = await raceWithAbort(
+        this.thumbCache.getOrCompute(cacheKey, async () => {
         return await this.thumbSemaphore.run(async () => {
           let lastStatus = 404;
           let lastType = "image/jpeg";
@@ -247,7 +307,9 @@ export class MediaProxyRoutes {
             cache: lastStatus === 404,
           };
         });
-      });
+      }),
+        reqSignal,
+      );
 
       if (entry.status !== 200) {
         return new Response(null, { status: entry.status });
@@ -262,6 +324,9 @@ export class MediaProxyRoutes {
         },
       });
     } catch (err) {
+      if (reqSignal?.aborted) {
+        return new Response(null, { status: 499 });
+      }
       this.logger.warn("Image IPv4 proxy error", {
         cacheKey,
         error: err instanceof Error ? err.message : String(err),

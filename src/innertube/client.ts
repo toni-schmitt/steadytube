@@ -1,7 +1,7 @@
 import { Innertube, Log } from "youtubei.js";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
-import { ipv4Fetch } from "../net/ipv4-fetch.ts";
+import { ipv4Fetch, type FetchLike } from "../net/ipv4-fetch.ts";
 
 // Keep daemon logs clean from benign youtubei.js JIT parser notices
 Log.setLevel(Log.Level.ERROR);
@@ -10,23 +10,42 @@ const INNERTUBE_HEADER_TIMEOUT_MS = 15_000;
 const INNERTUBE_TOTAL_TIMEOUT_MS = 20_000;
 const INNERTUBE_MAX_BODY_BYTES = 16 * 1024 * 1024; // 16 MiB cap on anonymous metadata responses
 
-function guardedInnertubeFetch(
-  input: string | URL | Request,
-  init?: RequestInit,
-): Promise<Response> {
-  const timeoutSignal = AbortSignal.timeout(INNERTUBE_TOTAL_TIMEOUT_MS);
-  const combinedSignal = init?.signal
-    ? AbortSignal.any([init.signal, timeoutSignal])
-    : timeoutSignal;
-  return ipv4Fetch(input, {
-    ...init,
-    httpsOnly: true,
-    publicIpv4Only: true,
-    timeoutMs: INNERTUBE_HEADER_TIMEOUT_MS,
-    maxBodyBytes: INNERTUBE_MAX_BODY_BYTES,
-    signal: combinedSignal,
-  });
+export function createGuardedInnertubeFetch(transport: FetchLike = ipv4Fetch) {
+  return function guardedInnertubeFetch(
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> {
+    const isReq = input instanceof Request;
+    const callerSignal = init?.signal ?? (isReq ? input.signal : undefined);
+    const timeoutSignal = AbortSignal.timeout(INNERTUBE_TOTAL_TIMEOUT_MS);
+    const combinedSignal = callerSignal
+      ? AbortSignal.any([callerSignal, timeoutSignal])
+      : timeoutSignal;
+
+    // Strip any Cookie header (including youtubei.js bootstrap synthetic PREF/VISITOR_INFO1_LIVE)
+    // so anonymous browsing stays strictly cookie-free.
+    const headers = new Headers(isReq ? input.headers : undefined);
+    if (init?.headers) {
+      const overrides = new Headers(init.headers);
+      overrides.forEach((value, key) => {
+        headers.set(key, value);
+      });
+    }
+    headers.delete("cookie");
+
+    return transport(input, {
+      ...init,
+      headers,
+      httpsOnly: true,
+      publicIpv4Only: true,
+      timeoutMs: INNERTUBE_HEADER_TIMEOUT_MS,
+      maxBodyBytes: INNERTUBE_MAX_BODY_BYTES,
+      signal: combinedSignal,
+    });
+  };
 }
+
+const guardedInnertubeFetch = createGuardedInnertubeFetch();
 
 /**
  * Anonymous IPv4-only InnerTube singleton.
@@ -55,6 +74,7 @@ export class AnonymousInnertubeProvider {
         const client = await Innertube.create({
           fetch: guardedInnertubeFetch as typeof globalThis.fetch,
           lang: "en",
+          timezone: "UTC",
           retrieve_player: false,
           generate_session_locally: false,
         });

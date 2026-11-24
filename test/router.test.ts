@@ -4,7 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import type { AppConfig } from "../src/config.ts";
 import { noopLogger } from "../src/logger.ts";
-import type { AnonymousInnertubeProvider } from "../src/innertube/client.ts";
+import {
+  createGuardedInnertubeFetch,
+  type AnonymousInnertubeProvider,
+} from "../src/innertube/client.ts";
 import { YtDlpError, type YtDlpRunner, type YtDlpVideoInfo } from "../src/media/ytdlp.ts";
 import { createApp } from "../src/server.ts";
 
@@ -803,6 +806,123 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
       const plJson = (await plRes.json()) as any;
       expect(plJson.videos.length).toBe(1);
       expect(plJson.videos[0].videoId).toBe("p3_valid");
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps warm pagination generations consistent, rejects encoded separators/unknown tabs/huge queries, and strips cookies + preserves Request.signal in InnerTube wrapper", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-r3-misc-"));
+    try {
+      let gen = 0;
+      let releaseRefresh!: () => void;
+      let refreshStarted!: () => void;
+      const refreshStartedPromise = new Promise<void>((r) => { refreshStarted = r; });
+      let getVideosCalls = 0;
+
+      const makeVideoNode = (id: string, title: string) => ({
+        type: "Video",
+        id,
+        title: { text: title },
+        author: { name: "Test Channel", id: "UC1234567890123456789012" },
+        duration: { seconds: 60 },
+        view_count: { text: "1K views" },
+        published: { text: "1 day ago" },
+      });
+
+      const fakeInnertube = {
+        async getClient() {
+          return {
+            async search() {
+              const myGen = ++gen;
+              if (myGen === 2) {
+                refreshStarted();
+                await new Promise<void>((r) => { releaseRefresh = r; });
+              }
+              return {
+                results: [makeVideoNode(`gen${myGen}_p1`, `G${myGen} P1`)],
+                has_continuation: true,
+                async getContinuation() {
+                  return {
+                    results: [makeVideoNode(`gen${myGen}_p2`, `G${myGen} P2`)],
+                    has_continuation: false,
+                  };
+                },
+              };
+            },
+            async getChannel() {
+              return {
+                metadata: { title: "Chan", external_id: "UC1234567890123456789012" },
+                async getVideos() {
+                  getVideosCalls++;
+                  return { videos: [], has_continuation: false };
+                },
+              };
+            },
+          };
+        },
+        reset() {},
+      } as unknown as AnonymousInnertubeProvider;
+
+      const app = createApp(makeTestConfig(tmpDir, false), {
+        logger: noopLogger,
+        innertube: fakeInnertube,
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo() { throw new Error("unused"); },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+      });
+
+      // 1) Warm session gen 1, then start gen 2 refresh (page=1) concurrently with page=2 -> BOTH must see gen 2!
+      const p1Warm = (await (await app.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=music&page=1"))).json()) as any[];
+      expect(p1Warm[0].videoId).toBe("gen1_p1");
+
+      const p1RefreshReq = app.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=music&page=1"));
+      await refreshStartedPromise;
+      const p2OverlapReq = app.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=music&page=2"));
+      releaseRefresh();
+
+      const [p1NewRes, p2NewRes] = await Promise.all([p1RefreshReq, p2OverlapReq]);
+      expect(((await p1NewRes.json()) as any[])[0].videoId).toBe("gen2_p1");
+      expect(((await p2NewRes.json()) as any[])[0].videoId).toBe("gen2_p2");
+
+      // 2) Encoded path separator -> 400; unknown channel tab -> 404 (never falls through to getVideos); oversized query -> 400
+      const sepRes = await app.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/channels/UC1234567890123456789012/videos%2Fextra"),
+      );
+      expect(sepRes.status).toBe(400);
+
+      const badTabRes = await app.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/channels/UC1234567890123456789012/unknown_tab"),
+      );
+      expect(badTabRes.status).toBe(404);
+      expect(getVideosCalls).toBe(0);
+
+      const hugeQRes = await app.fetch(
+        new Request(`http://127.0.0.1:8787/api/v1/search?q=${"a".repeat(501)}`),
+      );
+      expect(hugeQRes.status).toBe(400);
+
+      // 3) createGuardedInnertubeFetch preserves Request.signal AND strips Cookie headers
+      let seenAborted = false;
+      let seenCookie: string | null = "unset";
+      const wrapped = createGuardedInnertubeFetch(async (_input, init) => {
+        seenAborted = Boolean(init?.signal?.aborted);
+        seenCookie = new Headers(init?.headers).get("cookie");
+        return new Response("ok", { status: 200 });
+      });
+      const abortedCtrl = new AbortController();
+      abortedCtrl.abort(new DOMException("Pre-aborted", "AbortError"));
+      const reqWithSignalAndCookie = new Request("https://www.youtube.com/sw.js_data", {
+        headers: { Cookie: "PREF=tz=Europe.Berlin;VISITOR_INFO1_LIVE=abc123" },
+        signal: abortedCtrl.signal,
+      });
+      await wrapped(reqWithSignalAndCookie);
+      expect(seenAborted).toBe(true);
+      expect(seenCookie).toBeNull();
 
       app.stop();
     } finally {

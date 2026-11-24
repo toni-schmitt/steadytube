@@ -629,7 +629,10 @@ export async function ipv4Fetch(
         headers.delete("authorization");
         headers.delete("cookie");
       }
-      if (result.status === 303 || ((result.status === 301 || result.status === 302) && method === "POST")) {
+      if (
+        (result.status === 303 && method !== "HEAD") ||
+        ((result.status === 301 || result.status === 302) && method === "POST")
+      ) {
         method = "GET";
         bodyBuf = null;
         headers.delete("content-length");

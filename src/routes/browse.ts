@@ -16,8 +16,23 @@ import {
 } from "../innertube/mappers.ts";
 
 const MAX_SEARCH_PAGES = 25;
+const MAX_SEARCH_QUERY_LEN = 500;
 const MAX_PLAYLIST_OFFSET = 5000;
 const MAX_CONSECUTIVE_EMPTY_PLAYLIST_PAGES = 3;
+const SUPPORTED_CHANNEL_TABS = new Set([
+  "videos",
+  "latest",
+  "streams",
+  "live",
+  "shorts",
+  "playlists",
+  "releases",
+  "podcasts",
+  "courses",
+  "community",
+  "posts",
+  "search",
+]);
 
 interface CachedSearchSession {
   pages: Array<Array<Record<string, unknown>>>;
@@ -102,12 +117,14 @@ export class BrowseRoutes {
     forceRefresh: boolean,
     initFn: () => Promise<CachedSearchSession>,
   ): Promise<CachedSearchSession> {
+    // Always join an active refresh first so overlapping page 1 + page 2 requests stay
+    // on the same result generation rather than mixing stale and fresh sessions.
+    const inflight = this.searchInitInflight.get(sessionKey);
+    if (inflight) return inflight;
     if (!forceRefresh) {
       const existing = this.searchSessions.get(sessionKey);
       if (existing) return existing;
     }
-    const inflight = this.searchInitInflight.get(sessionKey);
-    if (inflight) return inflight;
 
     const promise = initFn()
       .then((session) => {
@@ -128,12 +145,12 @@ export class BrowseRoutes {
     forceRefresh: boolean,
     initFn: () => Promise<CachedPlaylistSession>,
   ): Promise<CachedPlaylistSession> {
+    const inflight = this.playlistInitInflight.get(playlistId);
+    if (inflight) return inflight;
     if (!forceRefresh) {
       const existing = this.playlistSessions.get(playlistId);
       if (existing) return existing;
     }
-    const inflight = this.playlistInitInflight.get(playlistId);
-    if (inflight) return inflight;
 
     const promise = initFn()
       .then((session) => {
@@ -156,6 +173,9 @@ export class BrowseRoutes {
     const q = (url.searchParams.get("q") || "").trim();
     if (!q) {
       return Response.json([]);
+    }
+    if (q.length > MAX_SEARCH_QUERY_LEN) {
+      return Response.json({ error: "Search query too long" }, { status: 400 });
     }
     const page = Math.max(1, Math.floor(Number(url.searchParams.get("page") || 1) || 1));
     if (page > MAX_SEARCH_PAGES) {
@@ -401,6 +421,9 @@ export class BrowseRoutes {
       if (tab === "search") {
         const q = (url.searchParams.get("q") || "").trim();
         if (!q) return Response.json([]);
+        if (q.length > MAX_SEARCH_QUERY_LEN) {
+          return Response.json({ error: "Search query too long" }, { status: 400 });
+        }
         const page = Math.max(1, Math.floor(Number(url.searchParams.get("page") || 1) || 1));
         if (page > MAX_SEARCH_PAGES) {
           return Response.json([]);
@@ -448,6 +471,10 @@ export class BrowseRoutes {
         return Response.json(session.pages[page - 1] || []);
       }
 
+      if (!SUPPORTED_CHANNEL_TABS.has(tab)) {
+        return Response.json({ error: `Unsupported channel tab: ${tab}` }, { status: 404 });
+      }
+
       const isPlaylistTab =
         tab === "playlists" || tab === "releases" || tab === "podcasts" || tab === "courses";
 
@@ -464,10 +491,8 @@ export class BrowseRoutes {
         feed = await channel.getReleases();
       } else if (tab === "podcasts") {
         feed = await channel.getPodcasts();
-      } else if (tab === "courses") {
-        feed = await channel.getCourses();
       } else {
-        feed = await channel.getVideos();
+        feed = await channel.getCourses();
       }
 
       // Apply sort filter if requested (newest / popular / oldest)

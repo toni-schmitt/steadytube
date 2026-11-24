@@ -128,7 +128,12 @@ export function createRequestHandler(deps: RouterDeps) {
 
 function safeDecodeParam(raw: string): string | null {
   try {
-    return decodeURIComponent(raw);
+    const decoded = decodeURIComponent(raw);
+    // Reject decoded path separators and ASCII control characters
+    if (/[/\\\x00-\x1f\x7f]/.test(decoded)) {
+      return null;
+    }
+    return decoded;
   } catch {
     return null;
   }
@@ -158,12 +163,12 @@ async function dispatch(
 
   // Thumbnails (/vi/<videoId>/<file>.jpg)
   if (pathname.startsWith("/vi/")) {
-    return await deps.mediaProxy.handleVideoThumbnail(pathname, method);
+    return await deps.mediaProxy.handleVideoThumbnail(pathname, method, req.signal);
   }
 
   // Avatars / banners / storyboards (/ggpht/*)
   if (pathname.startsWith("/ggpht/")) {
-    return await deps.mediaProxy.handleGgphtProxy(pathname, url.search, method);
+    return await deps.mediaProxy.handleGgphtProxy(pathname, url.search, method, req.signal);
   }
 
   // RSS subscription feeds
@@ -171,14 +176,14 @@ async function dispatch(
   if (feedPlaylistMatch) {
     const id = safeDecodeParam(feedPlaylistMatch[1]!);
     if (id === null) return Response.json({ error: "Malformed path parameter" }, { status: 400 });
-    return await deps.mediaProxy.handleFeed("playlist", id, method);
+    return await deps.mediaProxy.handleFeed("playlist", id, method, req.signal);
   }
 
   const feedChannelMatch = /^\/feed\/channel\/([^/]+)$/.exec(pathname);
   if (feedChannelMatch) {
     const id = safeDecodeParam(feedChannelMatch[1]!);
     if (id === null) return Response.json({ error: "Malformed path parameter" }, { status: 400 });
-    return await deps.mediaProxy.handleFeed("channel", id, method);
+    return await deps.mediaProxy.handleFeed("channel", id, method, req.signal);
   }
 
   // Video playback & manifests

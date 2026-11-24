@@ -32,6 +32,12 @@ describe("ipv4-fetch", () => {
             headers: { Location: "/echo-host" },
           });
         }
+        if (url.pathname === "/redirect-303") {
+          return new Response(null, {
+            status: 303,
+            headers: { Location: "/range" },
+          });
+        }
         if (url.pathname === "/gzip") {
           const gz = zlib.gzipSync(Buffer.from("hello-ipv4-gzip"));
           return new Response(gz, {
@@ -104,6 +110,12 @@ describe("ipv4-fetch", () => {
     const data = (await res.json()) as { host: string; method: string };
     expect(data.host).toBe(`127.0.0.1:${server.port}`);
     expect(data.method).toBe("GET");
+
+    // RFC 9110 §15.4.4: 303 See Other must preserve HEAD (never turn HEAD into GET)
+    const head303 = await ipv4Fetch(`${baseUrl}/redirect-303`, { method: "HEAD" });
+    expect(head303.status).toBe(200);
+    expect(head303.headers.get("content-length")).toBe("20");
+    expect(await head303.text()).toBe("");
   });
 
   test("automatically decompresses gzip in ipv4Fetch and keeps raw in ipv4FetchRaw", async () => {
