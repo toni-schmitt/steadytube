@@ -169,6 +169,10 @@ describe("Invidious mappers for FreeTube 0.26.0 schema", () => {
     expect(descriptionToHtml("Check <script> & https://example.com\nLine 2")).toBe(
       'Check &lt;script&gt; &amp; <a href="https://example.com" target="_blank" rel="noopener noreferrer">https://example.com</a><br>Line 2',
     );
+    // Adjacent escaped quotes/brackets must NOT be swallowed into href, while &amp; query params stay intact
+    expect(descriptionToHtml('See "https://example.com/p?a=1&b=2" and <https://example.org>')).toBe(
+      'See &quot;<a href="https://example.com/p?a=1&amp;b=2" target="_blank" rel="noopener noreferrer">https://example.com/p?a=1&amp;b=2</a>&quot; and &lt;<a href="https://example.org" target="_blank" rel="noopener noreferrer">https://example.org</a>&gt;',
+    );
   });
 
   test("maps channel-page 1-row LockupView and watch-next 2-row LockupView accurately", () => {

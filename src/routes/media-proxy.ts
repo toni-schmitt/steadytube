@@ -347,6 +347,7 @@ export class MediaProxyRoutes {
         status: entry.status,
         headers: {
           "Content-Type": entry.contentType,
+          "Content-Length": String(Buffer.byteLength(entry.body, "utf8")),
           "Cache-Control": entry.status === 200 ? `public, max-age=${this.config.rss.cacheTtlSec}` : "no-store",
         },
       });

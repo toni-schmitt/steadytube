@@ -1199,6 +1199,145 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
       expect(capExact.status).toBe(200);
       expect(await capExact.text()).toContain("Bonjour");
       appCap.stop();
+
+      // Round 5 #21, #23, GLM Minor 3, Mistral Minor 1 & Nit 6b:
+      // InnerTube host allowlist, search suggestion query cap, comment videoId token binding,
+      // RSS Content-Length, and search generation hop error recovery + full fill on final hop!
+      let capturedInnertubeAllowedHost: ((h: string) => boolean) | undefined;
+      const guardedFetch = createGuardedInnertubeFetch(async (_input, init) => {
+        capturedInnertubeAllowedHost = init?.allowedHost;
+        return new Response("{}", { status: 200 });
+      });
+      await guardedFetch("https://www.youtube.com/youtubei/v1/browse");
+      expect(typeof capturedInnertubeAllowedHost).toBe("function");
+      expect(capturedInnertubeAllowedHost!("www.youtube.com")).toBe(true);
+      expect(capturedInnertubeAllowedHost!("youtubei.googleapis.com")).toBe(true);
+      expect(capturedInnertubeAllowedHost!("suggestqueries-clients6.google.com")).toBe(true);
+      expect(capturedInnertubeAllowedHost!("evil.example.com")).toBe(false);
+
+      let sGen = 0;
+      let errGen1ContStarted!: () => void;
+      const errGen1ContStartedP = new Promise<void>((r) => { errGen1ContStarted = r; });
+      let rejectGen1Cont!: (err: Error) => void;
+      const appR5Browse = createApp(makeTestConfig(path.join(tmpDir, "r5-browse"), false), {
+        logger: noopLogger,
+        fetchFn: async () => new Response("<feed>héllo</feed>", { status: 200, headers: { "Content-Type": "application/atom+xml" } }),
+        innertube: {
+          async getClient() {
+            return {
+              async getComments(vid: string) {
+                return {
+                  header: { count: "2" },
+                  contents: [
+                    {
+                      comment: {
+                        comment_id: `c_${vid}_1`,
+                        author: { name: "User", id: "UC1111111111111111111111", thumbnails: [] },
+                        content: { text: `Comment on ${vid}` },
+                        published_time: "1 day ago",
+                        like_count: "1",
+                      },
+                      has_replies: false,
+                    },
+                  ],
+                  has_continuation: true,
+                  async getContinuation() {
+                    return {
+                      header: { count: "2" },
+                      contents: [
+                        {
+                          comment: {
+                            comment_id: `c_${vid}_2`,
+                            author: { name: "User", id: "UC1111111111111111111111", thumbnails: [] },
+                            content: { text: `Page 2 on ${vid}` },
+                            published_time: "1 day ago",
+                            like_count: "2",
+                          },
+                          has_replies: false,
+                        },
+                      ],
+                      has_continuation: false,
+                    };
+                  },
+                };
+              },
+              async search() {
+                const g = ++sGen;
+                return {
+                  results: [makeVid(`gen${g}_page1`, `G${g} P1`)],
+                  has_continuation: true,
+                  async getContinuation() {
+                    if (g === 1) {
+                      errGen1ContStarted();
+                      await new Promise<void>((_, reject) => { rejectGen1Cont = reject; });
+                    }
+                    return {
+                      results: [makeVid(`gen${g}_page2`, `G${g} P2`)],
+                      has_continuation: false,
+                    };
+                  },
+                };
+              },
+            };
+          },
+          reset() {},
+        } as unknown as AnonymousInnertubeProvider,
+      });
+
+      // GLM Minor 3: Oversized search suggestion query returns 400
+      const hugeSugg = await appR5Browse.fetch(
+        new Request(`http://127.0.0.1:8787/api/v1/search/suggestions?q=${"a".repeat(501)}`),
+      );
+      expect(hugeSugg.status).toBe(400);
+
+      // Mistral Nit 6b: RSS feed returns exact UTF-8 byte Content-Length for both GET and HEAD
+      const feedGet = await appR5Browse.fetch(
+        new Request("http://127.0.0.1:8787/feed/channel/UC1234567890123456789012"),
+      );
+      expect(feedGet.status).toBe(200);
+      expect(feedGet.headers.get("content-length")).toBe(String(Buffer.byteLength("<feed>héllo</feed>", "utf8")));
+      const feedHead = await appR5Browse.fetch(
+        new Request("http://127.0.0.1:8787/feed/channel/UC1234567890123456789012", { method: "HEAD" }),
+      );
+      expect(feedHead.status).toBe(200);
+      expect(feedHead.headers.get("content-length")).toBe(String(Buffer.byteLength("<feed>héllo</feed>", "utf8")));
+
+      // Mistral Minor 1: Comment continuation token is strictly bound to videoId
+      const cPage1 = (await (
+        await appR5Browse.fetch(new Request("http://127.0.0.1:8787/api/v1/comments/dQw4w9WgXcQ"))
+      ).json()) as any;
+      expect(cPage1.videoId).toBe("dQw4w9WgXcQ");
+      expect(typeof cPage1.continuation).toBe("string");
+      const crossVidComments = (await (
+        await appR5Browse.fetch(
+          new Request(
+            `http://127.0.0.1:8787/api/v1/comments/abc123XYZ99?continuation=${encodeURIComponent(cPage1.continuation)}`,
+          ),
+        )
+      ).json()) as any;
+      expect(crossVidComments.comments).toEqual([]);
+      const sameVidComments = (await (
+        await appR5Browse.fetch(
+          new Request(
+            `http://127.0.0.1:8787/api/v1/comments/dQw4w9WgXcQ?continuation=${encodeURIComponent(cPage1.continuation)}`,
+          ),
+        )
+      ).json()) as any;
+      expect(sameVidComments.comments[0].commentId).toBe("c_dQw4w9WgXcQ_2");
+
+      // #23: When an old generation's continuation rejects AFTER a newer generation was installed,
+      // page=2 switches to the new generation and returns gen2_page2 instead of failing with 500!
+      await appR5Browse.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=errhop&page=1"));
+      const p2ErrHop = appR5Browse.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=errhop&page=2"));
+      await errGen1ContStartedP;
+      await appR5Browse.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=errhop&page=1"));
+      rejectGen1Cont(new Error("expired gen1 token"));
+      const p2ErrHopRes = await p2ErrHop;
+      expect(p2ErrHopRes.status).toBe(200);
+      const p2ErrHopJson = (await p2ErrHopRes.json()) as any[];
+      expect(p2ErrHopJson[0].videoId).toBe("gen2_page2");
+
+      appR5Browse.stop();
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

@@ -91,6 +91,9 @@ describe("ipv4-fetch", () => {
             headers: { "Content-Length": "20", "Accept-Ranges": "bytes" },
           });
         }
+        if (url.pathname === "/reset-205") {
+          return new Response(null, { status: 205 });
+        }
         return new Response("not found", { status: 404 });
       },
     });
@@ -227,5 +230,10 @@ describe("ipv4-fetch", () => {
     expect(echoed.cookie).toBeNull();
     expect(echoed.xOld).toBeNull();
     expect(echoed.xNew).toBe("clean");
+
+    // 6) Null-body status 205 Reset Content does not throw in Response construction
+    const res205 = await ipv4Fetch(`${baseUrl}/reset-205`);
+    expect(res205.status).toBe(205);
+    expect(await res205.text()).toBe("");
   });
 });

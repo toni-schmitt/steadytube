@@ -9,6 +9,8 @@ Log.setLevel(Log.Level.ERROR);
 const INNERTUBE_HEADER_TIMEOUT_MS = 15_000;
 const INNERTUBE_TOTAL_TIMEOUT_MS = 20_000;
 const INNERTUBE_MAX_BODY_BYTES = 16 * 1024 * 1024; // 16 MiB cap on anonymous metadata responses
+const ALLOWED_INNERTUBE_HOST =
+  /^(?:(?:[a-z0-9-]+\.)?youtube\.com|youtubei\.googleapis\.com|suggestqueries(?:-clients6)?\.google\.com)$/i;
 
 function scrubInnertubeTimezoneBody(raw: string): string | null {
   if (!raw.includes("utcOffsetMinutes") && !raw.includes("timeZone")) {
@@ -88,6 +90,7 @@ export function createGuardedInnertubeFetch(transport: FetchLike = ipv4Fetch) {
       headers,
       httpsOnly: true,
       publicIpv4Only: true,
+      allowedHost: (h) => ALLOWED_INNERTUBE_HOST.test(h),
       timeoutMs: INNERTUBE_HEADER_TIMEOUT_MS,
       maxBodyBytes: INNERTUBE_MAX_BODY_BYTES,
       signal: combinedSignal,

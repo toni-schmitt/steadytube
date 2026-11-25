@@ -105,9 +105,9 @@ export function escapeHtml(input: string): string {
 export function descriptionToHtml(text: string): string {
   if (!text) return "";
   const escaped = escapeHtml(text);
-  // Linkify URLs
+  // Linkify URLs without swallowing trailing HTML entities (&lt;, &gt;, &quot;, &#39;)
   const withUrls = escaped.replace(
-    /\bhttps?:\/\/[^\s<>"']+/g,
+    /\bhttps?:\/\/(?:[^\s<>&"']|&(?!lt;|gt;|quot;|#39;))+/g,
     (url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`,
   );
   return withUrls.replace(/\r?\n/g, "<br>");

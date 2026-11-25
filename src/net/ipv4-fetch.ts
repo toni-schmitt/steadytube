@@ -372,7 +372,7 @@ async function doSingleIpv4Request(
 
       const location = resHeaders.get("location");
 
-      if (method === "HEAD" || status === 204 || status === 304) {
+      if (method === "HEAD" || status === 101 || status === 204 || status === 205 || status === 304) {
         res.resume();
         options.signal?.removeEventListener("abort", onAbort);
         settled = true;

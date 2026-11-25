@@ -74,6 +74,7 @@ interface ChannelTabContinuation {
 
 interface CommentContinuation {
   kind: "comments" | "replies" | "replies_page";
+  videoId: string;
   source: any;
 }
 
@@ -198,23 +199,46 @@ export class BrowseRoutes {
         return { pages: [mapped], lastResult: res };
       });
 
-      for (let hops = 0; hops < 3; hops++) {
+      const MAX_GEN_HOPS = 3;
+      for (let hops = 0; ; ) {
         let switchedGeneration = false;
         while (session.pages.length < page) {
           const activeRefresh = this.searchInitInflight.get(sessionKey);
-          if (activeRefresh) {
+          if (activeRefresh && hops < MAX_GEN_HOPS) {
             session = await activeRefresh;
+            hops++;
             switchedGeneration = true;
             break;
           }
           const currentCached = this.searchSessions.get(sessionKey);
-          if (currentCached && currentCached !== session) {
+          if (currentCached && currentCached !== session && hops < MAX_GEN_HOPS) {
             session = currentCached;
+            hops++;
             switchedGeneration = true;
             break;
           }
           if (session.inflightContinuation) {
-            await session.inflightContinuation;
+            try {
+              await session.inflightContinuation;
+            } catch (contErr) {
+              if (hops < MAX_GEN_HOPS) {
+                const newerRefresh = this.searchInitInflight.get(sessionKey);
+                if (newerRefresh) {
+                  session = await newerRefresh;
+                  hops++;
+                  switchedGeneration = true;
+                  break;
+                }
+                const newerCached = this.searchSessions.get(sessionKey);
+                if (newerCached && newerCached !== session) {
+                  session = newerCached;
+                  hops++;
+                  switchedGeneration = true;
+                  break;
+                }
+              }
+              throw contErr;
+            }
             continue;
           }
           if (!session.lastResult?.has_continuation) {
@@ -232,6 +256,24 @@ export class BrowseRoutes {
           activeSession.inflightContinuation = step;
           try {
             await step;
+          } catch (contErr) {
+            if (hops < MAX_GEN_HOPS) {
+              const newerRefresh = this.searchInitInflight.get(sessionKey);
+              if (newerRefresh) {
+                session = await newerRefresh;
+                hops++;
+                switchedGeneration = true;
+                break;
+              }
+              const newerCached = this.searchSessions.get(sessionKey);
+              if (newerCached && newerCached !== session) {
+                session = newerCached;
+                hops++;
+                switchedGeneration = true;
+                break;
+              }
+            }
+            throw contErr;
           } finally {
             if (activeSession.inflightContinuation === step) {
               activeSession.inflightContinuation = undefined;
@@ -239,16 +281,21 @@ export class BrowseRoutes {
           }
         }
         if (switchedGeneration) continue;
-        // Re-check after completing continuations in case page=1 started/installed a newer generation
-        const trailingRefresh = this.searchInitInflight.get(sessionKey);
-        if (trailingRefresh) {
-          session = await trailingRefresh;
-          continue;
-        }
-        const latestCached = this.searchSessions.get(sessionKey);
-        if (latestCached && latestCached !== session) {
-          session = latestCached;
-          continue;
+        // Re-check after completing continuations in case page=1 started/installed a newer generation;
+        // only hop while hops < MAX_GEN_HOPS so every switched generation is filled before returning.
+        if (hops < MAX_GEN_HOPS) {
+          const trailingRefresh = this.searchInitInflight.get(sessionKey);
+          if (trailingRefresh) {
+            session = await trailingRefresh;
+            hops++;
+            continue;
+          }
+          const latestCached = this.searchSessions.get(sessionKey);
+          if (latestCached && latestCached !== session) {
+            session = latestCached;
+            hops++;
+            continue;
+          }
         }
         break;
       }
@@ -274,6 +321,9 @@ export class BrowseRoutes {
     const q = (url.searchParams.get("q") || "").trim();
     if (!q) {
       return Response.json({ query: "", suggestions: [] });
+    }
+    if (q.length > MAX_SEARCH_QUERY_LEN) {
+      return Response.json({ error: "Search query too long" }, { status: 400 });
     }
     try {
       const client = await this.innertube.getClient();
@@ -483,23 +533,46 @@ export class BrowseRoutes {
           return { pages: [items], lastResult: searchFeed };
         });
 
-        for (let hops = 0; hops < 3; hops++) {
+        const MAX_GEN_HOPS = 3;
+        for (let hops = 0; ; ) {
           let switchedGeneration = false;
           while (session.pages.length < page) {
             const activeRefresh = this.searchInitInflight.get(sessionKey);
-            if (activeRefresh) {
+            if (activeRefresh && hops < MAX_GEN_HOPS) {
               session = await activeRefresh;
+              hops++;
               switchedGeneration = true;
               break;
             }
             const currentCached = this.searchSessions.get(sessionKey);
-            if (currentCached && currentCached !== session) {
+            if (currentCached && currentCached !== session && hops < MAX_GEN_HOPS) {
               session = currentCached;
+              hops++;
               switchedGeneration = true;
               break;
             }
             if (session.inflightContinuation) {
-              await session.inflightContinuation;
+              try {
+                await session.inflightContinuation;
+              } catch (contErr) {
+                if (hops < MAX_GEN_HOPS) {
+                  const newerRefresh = this.searchInitInflight.get(sessionKey);
+                  if (newerRefresh) {
+                    session = await newerRefresh;
+                    hops++;
+                    switchedGeneration = true;
+                    break;
+                  }
+                  const newerCached = this.searchSessions.get(sessionKey);
+                  if (newerCached && newerCached !== session) {
+                    session = newerCached;
+                    hops++;
+                    switchedGeneration = true;
+                    break;
+                  }
+                }
+                throw contErr;
+              }
               continue;
             }
             if (!session.lastResult?.has_continuation) {
@@ -519,6 +592,24 @@ export class BrowseRoutes {
             activeSession.inflightContinuation = step;
             try {
               await step;
+            } catch (contErr) {
+              if (hops < MAX_GEN_HOPS) {
+                const newerRefresh = this.searchInitInflight.get(sessionKey);
+                if (newerRefresh) {
+                  session = await newerRefresh;
+                  hops++;
+                  switchedGeneration = true;
+                  break;
+                }
+                const newerCached = this.searchSessions.get(sessionKey);
+                if (newerCached && newerCached !== session) {
+                  session = newerCached;
+                  hops++;
+                  switchedGeneration = true;
+                  break;
+                }
+              }
+              throw contErr;
             } finally {
               if (activeSession.inflightContinuation === step) {
                 activeSession.inflightContinuation = undefined;
@@ -526,15 +617,19 @@ export class BrowseRoutes {
             }
           }
           if (switchedGeneration) continue;
-          const trailingRefresh = this.searchInitInflight.get(sessionKey);
-          if (trailingRefresh) {
-            session = await trailingRefresh;
-            continue;
-          }
-          const latestCached = this.searchSessions.get(sessionKey);
-          if (latestCached && latestCached !== session) {
-            session = latestCached;
-            continue;
+          if (hops < MAX_GEN_HOPS) {
+            const trailingRefresh = this.searchInitInflight.get(sessionKey);
+            if (trailingRefresh) {
+              session = await trailingRefresh;
+              hops++;
+              continue;
+            }
+            const latestCached = this.searchSessions.get(sessionKey);
+            if (latestCached && latestCached !== session) {
+              session = latestCached;
+              hops++;
+              continue;
+            }
           }
           break;
         }
@@ -621,10 +716,10 @@ export class BrowseRoutes {
     const sortBy = (url.searchParams.get("sort_by") || "top").toLowerCase();
 
     try {
-      // Handle pagination or reply thread expansion
+      // Handle pagination or reply thread expansion (strictly bound to videoId)
       if (continuationToken) {
         const state = this.commentContinuations.get(continuationToken);
-        if (!state) {
+        if (!state || state.videoId !== videoId) {
           return Response.json({ comments: [], continuation: null });
         }
 
@@ -638,19 +733,19 @@ export class BrowseRoutes {
             .map((r: unknown) => mapCommentThreadToInvidious(r as Record<string, any>, origin))
             .filter((x): x is NonNullable<typeof x> => x !== null);
           const nextToken = repliesObj?.has_continuation
-            ? this.commentContinuations.put({ kind: "replies_page", source: repliesObj })
+            ? this.commentContinuations.put({ kind: "replies_page", videoId, source: repliesObj })
             : null;
           return Response.json({ comments, continuation: nextToken });
         }
 
         const nextPage: any = await state.source.getContinuation();
-        return Response.json(this.serializeCommentsPage(nextPage, origin));
+        return Response.json(this.serializeCommentsPage(nextPage, origin, videoId));
       }
 
       const client = await this.innertube.getClient();
       const sortMode = sortBy === "new" ? "NEWEST_FIRST" : "TOP_COMMENTS";
       const page: any = await client.getComments(videoId, sortMode);
-      return Response.json(this.serializeCommentsPage(page, origin));
+      return Response.json(this.serializeCommentsPage(page, origin, videoId));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.logger.warn("Comments fetch failed", { videoId, error: msg });
@@ -713,7 +808,8 @@ export class BrowseRoutes {
 
       // Fetch continuations if caller asked past currently buffered items (serialized per session)
       const targetLen = Math.min(startOffset + pageSize, MAX_PLAYLIST_OFFSET + pageSize);
-      for (let hops = 0; hops < 3; hops++) {
+      const MAX_GEN_HOPS = 3;
+      for (let hops = 0; ; ) {
         let switchedGeneration = false;
         while (
           session.videos.length < targetLen &&
@@ -721,19 +817,41 @@ export class BrowseRoutes {
           (session.inflightContinuation || session.lastFeed?.has_continuation)
         ) {
           const activeRefresh = this.playlistInitInflight.get(playlistId);
-          if (activeRefresh) {
+          if (activeRefresh && hops < MAX_GEN_HOPS) {
             session = await activeRefresh;
+            hops++;
             switchedGeneration = true;
             break;
           }
           const currentCached = this.playlistSessions.get(playlistId);
-          if (currentCached && currentCached !== session) {
+          if (currentCached && currentCached !== session && hops < MAX_GEN_HOPS) {
             session = currentCached;
+            hops++;
             switchedGeneration = true;
             break;
           }
           if (session.inflightContinuation) {
-            await session.inflightContinuation;
+            try {
+              await session.inflightContinuation;
+            } catch (contErr) {
+              if (hops < MAX_GEN_HOPS) {
+                const newerRefresh = this.playlistInitInflight.get(playlistId);
+                if (newerRefresh) {
+                  session = await newerRefresh;
+                  hops++;
+                  switchedGeneration = true;
+                  break;
+                }
+                const newerCached = this.playlistSessions.get(playlistId);
+                if (newerCached && newerCached !== session) {
+                  session = newerCached;
+                  hops++;
+                  switchedGeneration = true;
+                  break;
+                }
+              }
+              throw contErr;
+            }
             continue;
           }
           const activeSession = session;
@@ -762,6 +880,24 @@ export class BrowseRoutes {
           activeSession.inflightContinuation = step;
           try {
             await step;
+          } catch (contErr) {
+            if (hops < MAX_GEN_HOPS) {
+              const newerRefresh = this.playlistInitInflight.get(playlistId);
+              if (newerRefresh) {
+                session = await newerRefresh;
+                hops++;
+                switchedGeneration = true;
+                break;
+              }
+              const newerCached = this.playlistSessions.get(playlistId);
+              if (newerCached && newerCached !== session) {
+                session = newerCached;
+                hops++;
+                switchedGeneration = true;
+                break;
+              }
+            }
+            throw contErr;
           } finally {
             if (activeSession.inflightContinuation === step) {
               activeSession.inflightContinuation = undefined;
@@ -769,15 +905,19 @@ export class BrowseRoutes {
           }
         }
         if (switchedGeneration) continue;
-        const trailingRefresh = this.playlistInitInflight.get(playlistId);
-        if (trailingRefresh) {
-          session = await trailingRefresh;
-          continue;
-        }
-        const latestCached = this.playlistSessions.get(playlistId);
-        if (latestCached && latestCached !== session) {
-          session = latestCached;
-          continue;
+        if (hops < MAX_GEN_HOPS) {
+          const trailingRefresh = this.playlistInitInflight.get(playlistId);
+          if (trailingRefresh) {
+            session = await trailingRefresh;
+            hops++;
+            continue;
+          }
+          const latestCached = this.playlistSessions.get(playlistId);
+          if (latestCached && latestCached !== session) {
+            session = latestCached;
+            hops++;
+            continue;
+          }
         }
         break;
       }
@@ -795,7 +935,7 @@ export class BrowseRoutes {
     }
   }
 
-  private serializeCommentsPage(page: any, origin: string) {
+  private serializeCommentsPage(page: any, origin: string, videoId: string) {
     const threads: any[] = page?.contents || [];
     const comments = [];
 
@@ -804,6 +944,7 @@ export class BrowseRoutes {
       if (thread?.has_replies) {
         replyToken = this.commentContinuations.put({
           kind: "replies",
+          videoId,
           source: thread,
         });
       }
@@ -812,12 +953,12 @@ export class BrowseRoutes {
     }
 
     const nextToken = page?.has_continuation
-      ? this.commentContinuations.put({ kind: "comments", source: page })
+      ? this.commentContinuations.put({ kind: "comments", videoId, source: page })
       : null;
 
     return {
       commentCount: parseCompactNumber(page?.header?.count),
-      videoId: "",
+      videoId,
       comments,
       continuation: nextToken,
     };
