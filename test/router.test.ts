@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -244,6 +244,95 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
 
       app.stop();
     } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("RSS refresh prefetches the feeds the previous refresh of the same family asked for", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-rss-prefetch-"));
+    const t0 = Date.now();
+    try {
+      const upstream: string[] = [];
+      const mockFetch = async (input: string | URL | Request) => {
+        upstream.push(new URL(input.toString()).searchParams.get("playlist_id")!);
+        await new Promise((r) => setTimeout(r, 15));
+        return new Response("<feed/>", { status: 200 });
+      };
+      const app = createApp(makeTestConfig(tmpDir), {
+        logger: noopLogger,
+        fetchFn: mockFetch,
+        fetchRawFn: mockFetch,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo() { throw new Error("unused"); },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+      });
+      const get = (id: string) => app.fetch(new Request(`http://127.0.0.1:8787/feed/playlist/${id}`));
+      const ids = ["UULFaaaaaaaaaa", "UULFbbbbbbbbbb", "UULFcccccccccc"];
+
+      setSystemTime(new Date(t0));
+      for (const id of ids) await get(id);
+      expect(upstream).toEqual(ids);
+
+      // Next refresh after the 5 min cache expired: the first request fetches the rest too.
+      setSystemTime(new Date(t0 + 10 * 60_000));
+      expect((await get(ids[0]!)).status).toBe(200);
+      expect(upstream.slice(3).sort()).toEqual(ids);
+      for (const id of ids.slice(1)) expect((await get(id)).status).toBe(200);
+      expect(upstream.length).toBe(6);
+
+      // Shorts feeds are their own family: they don't drag in the videos feeds.
+      await get("UUSHaaaaaaaaaa");
+      expect(upstream.slice(6)).toEqual(["UUSHaaaaaaaaaa"]);
+
+      app.stop();
+    } finally {
+      setSystemTime();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("RSS refresh prefetch of more feeds than the semaphore queue holds leaves room for FreeTube's requests", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-rss-prefetch-bound-"));
+    const t0 = Date.now();
+    try {
+      let upstreamCalls = 0;
+      const mockFetch = async () => {
+        upstreamCalls++;
+        await new Promise((r) => setTimeout(r, 1));
+        return new Response("<feed/>", { status: 200 });
+      };
+      const app = createApp(makeTestConfig(tmpDir), {
+        logger: noopLogger,
+        fetchFn: mockFetch,
+        fetchRawFn: mockFetch,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo() { throw new Error("unused"); },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+      });
+      const get = (id: string) => app.fetch(new Request(`http://127.0.0.1:8787/feed/playlist/${id}`));
+      // More than the feed semaphore's 256-entry queue.
+      const ids = Array.from({ length: 300 }, (_, i) => `UULF${String(i).padStart(10, "0")}`);
+
+      setSystemTime(new Date(t0));
+      for (const id of ids) await get(id);
+
+      setSystemTime(new Date(t0 + 10 * 60_000));
+      const first = get(ids[0]!);
+      expect((await get("UULFnotprefetched")).status).toBe(200);
+      expect((await first).status).toBe(200);
+      for (const id of ids) expect((await get(id)).status).toBe(200);
+      // Each remembered feed fetched once per refresh, plus the new one.
+      expect(upstreamCalls).toBe(2 * ids.length + 1);
+
+      app.stop();
+    } finally {
+      setSystemTime();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

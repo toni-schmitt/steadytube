@@ -84,6 +84,14 @@ function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined):
   });
 }
 
+// Requests within one refresh arrive ~70 ms apart; a feed family idle this long starts a new refresh.
+const FEED_REFRESH_GAP_MS = 60_000;
+// Feeds no refresh has asked for in this long (e.g. unsubscribed channels) stop being prefetched.
+const FEED_REMEMBER_MS = 30 * 24 * 60 * 60 * 1000;
+const FEED_REMEMBER_MAX = 2000;
+
+type FeedKind = "playlist" | "channel";
+
 export class MediaProxyRoutes {
   private readonly thumbCache: TtlLruCache<string, CachedBinary>;
   private readonly feedCache: TtlLruCache<string, CachedFeed>;
@@ -91,6 +99,10 @@ export class MediaProxyRoutes {
   private readonly thumbInflight = new Map<string, SharedInflightEntry<CachedBinary>>();
   private readonly feedSemaphore: Semaphore;
   private readonly thumbSemaphore = new Semaphore(48, MAX_SEMAPHORE_QUEUE_SIZE);
+  // shortcut: in memory only, so the first refresh after a daemon restart is still slow; persist to cacheDir if restarts become frequent.
+  private readonly feedFamilies = new Map<string, { lastRequestAt: number; ids: Map<string, number> }>();
+  private readonly prefetchQueue: Array<{ kind: FeedKind; id: string }> = [];
+  private prefetchWorkers = 0;
 
   constructor(
     private readonly config: AppConfig,
@@ -240,7 +252,7 @@ export class MediaProxyRoutes {
    * Concurrency-safe for 200+ simultaneous FreeTube subscription refreshes.
    */
   async handleFeed(
-    kind: "playlist" | "channel",
+    kind: FeedKind,
     id: string,
     method: string,
     reqSignal?: AbortSignal,
@@ -252,96 +264,11 @@ export class MediaProxyRoutes {
       return new Response(null, { status: 499 });
     }
 
-    const paramKey = kind === "playlist" ? "playlist_id" : "channel_id";
-    const upstreamUrl = `https://www.youtube.com/feeds/videos.xml?${paramKey}=${encodeURIComponent(id)}`;
-    const cacheKey = `feed:${kind}:${id}`;
-
     try {
-      const entry = await this.runSharedCached(
-        this.feedCache,
-        this.feedInflight,
-        cacheKey,
-        reqSignal,
-        async (sharedSignal) => {
-          return await this.feedSemaphore.run(
-            async () => {
-              let lastStatus = 502;
-              let lastBody = "";
-              let lastContentType = "application/atom+xml; charset=utf-8";
-
-              // Up to 2 attempts for transient network/5xx errors during 200-feed bursts
-              for (let attempt = 0; attempt < 2; attempt++) {
-                if (sharedSignal.aborted) {
-                  throw getAbortError(sharedSignal);
-                }
-                try {
-                  const attemptSignal = AbortSignal.any([
-                    sharedSignal,
-                    AbortSignal.timeout(UPSTREAM_PROXY_TIMEOUT_MS),
-                  ]);
-                  const res = await this.fetchFn(upstreamUrl, {
-                    method: "GET",
-                    timeoutMs: UPSTREAM_PROXY_TIMEOUT_MS,
-                    signal: attemptSignal,
-                    httpsOnly: true,
-                    publicIpv4Only: true,
-                    allowedHost: (h) => ALLOWED_FEED_HOST.test(h),
-                    headers: {
-                      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-                      Accept: "application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
-                    },
-                  });
-                  lastStatus = res.status;
-                  lastContentType = res.headers.get("content-type") || "application/atom+xml; charset=utf-8";
-
-                  if (res.status === 404) {
-                    await res.body?.cancel().catch(() => {});
-                    lastBody = "Not Found";
-                    break;
-                  }
-                  if (res.status >= 500 && attempt === 0) {
-                    await res.body?.cancel().catch(() => {});
-                    await sleepWithAbort(250, sharedSignal);
-                    continue;
-                  }
-
-                  const bodyBytes = await readBoundedResponseBytes(res, MAX_FEED_BODY_BYTES);
-                  lastBody = new TextDecoder("utf-8").decode(bodyBytes);
-                  break;
-                } catch (err) {
-                  if (sharedSignal.aborted) throw err;
-                  if (attempt === 0) {
-                    await sleepWithAbort(250, sharedSignal);
-                    continue;
-                  }
-                  throw err;
-                }
-              }
-
-              if (lastStatus === 200) {
-                return {
-                  value: { status: 200, contentType: lastContentType, body: lastBody },
-                  ttlMs: this.config.rss.cacheTtlSec * 1000,
-                  cache: true,
-                };
-              }
-              if (lastStatus === 404) {
-                return {
-                  value: { status: 404, contentType: "text/plain; charset=utf-8", body: "Not Found" },
-                  ttlMs: this.config.rss.negativeCacheTtlSec * 1000,
-                  cache: true,
-                };
-              }
-              return {
-                value: { status: lastStatus, contentType: lastContentType, body: lastBody },
-                cache: false,
-              };
-            },
-            SEMAPHORE_WAIT_TIMEOUT_MS,
-            sharedSignal,
-          );
-        },
-      );
+      // Started before the prefetch so the triggering request is first in the semaphore queue.
+      const pending = this.loadFeed(kind, id, reqSignal);
+      this.prefetchFeedFamily(kind, id);
+      const entry = await pending;
 
       return new Response(method === "HEAD" ? null : entry.body, {
         status: entry.status,
@@ -372,6 +299,147 @@ export class MediaProxyRoutes {
         headers: { "Content-Type": "text/plain; charset=utf-8" },
       });
     }
+  }
+
+  /**
+   * FreeTube sends a whole subscription refresh at once, but Chromium only opens ~6 connections
+   * per host, so ~300 feeds at ~370 ms upstream each take 20+ s. On the first request of a
+   * refresh, fetch every feed of the same family that earlier refreshes asked for, at full
+   * upstream concurrency; FreeTube's queued requests then join those fetches or hit the cache.
+   */
+  private prefetchFeedFamily(kind: FeedKind, id: string): void {
+    // UULF/UUSH/UULV are a channel's videos/shorts/live playlists, each refreshed by its own FreeTube tab.
+    const familyKey = kind === "playlist" && id.startsWith("UU") ? id.slice(0, 4) : kind;
+    const now = Date.now();
+    let family = this.feedFamilies.get(familyKey);
+    if (!family) {
+      family = { lastRequestAt: 0, ids: new Map() };
+      this.feedFamilies.set(familyKey, family);
+    }
+    const startsRefresh = now - family.lastRequestAt > FEED_REFRESH_GAP_MS;
+    family.lastRequestAt = now;
+    // Re-insert so Map order stays least-recently-requested first for the size cap.
+    family.ids.delete(id);
+    family.ids.set(id, now);
+    if (family.ids.size > FEED_REMEMBER_MAX) family.ids.delete(family.ids.keys().next().value!);
+    if (!startsRefresh) return;
+
+    for (const [knownId, requestedAt] of family.ids) {
+      if (now - requestedAt > FEED_REMEMBER_MS) {
+        family.ids.delete(knownId);
+        continue;
+      }
+      if (knownId !== id) this.queuePrefetch(kind, knownId);
+    }
+  }
+
+  /**
+   * Prefetches run on at most `maxConcurrentUpstream` workers, so they hold at most that many
+   * feed-semaphore slots. Calling loadFeed for every feed of a 300-channel refresh at once would
+   * overflow the semaphore's bounded queue and turn FreeTube's own requests into 503 "proxy busy".
+   */
+  private queuePrefetch(kind: FeedKind, id: string): void {
+    this.prefetchQueue.push({ kind, id });
+    if (this.prefetchWorkers >= this.config.rss.maxConcurrentUpstream) return;
+    this.prefetchWorkers++;
+    void (async () => {
+      for (let job = this.prefetchQueue.shift(); job; job = this.prefetchQueue.shift()) {
+        // A failed prefetch is not cached, so FreeTube's own request for that feed retries it.
+        await this.loadFeed(job.kind, job.id).catch(() => {});
+      }
+      this.prefetchWorkers--;
+    })();
+  }
+
+  private async loadFeed(kind: FeedKind, id: string, reqSignal?: AbortSignal): Promise<CachedFeed> {
+    const paramKey = kind === "playlist" ? "playlist_id" : "channel_id";
+    const upstreamUrl = `https://www.youtube.com/feeds/videos.xml?${paramKey}=${encodeURIComponent(id)}`;
+
+    return await this.runSharedCached(
+      this.feedCache,
+      this.feedInflight,
+      `feed:${kind}:${id}`,
+      reqSignal,
+      async (sharedSignal) => {
+        return await this.feedSemaphore.run(
+          async () => {
+            let lastStatus = 502;
+            let lastBody = "";
+            let lastContentType = "application/atom+xml; charset=utf-8";
+
+            // Up to 2 attempts for transient network/5xx errors during 200-feed bursts
+            for (let attempt = 0; attempt < 2; attempt++) {
+              if (sharedSignal.aborted) {
+                throw getAbortError(sharedSignal);
+              }
+              try {
+                const attemptSignal = AbortSignal.any([
+                  sharedSignal,
+                  AbortSignal.timeout(UPSTREAM_PROXY_TIMEOUT_MS),
+                ]);
+                const res = await this.fetchFn(upstreamUrl, {
+                  method: "GET",
+                  timeoutMs: UPSTREAM_PROXY_TIMEOUT_MS,
+                  signal: attemptSignal,
+                  httpsOnly: true,
+                  publicIpv4Only: true,
+                  allowedHost: (h) => ALLOWED_FEED_HOST.test(h),
+                  headers: {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                    Accept: "application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+                  },
+                });
+                lastStatus = res.status;
+                lastContentType = res.headers.get("content-type") || "application/atom+xml; charset=utf-8";
+
+                if (res.status === 404) {
+                  await res.body?.cancel().catch(() => {});
+                  lastBody = "Not Found";
+                  break;
+                }
+                if (res.status >= 500 && attempt === 0) {
+                  await res.body?.cancel().catch(() => {});
+                  await sleepWithAbort(250, sharedSignal);
+                  continue;
+                }
+
+                const bodyBytes = await readBoundedResponseBytes(res, MAX_FEED_BODY_BYTES);
+                lastBody = new TextDecoder("utf-8").decode(bodyBytes);
+                break;
+              } catch (err) {
+                if (sharedSignal.aborted) throw err;
+                if (attempt === 0) {
+                  await sleepWithAbort(250, sharedSignal);
+                  continue;
+                }
+                throw err;
+              }
+            }
+
+            if (lastStatus === 200) {
+              return {
+                value: { status: 200, contentType: lastContentType, body: lastBody },
+                ttlMs: this.config.rss.cacheTtlSec * 1000,
+                cache: true,
+              };
+            }
+            if (lastStatus === 404) {
+              return {
+                value: { status: 404, contentType: "text/plain; charset=utf-8", body: "Not Found" },
+                ttlMs: this.config.rss.negativeCacheTtlSec * 1000,
+                cache: true,
+              };
+            }
+            return {
+              value: { status: lastStatus, contentType: lastContentType, body: lastBody },
+              cache: false,
+            };
+          },
+          SEMAPHORE_WAIT_TIMEOUT_MS,
+          sharedSignal,
+        );
+      },
+    );
   }
 
   private async serveCachedImage(
