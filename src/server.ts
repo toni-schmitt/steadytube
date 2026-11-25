@@ -80,10 +80,23 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
     fetch: handler,
     stop() {
       resolver.stop();
-      ephemeralStore.close();
+      if (resolver.hasActiveDiskWork()) {
+        // Keep the cache lock held while active downloads/remuxes finish draining,
+        // while immediately blocking all new lock acquisitions, reservations, and registrations.
+        ephemeralStore.beginShutdown();
+        void resolver.awaitShutdown(5_000).finally(() => {
+          ephemeralStore.close();
+        });
+      } else {
+        ephemeralStore.close();
+      }
     },
     async awaitShutdown(timeoutMs = 1000): Promise<void> {
-      await resolver.awaitShutdown(timeoutMs);
+      try {
+        await resolver.awaitShutdown(timeoutMs);
+      } finally {
+        ephemeralStore.close();
+      }
     },
   };
 }

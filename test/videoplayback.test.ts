@@ -3247,4 +3247,600 @@ describe("Mid-playback recovery state machine", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test("Round 5 #1-#6/#9-#15/#18: h:rev recovery preservation, strict yt-dlp meta match, primary tier race, cold Tier 3 coalescing/budget/rev/corrupt-cleanup, shutdown lock drain, and strict framing", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-r5-"));
+    try {
+      const mp4Bytes = makeMp4StreamBytes(600);
+
+      // 1) #2: findMatchingYtDlpFormatId requires exact lmt and xtags (missing in candidate URL -> rejected)
+      expect(
+        findMatchingYtDlpFormatId(
+          [
+            {
+              format_id: "137",
+              ext: "mp4",
+              protocol: "https",
+              filesize: mp4Bytes.byteLength,
+              url: `https://rr1---test.googlevideo.com/videoplayback?itag=137&clen=${mp4Bytes.byteLength}`,
+            },
+          ],
+          {
+            formatId: "137",
+            itag: 137,
+            clen: mp4Bytes.byteLength,
+            lmt: "1700000111",
+            xtags: "acont=original",
+          },
+        ),
+      ).toBeNull();
+      expect(
+        findMatchingYtDlpFormatId(
+          [
+            {
+              format_id: "137",
+              ext: "mp4",
+              protocol: "https",
+              filesize: mp4Bytes.byteLength,
+              url: `https://rr1---test.googlevideo.com/videoplayback?itag=137&clen=${mp4Bytes.byteLength}&lmt=1700000111&xtags=acont%3Doriginal`,
+            },
+          ],
+          {
+            formatId: "137",
+            itag: 137,
+            clen: mp4Bytes.byteLength,
+            lmt: "1700000111",
+            xtags: "acont=original",
+          },
+        ),
+      ).toBe("137");
+
+      // 2) #1: Failed target with hash-derived rev (`h:...`) recovering to refreshed target with lmt + matching digests
+      // preserves `h:...` rev and succeeds cleanly; incompatible refresh NEVER mutates live cache!
+      let failTier1R1 = false;
+      const appR1 = createApp(makeTestConfig(path.join(tmpDir, "r1"), { authEnabled: true }), {
+        logger: noopLogger,
+        innertube: {
+          async getClient() {
+            return { async getInfo() { return { streaming_data: {}, basic_info: {}, watch_next_feed: [] }; } };
+          },
+          reset() {},
+        } as unknown as AnonymousInnertubeProvider,
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo(videoId, { useAuth }): Promise<YtDlpVideoInfo> {
+            return {
+              id: videoId,
+              title: "Hash Rev Recovery",
+              duration: 60,
+              formats: [
+                {
+                  format_id: "137",
+                  ext: "mp4",
+                  protocol: "https",
+                  container: "mp4_dash",
+                  vcodec: "avc1.640028",
+                  acodec: "none",
+                  width: 1920,
+                  height: 1080,
+                  fps: 30,
+                  tbr: 2000,
+                  filesize: mp4Bytes.byteLength,
+                  // Tier 1 has NO lmt (so rev=h:<digest> from initial remote probe), Tier 2 reports lmt=1700000555
+                  url: useAuth
+                    ? `https://rr1---t2.googlevideo.com/videoplayback?itag=137&dur=60&expire=1999999999&clen=${mp4Bytes.byteLength}&lmt=1700000555`
+                    : `https://rr1---t1.googlevideo.com/videoplayback?itag=137&dur=60&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+                },
+              ],
+            };
+          },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+        fetchRawFn: async (input, init) => {
+          const u = input.toString();
+          if (u.includes("rr1---t1") && failTier1R1) {
+            return new Response("Forbidden", { status: 403 });
+          }
+          const range = new Headers(init?.headers).get("range") || "";
+          const m = /^bytes=(\d+)-(\d+)$/.exec(range);
+          if (!m) {
+            return new Response(mp4Bytes, { status: 200, headers: { "Content-Length": String(mp4Bytes.byteLength) } });
+          }
+          const s = Number(m[1]);
+          const e = Math.min(Number(m[2]), mp4Bytes.byteLength - 1);
+          const slice = mp4Bytes.slice(s, e + 1);
+          return new Response(slice, {
+            status: 206,
+            headers: {
+              "Content-Range": `bytes ${s}-${e}/${mp4Bytes.byteLength}`,
+              "Content-Length": String(slice.byteLength),
+            },
+          });
+        },
+      });
+      appR1.config.playback.ephemeralBuffer.enabled = false;
+      const vR1 = (await (await appR1.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"))).json()) as any;
+      const r1Url = vR1.adaptiveFormats[0].url as string;
+      expect(r1Url).toContain("rev=h%3A");
+      failTier1R1 = true;
+      const r1RecRes = await appR1.fetch(new Request(r1Url, { headers: { Range: "bytes=304-353" } }));
+      expect(r1RecRes.status).toBe(206);
+      expect(r1RecRes.headers.get("x-steadytube-tier")).toBe("2");
+      appR1.stop();
+
+      // 3) #3: Older slower Tier 2 resolveVideo MUST NOT overwrite newer fresh complete Tier 1 record!
+      let slowStarted!: () => void;
+      const slowStartedP = new Promise<void>((r) => { slowStarted = r; });
+      let releaseSlowTier2!: () => void;
+      const appR3 = createApp(makeTestConfig(path.join(tmpDir, "r3"), { authEnabled: true }), {
+        logger: noopLogger,
+        innertube: {
+          async getClient() {
+            return {
+              async getInfo() {
+                return {
+                  streaming_data: {
+                    adaptive_formats: [
+                      { itag: 137, init_range: { start: 0, end: 231 }, index_range: { start: 232, end: 303 } },
+                      { itag: 140, init_range: { start: 0, end: 231 }, index_range: { start: 232, end: 303 } },
+                    ],
+                  },
+                  basic_info: {},
+                  watch_next_feed: [],
+                };
+              },
+            };
+          },
+          reset() {},
+        } as unknown as AnonymousInnertubeProvider,
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo(videoId, { useAuth }): Promise<YtDlpVideoInfo> {
+            if (useAuth) {
+              slowStarted();
+              await new Promise<void>((r) => { releaseSlowTier2 = r; });
+            }
+            return {
+              id: videoId,
+              title: useAuth ? "Older Slow Tier 2" : "Newer Fast Tier 1",
+              duration: 60,
+              formats: [
+                {
+                  format_id: "137",
+                  ext: "mp4",
+                  protocol: "https",
+                  container: "mp4_dash",
+                  vcodec: "avc1.640028",
+                  acodec: "none",
+                  width: 1920,
+                  height: 1080,
+                  fps: 30,
+                  tbr: 2000,
+                  filesize: mp4Bytes.byteLength,
+                  url: `https://rr1---${useAuth ? "slow-t2" : "fast-t1"}.googlevideo.com/videoplayback?itag=137&dur=60&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+                },
+                {
+                  format_id: "140",
+                  ext: "m4a",
+                  protocol: "https",
+                  container: "m4a_dash",
+                  vcodec: "none",
+                  acodec: "mp4a.40.2",
+                  tbr: 128,
+                  filesize: mp4Bytes.byteLength,
+                  url: `https://rr1---${useAuth ? "slow-t2" : "fast-t1"}.googlevideo.com/videoplayback?itag=140&dur=60&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+                },
+              ],
+            };
+          },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+      });
+      const olderSlowTier2 = appR3.resolver.resolveVideo("abc123XYZ99", "http://127.0.0.1:8787", {
+        minTier: 2,
+        maxTier: 2,
+      });
+      await slowStartedP;
+      const newerFastTier1 = await appR3.resolver.resolveVideo("abc123XYZ99", "http://127.0.0.1:8787", {
+        requireDashPair: true,
+      });
+      expect(newerFastTier1.tier).toBe(1);
+      releaseSlowTier2();
+      const slowOut = await olderSlowTier2;
+      expect(slowOut.tier).toBe(1);
+      expect(appR3.resolver.getCached("abc123XYZ99")?.tier).toBe(1);
+      appR3.stop();
+
+      // 4) #4, #5, #9, #10, #18 & Mistral Nit 4: Cold Tier 3 coalescing, tight-budget cache reuse,
+      // sourceRev change isolation, corrupt disk file cleanup, and shutdown lock drain!
+      const vidA = makeGlobalSidxMp4Bytes(400);
+      const audA = makeGlobalSidxMp4Bytes(300);
+      const vidB = makeGlobalSidxMp4Bytes(420);
+      let coldLmt = "111";
+      let coldDownloads = 0;
+      let holdNextDownload = false;
+      let dlStarted!: () => void;
+      let releaseDl!: () => void;
+      const dlStartedP = new Promise<void>((r) => { dlStarted = r; });
+
+      // Tight maxCacheBytes: vidA (~592B) + audA (~492B) = ~1084B; cap = 1400B so re-charging cached vidA would fail!
+      const coldDir = path.join(tmpDir, "cold-r5");
+      const coldCfg = makeTestConfig(coldDir, { authEnabled: false });
+      coldCfg.playback.ephemeralBuffer.maxCacheBytes = vidA.byteLength + audA.byteLength + 200;
+      const appCold = createApp(coldCfg, {
+        logger: noopLogger,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+            return {
+              id: videoId,
+              title: "Cold Tier 3 Checks",
+              duration: 99,
+              formats: [
+                {
+                  format_id: "137",
+                  ext: "mp4",
+                  protocol: "m3u8_native",
+                  vcodec: "avc1.640028",
+                  acodec: "none",
+                  width: 1920,
+                  height: 1080,
+                  fps: 30,
+                  tbr: 2000,
+                  url: `https://rr1---sn.googlevideo.com/videoplayback?itag=137&lmt=${coldLmt}`,
+                },
+                {
+                  format_id: "140",
+                  ext: "m4a",
+                  protocol: "m3u8_native",
+                  vcodec: "none",
+                  acodec: "mp4a.40.2",
+                  abr: 128,
+                  url: `https://rr1---sn.googlevideo.com/videoplayback?itag=140&lmt=${coldLmt}`,
+                },
+              ],
+            };
+          },
+          async downloadFormat(_id, sel, outPath) {
+            coldDownloads++;
+            if (holdNextDownload) {
+              holdNextDownload = false;
+              dlStarted();
+              await new Promise<void>((r) => { releaseDl = r; });
+            }
+            const data = sel === "137" ? (coldLmt === "111" ? vidA : vidB) : audA;
+            fs.writeFileSync(outPath, data);
+            return outPath;
+          },
+        },
+      });
+
+      // Concurrent cold Tier 3 calls coalesce into a single video+audio download pair (2 downloads total, not 4)
+      const [c1, c2] = await Promise.all([
+        appCold.resolver.resolveVideo("abc123XYZ99", "http://127.0.0.1:8787", { minTier: 3 }),
+        appCold.resolver.resolveVideo("abc123XYZ99", "http://127.0.0.1:8787", { minTier: 3, forceRefresh: true }),
+      ]);
+      expect(c1.tier).toBe(3);
+      expect(c2.tier).toBe(3);
+      expect(coldDownloads).toBe(2);
+
+      // Re-resolving under tight maxCacheBytes MUST reuse cached files without double-charging pinned size!
+      appCold.resolver.invalidateVideo("abc123XYZ99");
+      const cReuse = await appCold.resolver.resolveVideo("abc123XYZ99", "http://127.0.0.1:8787", { minTier: 3 });
+      expect(cReuse.tier).toBe(3);
+      expect(coldDownloads).toBe(2); // Reused!
+
+      // Changing upstream sourceRev (lmt=222) MUST NOT reuse stale lmt=111 cached file!
+      coldLmt = "222";
+      // Increase cap slightly so both rev 111 and rev 222 can briefly coexist before eviction
+      appCold.config.playback.ephemeralBuffer.maxCacheBytes = 50_000;
+      const appCold2Dir = path.join(tmpDir, "cold-r5-rev");
+      const appColdRev = createApp(makeTestConfig(appCold2Dir, { authEnabled: false }), {
+        logger: noopLogger,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+            return {
+              id: videoId,
+              title: "Cold Rev Change",
+              duration: 99,
+              formats: [
+                { format_id: "137", ext: "mp4", protocol: "m3u8_native", vcodec: "avc1.640028", acodec: "none", width: 1920, height: 1080, fps: 30, url: `https://rr1---sn.googlevideo.com/videoplayback?itag=137&lmt=${coldLmt}` },
+                { format_id: "140", ext: "m4a", protocol: "m3u8_native", vcodec: "none", acodec: "mp4a.40.2", abr: 128, url: `https://rr1---sn.googlevideo.com/videoplayback?itag=140&lmt=${coldLmt}` },
+              ],
+            };
+          },
+          async downloadFormat(_id, sel, outPath) {
+            fs.writeFileSync(outPath, sel === "137" ? (coldLmt === "111" ? vidA : vidB) : audA);
+            return outPath;
+          },
+        },
+      });
+      coldLmt = "111";
+      const rev1Rec = await appColdRev.resolver.resolveVideo("abc123XYZ99", "http://127.0.0.1:8787", { minTier: 3 });
+      const rev1Target = rev1Rec.targetsByFid.get("tier3-v-137");
+      expect(rev1Target?.kind === "local" && rev1Target.size).toBe(vidA.byteLength);
+
+      // Corrupt disk file -> next resolve deletes corrupt file and re-downloads cleanly (Mistral Nit 4)
+      if (rev1Target?.kind === "local") {
+        fs.writeFileSync(rev1Target.filePath, new Uint8Array(64).fill(0));
+      }
+      appColdRev.resolver.invalidateVideo("abc123XYZ99");
+      const healedRec = await appColdRev.resolver.resolveVideo("abc123XYZ99", "http://127.0.0.1:8787", { minTier: 3 });
+      const healedTarget = healedRec.targetsByFid.get("tier3-v-137");
+      expect(healedTarget?.kind === "local" && healedTarget.size).toBe(vidA.byteLength);
+
+      // Now lmt changes to 222 -> MUST download vidB into a new file rather than reusing vidA!
+      coldLmt = "222";
+      appColdRev.resolver.invalidateVideo("abc123XYZ99");
+      const rev2Rec = await appColdRev.resolver.resolveVideo("abc123XYZ99", "http://127.0.0.1:8787", { minTier: 3 });
+      const rev2Target = rev2Rec.targetsByFid.get("tier3-v-137");
+      expect(rev2Target?.kind === "local" && rev2Target.size).toBe(vidB.byteLength);
+      appColdRev.stop();
+
+      // #9: Calling stop() while a cold Tier 3 download is active keeps .steadytube.lock held until awaitShutdown() drains!
+      holdNextDownload = true;
+      appCold.resolver.invalidateVideo("abc123XYZ99");
+      const inflightCold = appCold.resolver
+        .resolveVideo("vidDrain123", "http://127.0.0.1:8787", { minTier: 3 })
+        .catch(() => null);
+      await dlStartedP;
+      appCold.stop();
+      expect(appCold.ephemeralStore.isClosed()).toBe(true);
+      expect(fs.existsSync(path.join(coldDir, ".steadytube.lock"))).toBe(true);
+      releaseDl();
+      await inflightCold;
+      await appCold.awaitShutdown(1000);
+      expect(fs.existsSync(path.join(coldDir, ".steadytube.lock"))).toBe(false);
+
+      // 5) #6: Gen 2 progressive failure restores Gen 2's fallbackRemote (NEVER Gen 1's), and
+      // serveTarget falls through to fallbackRemote when progressive download fails mid-wait!
+      let genCount = 0;
+      let failProgNow!: () => void;
+      let allowGen2Upstream = false;
+      const appR6 = createApp(makeTestConfig(path.join(tmpDir, "r6"), { authEnabled: false }), {
+        logger: noopLogger,
+        innertube: makeMockInnertube(),
+        fetchRawFn: async (input, init) => {
+          if (allowGen2Upstream && input.toString().includes("gen2")) {
+            const range = new Headers(init?.headers).get("range") || "bytes=0-49";
+            const m = /^bytes=(\d+)-(\d+)$/.exec(range);
+            const s = m ? Number(m[1]) : 0;
+            const e = m ? Number(m[2]) : 49;
+            const slice = mp4Bytes.slice(s, e + 1);
+            return new Response(slice, {
+              status: 206,
+              headers: {
+                "Content-Range": `bytes ${s}-${e}/${mp4Bytes.byteLength}`,
+                "Content-Length": String(slice.byteLength),
+              },
+            });
+          }
+          return new Response("Forbidden", { status: 403 });
+        },
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+            const g = ++genCount;
+            return {
+              id: videoId,
+              title: `Gen ${g}`,
+              duration: 60,
+              formats: [
+                {
+                  format_id: "137",
+                  ext: "mp4",
+                  protocol: "https",
+                  container: "mp4_dash",
+                  vcodec: "avc1.640028",
+                  acodec: "none",
+                  width: 1920,
+                  height: 1080,
+                  fps: 30,
+                  tbr: 2000,
+                  filesize: mp4Bytes.byteLength,
+                  url: `https://rr1---gen${g}.googlevideo.com/videoplayback?itag=137&dur=60&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+                },
+              ],
+            };
+          },
+          async downloadFormat() { throw new Error("unused"); },
+          async startProgressiveDownload(videoId, sel, outPath, opts): Promise<ProgressiveDownloadHandle> {
+            const tmpPath = `${outPath}.r6.tmp.mp4`;
+            fs.writeFileSync(tmpPath, mp4Bytes.subarray(0, 350));
+            let status: "downloading" | "completed" | "failed" = "downloading";
+            const waiters: Array<() => void> = [];
+            const done = new Promise<{ filePath: string; size: number }>((_, reject) => {
+              failProgNow = () => {
+                status = "failed";
+                for (const w of waiters.splice(0)) w();
+                reject(new Error("upstream dropped"));
+              };
+            });
+            return {
+              videoId,
+              formatId: opts.cacheFormatId || sel,
+              mimeType: opts.mimeType,
+              expectedSize: opts.expectedSize,
+              done,
+              getReadablePath: () => tmpPath,
+              getAvailableBytes: () => 350,
+              getStatus: () => status,
+              getError: () => (status === "failed" ? new Error("upstream dropped") : null),
+              touch: () => {},
+              cancel: () => { status = "failed"; },
+              waitForBytes(minBytes) {
+                if (status !== "downloading" || 350 >= minBytes) return Promise.resolve();
+                return new Promise<void>((resolve) => waiters.push(resolve));
+              },
+            };
+          },
+        },
+      });
+      const uG1 = ((await (await appR6.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"))).json()) as any).adaptiveFormats[0].url as string;
+      expect((await appR6.fetch(new Request(uG1, { headers: { Range: "bytes=0-49" } }))).status).toBe(206);
+      appR6.resolver.invalidateVideo("abc123XYZ99");
+      const uG2 = ((await (await appR6.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"))).json()) as any).adaptiveFormats[0].url as string;
+      expect((await appR6.fetch(new Request(uG2, { headers: { Range: "bytes=0-49" } }))).status).toBe(206);
+
+      // Start a Gen 2 read waiting past available bytes (400..449), then fail progressive handle while Gen 2 upstream works!
+      allowGen2Upstream = true;
+      const midWaitReq = appR6.fetch(new Request(uG2, { headers: { Range: "bytes=400-449" } }));
+      await new Promise((r) => setTimeout(r, 10));
+      failProgNow();
+      await new Promise((r) => setTimeout(r, 20));
+      const slotG2 = appR6.resolver.getStreamTarget("abc123XYZ99", "137", 137);
+      expect(slotG2?.kind).toBe("remote");
+      // MUST restore Gen 2's URL (rr1---gen2), NEVER Gen 1's (rr1---gen1)!
+      expect(slotG2?.kind === "remote" && slotG2.url.includes("rr1---gen2")).toBe(true);
+      const midWaitRes = await midWaitReq;
+      // Fell through to fallbackRemote (rr1---gen2) instead of returning 503!
+      expect(midWaitRes.status).toBe(206);
+      appR6.stop();
+
+      // 6) #12, #13, #14, #15 & GLM Minor 1: Ranged HEAD fast-path, gzip rejection, unsolicited 206 rejection,
+      // upstream 416 error-body sanitization without stale-marking, direct ?host= validation, and huge rawEnd!
+      let directMode: "gzip" | "unsolicited-206" | "416-with-body" | "ok" = "gzip";
+      let upstreamHitCount = 0;
+      const appFraming = createApp(makeTestConfig(path.join(tmpDir, "framing"), { authEnabled: false }), {
+        logger: noopLogger,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo(videoId): Promise<YtDlpVideoInfo> {
+            return {
+              id: videoId,
+              title: "Framing R5",
+              duration: 60,
+              formats: [
+                {
+                  format_id: "137",
+                  ext: "mp4",
+                  protocol: "https",
+                  container: "mp4_dash",
+                  vcodec: "avc1.640028",
+                  acodec: "none",
+                  width: 1920,
+                  height: 1080,
+                  fps: 30,
+                  tbr: 2000,
+                  filesize: mp4Bytes.byteLength,
+                  url: `https://rr1---sn.googlevideo.com/videoplayback?itag=137&dur=60&expire=1999999999&clen=${mp4Bytes.byteLength}`,
+                },
+                {
+                  format_id: "18",
+                  ext: "mp4",
+                  protocol: "https",
+                  vcodec: "avc1.42001E",
+                  acodec: "mp4a.40.2",
+                  width: 640,
+                  height: 360,
+                  fps: 30,
+                  tbr: 500,
+                  url: "https://rr1---unknownlen.googlevideo.com/videoplayback?itag=18&dur=60&expire=1999999999",
+                },
+              ],
+            };
+          },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+        fetchRawFn: async () => {
+          upstreamHitCount++;
+          if (directMode === "gzip") {
+            return new Response(mp4Bytes.slice(0, 50), {
+              status: 206,
+              headers: {
+                "Content-Range": `bytes 0-49/${mp4Bytes.byteLength}`,
+                "Content-Length": "50",
+                "Content-Encoding": "gzip",
+              },
+            });
+          }
+          if (directMode === "unsolicited-206") {
+            return new Response(mp4Bytes.slice(0, 50), {
+              status: 206,
+              headers: {
+                "Content-Range": `bytes 0-49/${mp4Bytes.byteLength}`,
+                "Content-Length": "50",
+              },
+            });
+          }
+          if (directMode === "416-with-body") {
+            return new Response("<html>Requested Range Not Satisfiable</html>", {
+              status: 416,
+              headers: { "Content-Range": "bytes */500", "Content-Length": "42" },
+            });
+          }
+          return new Response(mp4Bytes, {
+            status: 206,
+            headers: {
+              "Content-Range": `bytes 0-${mp4Bytes.byteLength - 1}/${mp4Bytes.byteLength}`,
+              "Content-Length": String(mp4Bytes.byteLength),
+            },
+          });
+        },
+      });
+      appFraming.config.playback.ephemeralBuffer.enabled = false;
+      const vFraming = (await (await appFraming.fetch(new Request("http://127.0.0.1:8787/api/v1/videos/abc123XYZ99"))).json()) as any;
+      const url137 = vFraming.adaptiveFormats[0].url as string;
+      const url18 = vFraming.formatStreams[0].url as string;
+
+      // #14: Ranged HEAD hits exact-clen fast path with 0 upstream calls
+      const rangedHead = await appFraming.fetch(
+        new Request(url137, { method: "HEAD", headers: { Range: "bytes=0-49" } }),
+      );
+      expect(rangedHead.status).toBe(200);
+      expect(rangedHead.headers.get("content-length")).toBe(String(mp4Bytes.byteLength));
+      expect(upstreamHitCount).toBe(0);
+
+      // #12: Content-Encoding: gzip on 206 is rejected
+      directMode = "gzip";
+      const gzipRes = await appFraming.fetch(new Request(url137, { headers: { Range: "bytes=0-49" } }));
+      expect(gzipRes.status).not.toBe(206);
+
+      // #12: Unsolicited 206 on multi-range (ignored Range) is rejected
+      directMode = "unsolicited-206";
+      const multiRes = await appFraming.fetch(
+        new Request(url137, { headers: { Range: "bytes=0-10, 20-30" } }),
+      );
+      expect(multiRes.status).not.toBe(206);
+
+      // #13: Upstream 416 with HTML error body returns clean empty 416 (Content-Length: 0) and does NOT mark target stale!
+      directMode = "416-with-body";
+      const r416 = await appFraming.fetch(new Request(url18, { headers: { Range: "bytes=1000-2000" } }));
+      expect(r416.status).toBe(416);
+      expect(r416.headers.get("content-length")).toBe("0");
+      expect(r416.headers.get("content-range")).toBe("bytes */500");
+      expect((await r416.arrayBuffer()).byteLength).toBe(0);
+      const t18 = appFraming.resolver.getStreamTarget("abc123XYZ99", "18", 18);
+      expect(t18?.kind === "remote" && !t18.stale).toBe(true);
+
+      // #15: Unknown-length huge rawEnd (400 digits) is NOT treated as unsatisfiable!
+      directMode = "ok";
+      const hugeEndRes = await appFraming.fetch(
+        new Request(url18, { headers: { Range: `bytes=0-${"9".repeat(400)}` } }),
+      );
+      expect(hugeEndRes.status).toBe(206);
+
+      // GLM Minor 1: Direct ?host= proxy rejects gzip 206 and unsolicited 206
+      directMode = "gzip";
+      const directGzip = await appFraming.fetch(
+        new Request("http://127.0.0.1:8787/videoplayback?host=rr1---sn.googlevideo.com&itag=137", {
+          headers: { Range: "bytes=0-49" },
+        }),
+      );
+      expect(directGzip.status).toBe(502);
+
+      directMode = "unsolicited-206";
+      const directUnsolicited = await appFraming.fetch(
+        new Request("http://127.0.0.1:8787/videoplayback?host=rr1---sn.googlevideo.com&itag=137"),
+      );
+      expect(directUnsolicited.status).toBe(502);
+      appFraming.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

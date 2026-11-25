@@ -1157,6 +1157,48 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
       expect(plJson.descriptionHtml).toContain('<a href="https://example.com"');
 
       appBrowse.stop();
+
+      // Round 5 #22: Caption selection requires BOTH label and lang to match when both are provided (no cross-track fallback)
+      const appCap = createApp(makeTestConfig(path.join(tmpDir, "cap-match"), false), {
+        logger: noopLogger,
+        innertube: {
+          async getClient() {
+            return {
+              async getInfo() {
+                return {
+                  captions: {
+                    caption_tracks: [
+                      { name: { text: "English" }, language_code: "en", base_url: "https://www.youtube.com/api/timedtext?lang=en" },
+                      { name: { text: "French" }, language_code: "fr", base_url: "https://www.youtube.com/api/timedtext?lang=fr" },
+                    ],
+                  },
+                };
+              },
+            };
+          },
+          reset() {},
+        } as unknown as AnonymousInnertubeProvider,
+        fetchFn: async (input) => {
+          const u = input.toString();
+          return new Response(`WEBVTT\n\n00:00.000 --> 00:01.000\n${u.includes("lang=fr") ? "Bonjour" : "Hello"}`, {
+            status: 200,
+          });
+        },
+      });
+      const capMismatch = await appCap.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/captions/dQw4w9WgXcQ?label=French&lang=en"),
+      );
+      expect(capMismatch.status).toBe(404);
+      const capEmptyParams = await appCap.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/captions/dQw4w9WgXcQ?label=&lang="),
+      );
+      expect(capEmptyParams.status).toBe(404);
+      const capExact = await appCap.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/captions/dQw4w9WgXcQ?label=French&lang=fr"),
+      );
+      expect(capExact.status).toBe(200);
+      expect(await capExact.text()).toContain("Bonjour");
+      appCap.stop();
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

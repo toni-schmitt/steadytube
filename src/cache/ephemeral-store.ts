@@ -15,6 +15,8 @@ export interface EphemeralEntryMeta {
   rev?: string | null;
   /** Upstream source revision (lmt) bound to cold Tier 3 cached tracks */
   sourceRev?: string | null;
+  /** Upstream exact content length bound to cold Tier 3 cached tracks (before optional remux) */
+  sourceClen?: number;
   /** Audio/variant xtags if present */
   xtags?: string | null;
   initHash?: string;

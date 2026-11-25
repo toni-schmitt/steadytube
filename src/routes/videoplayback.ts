@@ -58,22 +58,55 @@ function parseContentRangeHeader(
   return null;
 }
 
+/**
+ * Compute the single byte-range header we actually forward upstream:
+ * - Never forward Range on HEAD (RFC 9110 §14.2: HEAD returns full metadata 200).
+ * - Never forward Range when If-Range is present (we do not validate If-Range validators).
+ * - Ignore unknown range units, multi-range lists, and syntactically invalid specs so
+ *   upstream cannot return multipart/byteranges or an unexpected 206.
+ */
+function getEffectiveOutboundRange(req: Request): string | null {
+  if (req.method === "HEAD") return null;
+  if (req.headers.get("if-range")) return null;
+  const raw = req.headers.get("range");
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.includes(",")) return null;
+  const m = /^bytes=(\d*)-(\d*)$/i.exec(trimmed);
+  if (!m || (m[1] === "" && m[2] === "")) return null;
+  return trimmed;
+}
+
+function compareUintStrings(a: string, b: string): number {
+  const na = a.replace(/^0+/, "") || "0";
+  const nb = b.replace(/^0+/, "") || "0";
+  if (na.length !== nb.length) return na.length < nb.length ? -1 : 1;
+  return na < nb ? -1 : na > nb ? 1 : 0;
+}
+
 type UpstreamValidationResult =
   | { ok: true; expectedBodyBytes: number | null }
   | { ok: false; reason: "layout_mismatch" | "recoverable_protocol" };
 
 /**
  * Strictly validate upstream 200 / 206 / 416 headers BEFORE forwarding headers/bytes to Shaka:
+ * - Reject non-identity Content-Encoding on 200/206 so raw compressed bytes never masquerade as offsets.
+ * - Reject unsolicited 206 when no single byte-range was forwarded upstream.
  * - 206 MUST carry a valid single-range Content-Range matching the requested interval,
  *   exact `expectedTotal` (rejecting `*` when exact total is known), and exact Content-Length.
  * - 200 MUST match `expectedTotal` when Content-Length is supplied.
  * - 416 MUST match `expectedTotal` when `bytes *\/total` is supplied.
  */
 function validateUpstreamSegmentResponse(
-  req: Request,
+  outboundRange: string | null,
   res: Response,
   expectedTotal: number,
 ): UpstreamValidationResult {
+  const ce = (res.headers.get("content-encoding") || "").trim().toLowerCase();
+  if ((res.status === 200 || res.status === 206) && ce.length > 0 && ce !== "identity") {
+    return { ok: false, reason: "recoverable_protocol" };
+  }
+
   const rawCl = res.headers.get("content-length");
   let parsedCl: number | null = null;
   if (rawCl !== null) {
@@ -88,6 +121,9 @@ function validateUpstreamSegmentResponse(
   }
 
   if (res.status === 206) {
+    if (outboundRange === null) {
+      return { ok: false, reason: "recoverable_protocol" };
+    }
     const parsedCr = parseContentRangeHeader(res.headers.get("content-range"));
     if (!parsedCr || !("start" in parsedCr)) {
       return { ok: false, reason: "recoverable_protocol" };
@@ -105,27 +141,34 @@ function validateUpstreamSegmentResponse(
       return { ok: false, reason: "recoverable_protocol" };
     }
 
-    // Verify returned interval matches the client's requested single Range (when no If-Range)
-    if (!req.headers.get("if-range")) {
-      const reqRange = req.headers.get("range");
-      if (reqRange && reqRange.trim()) {
-        const refTotal = expectedTotal > 0 ? expectedTotal : (parsedCr.total ?? 0);
-        if (refTotal > 0) {
-          const parsedReq = parseHttpRangeHeader(reqRange, refTotal);
-          if (parsedReq === "unsatisfiable") {
-            return { ok: false, reason: "recoverable_protocol" };
-          }
-          if (parsedReq.isPartial && (parsedCr.start !== parsedReq.start || parsedCr.end !== parsedReq.end)) {
+    // Verify returned interval matches the forwarded single Range
+    const refTotal = expectedTotal > 0 ? expectedTotal : (parsedCr.total ?? 0);
+    if (refTotal > 0) {
+      const parsedReq = parseHttpRangeHeader(outboundRange, refTotal);
+      if (parsedReq === "unsatisfiable") {
+        return { ok: false, reason: "recoverable_protocol" };
+      }
+      if (parsedReq.isPartial && (parsedCr.start !== parsedReq.start || parsedCr.end !== parsedReq.end)) {
+        return { ok: false, reason: "recoverable_protocol" };
+      }
+    } else {
+      const m = /^bytes=(\d*)-(\d*)$/i.exec(outboundRange);
+      if (m) {
+        const [, rawStart, rawEnd] = m;
+        if (rawStart === "") {
+          const trimmedDigits = rawEnd!.replace(/^0+/, "");
+          if (!trimmedDigits) return { ok: false, reason: "recoverable_protocol" };
+          const maxSuffix = trimmedDigits.length > 15 ? Infinity : Number(trimmedDigits);
+          if (rangeLen > maxSuffix) {
             return { ok: false, reason: "recoverable_protocol" };
           }
         } else {
-          const m = /^bytes=(\d+)-(\d*)$/i.exec(reqRange.trim());
-          if (m) {
-            const reqStart = Number(m[1]);
-            const reqEnd = m[2] ? Number(m[2]) : null;
-            if (parsedCr.start !== reqStart || (reqEnd !== null && parsedCr.end > reqEnd)) {
-              return { ok: false, reason: "recoverable_protocol" };
-            }
+          const reqStart = Number(rawStart);
+          if (!Number.isFinite(reqStart) || parsedCr.start !== reqStart) {
+            return { ok: false, reason: "recoverable_protocol" };
+          }
+          if (rawEnd !== "" && compareUintStrings(String(parsedCr.end), rawEnd!) > 0) {
+            return { ok: false, reason: "recoverable_protocol" };
           }
         }
       }
@@ -220,12 +263,12 @@ function classifyRequestedRange(req: Request, totalSize: number): RequestedRange
     if (/^0+$/.test(rawEnd!)) return { kind: "unsatisfiable" };
     return { kind: "indeterminate_suffix" };
   }
-  const start = Number(rawStart);
-  if (!Number.isFinite(start) || start < 0) return { kind: "unsatisfiable" };
-  if (rawEnd !== "") {
-    const end = Number(rawEnd);
-    if (!Number.isFinite(end) || end < start) return { kind: "unsatisfiable" };
+  if (rawEnd !== "" && compareUintStrings(rawEnd!, rawStart!) < 0) {
+    return { kind: "unsatisfiable" };
   }
+  const trimmedStart = rawStart!.replace(/^0+/, "") || "0";
+  const start = trimmedStart.length > 15 ? Number.MAX_SAFE_INTEGER : Number(trimmedStart);
+  if (!Number.isFinite(start) || start < 0) return { kind: "unsatisfiable" };
   return { kind: "offset", start };
 }
 
@@ -475,7 +518,7 @@ export class VideoPlaybackRoute {
             if (urlRev && diskEntry.meta?.rev !== urlRev) continue;
             if (urlXtags && diskEntry.meta?.xtags !== urlXtags) continue;
             if (urlLayout) {
-              if (diskEntry.meta?.layout !== undefined) {
+              if (diskEntry.meta?.layout != null) {
                 if (diskEntry.meta.layout !== urlLayout) continue;
               } else {
                 const probed = probeLocalFileDashRanges(
@@ -565,14 +608,22 @@ export class VideoPlaybackRoute {
     let current: StreamTargetRemote;
     if (target.kind === "progressive") {
       if (target.source.getStatus() !== "failed") {
-        return await this.ephemeralStore.serveProgressive(
+        const progRes = await this.ephemeralStore.serveProgressive(
           target.source,
           req,
           this.config.playback.streamStallTimeoutMs,
         );
-      }
-      // Failed progressive stream: recover cleanly via its fallback remote target if available
-      if (target.fallbackRemote) {
+        if (
+          progRes.status !== 503 ||
+          req.signal.aborted ||
+          target.source.getStatus() !== "failed" ||
+          !target.fallbackRemote
+        ) {
+          return progRes;
+        }
+        // Progressive download failed while waiting for initial bytes -> recover via fallbackRemote
+        current = target.fallbackRemote;
+      } else if (target.fallbackRemote) {
         current = target.fallbackRemote;
       } else {
         this.resolver.invalidateVideoIfTargetMatches(target.videoId, target.formatId, target);
@@ -582,8 +633,8 @@ export class VideoPlaybackRoute {
       current = target;
     }
 
-    // Fast path for non-ranged HEAD when we already know authoritative exact content length
-    if (req.method === "HEAD" && current.clen > 0 && !current.stale && !req.headers.get("range")) {
+    // Fast path for HEAD (including ranged HEAD per RFC 9110 §14.2) when exact length is known
+    if (req.method === "HEAD" && current.clen > 0 && !current.stale) {
       return new Response(null, {
         status: 200,
         headers: {
@@ -657,12 +708,13 @@ export class VideoPlaybackRoute {
     }
 
     // Try current remote target over IPv4; transparently recover on 403/410/429/5xx/network/protocol error
+    const outboundRange = getEffectiveOutboundRange(req);
     for (let attempt = 0; attempt < MAX_RECOVERY_ATTEMPTS; attempt++) {
       try {
-        const res = await this.fetchUpstreamSegment(req, current);
+        const res = await this.fetchUpstreamSegment(req, current, outboundRange);
         if (res.status === 200 || res.status === 206 || res.status === 416) {
           const expectedTotal = expectedIdentity?.clen || current.clen || 0;
-          const validation = validateUpstreamSegmentResponse(req, res, expectedTotal);
+          const validation = validateUpstreamSegmentResponse(outboundRange, res, expectedTotal);
           if (!validation.ok) {
             await res.body?.cancel().catch(() => {});
             if (validation.reason === "layout_mismatch") {
@@ -678,6 +730,18 @@ export class VideoPlaybackRoute {
               status: res.status,
               attempt,
             });
+          } else if (res.status === 416) {
+            await res.body?.cancel().catch(() => {});
+            const outHeaders = new Headers({
+              "Content-Type": res.headers.get("content-type") || current.mimeType,
+              "Accept-Ranges": res.headers.get("accept-ranges") || "bytes",
+              "Content-Length": "0",
+              "Cache-Control": "private, max-age=300",
+              "X-SteadyTube-Tier": String(current.tier),
+            });
+            const contentRange = res.headers.get("content-range");
+            if (contentRange) outHeaders.set("Content-Range", contentRange);
+            return new Response(null, { status: 416, headers: outHeaders });
           } else {
             return this.buildStreamResponse(req, res, current, validation.expectedBodyBytes);
           }
@@ -772,17 +836,17 @@ export class VideoPlaybackRoute {
     return new Response("Cached stream expired; reload required", { status: 503 });
   }
 
-  private async fetchUpstreamSegment(req: Request, target: StreamTargetRemote): Promise<Response> {
+  private async fetchUpstreamSegment(
+    req: Request,
+    target: StreamTargetRemote,
+    outboundRange: string | null,
+  ): Promise<Response> {
     const headers: Record<string, string> = {
       ...target.httpHeaders,
       "Accept-Encoding": "identity",
     };
-    // Consistent with Tier 3 serving (RFC 9110 §13.1.5): do not forward Range
-    // without validating If-Range; fall back to full representation instead.
-    const ifRange = req.headers.get("if-range");
-    const range = ifRange ? null : req.headers.get("range");
-    if (range) {
-      headers["Range"] = range;
+    if (outboundRange) {
+      headers["Range"] = outboundRange;
     }
     return await this.fetchRaw(target.url, {
       method: req.method,
@@ -883,13 +947,12 @@ export class VideoPlaybackRoute {
     fallbackMime: string,
     tier: number,
   ): Promise<Response> {
+    const outboundRange = getEffectiveOutboundRange(req);
     const headers: Record<string, string> = {
       ...extraHeaders,
       "Accept-Encoding": "identity",
     };
-    const ifRange = req.headers.get("if-range");
-    const range = ifRange ? null : req.headers.get("range");
-    if (range) headers["Range"] = range;
+    if (outboundRange) headers["Range"] = outboundRange;
 
     try {
       const upstream = await this.fetchRaw(upstreamUrl, {
@@ -900,14 +963,37 @@ export class VideoPlaybackRoute {
         publicIpv4Only: true,
         allowedHost: (h) => ALLOWED_GOOGLEVIDEO_HOST.test(h),
       });
+
+      if (upstream.status !== 200 && upstream.status !== 206 && upstream.status !== 416) {
+        await upstream.body?.cancel().catch(() => {});
+        return new Response(null, { status: upstream.status });
+      }
+
+      const validation = validateUpstreamSegmentResponse(outboundRange, upstream, 0);
+      if (!validation.ok) {
+        await upstream.body?.cancel().catch(() => {});
+        return new Response("Invalid upstream segment response", { status: 502 });
+      }
+
       const outHeaders = new Headers();
       outHeaders.set("Content-Type", upstream.headers.get("content-type") || fallbackMime);
       outHeaders.set("Accept-Ranges", upstream.headers.get("accept-ranges") || "bytes");
-      const cl = upstream.headers.get("content-length");
-      if (cl) outHeaders.set("Content-Length", cl);
       const cr = upstream.headers.get("content-range");
       if (cr) outHeaders.set("Content-Range", cr);
       outHeaders.set("X-SteadyTube-Tier", String(tier));
+
+      if (upstream.status === 416) {
+        await upstream.body?.cancel().catch(() => {});
+        outHeaders.set("Content-Length", "0");
+        return new Response(null, { status: 416, headers: outHeaders });
+      }
+
+      const cl = upstream.headers.get("content-length");
+      if (cl) {
+        outHeaders.set("Content-Length", cl);
+      } else if (upstream.status === 206 && validation.expectedBodyBytes !== null) {
+        outHeaders.set("Content-Length", String(validation.expectedBodyBytes));
+      }
 
       if (req.method === "HEAD" || !upstream.body) {
         return new Response(null, { status: upstream.status, headers: outHeaders });
@@ -921,6 +1007,7 @@ export class VideoPlaybackRoute {
           if (req.signal.aborted) return;
           this.logger.warn("Direct ?host= upstream stream stalled mid-chunk");
         },
+        validation.expectedBodyBytes,
       );
 
       return new Response(guardedBody, {

@@ -77,8 +77,10 @@ export class VideoRoutes {
       });
     }
 
-    const label = url.searchParams.get("label") || "";
-    const lang = url.searchParams.get("lang") || "";
+    const hasLabel = url.searchParams.has("label");
+    const hasLang = url.searchParams.has("lang");
+    const label = url.searchParams.get("label") ?? "";
+    const lang = url.searchParams.get("lang") ?? "";
 
     try {
       // Never trigger Tier 2 cookies or Tier 3 downloads just to read captions
@@ -91,9 +93,10 @@ export class VideoRoutes {
       }
 
       const track =
-        label || lang
-          ? captions.find((c) => label && c.label === label) ||
-            captions.find((c) => lang && c.languageCode === lang)
+        hasLabel || hasLang
+          ? captions.find(
+              (c) => (!hasLabel || c.label === label) && (!hasLang || c.languageCode === lang),
+            )
           : captions[0];
 
       if (!track) {
