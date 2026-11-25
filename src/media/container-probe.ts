@@ -311,6 +311,7 @@ export function hasValidGlobalMp4Sidx(filePath: string): boolean {
       return false;
     }
 
+    let fragIdx = 0;
     for (let i = 0; i < referenceCount; i++) {
       const entryOffset = entriesStart + i * 12;
       const refWord = view.getUint32(entryOffset, false);
@@ -320,14 +321,32 @@ export function hasValidGlobalMp4Sidx(filePath: string): boolean {
       const referencedSize = refWord & 0x7fffffff;
       const subsegmentDuration = view.getUint32(entryOffset + 4, false);
       if (referencedSize === 0 || subsegmentDuration === 0) return false;
-      if (!validBoundaries.has(cursor)) return false;
+      const refStart = cursor;
+      if (!validBoundaries.has(refStart)) return false;
       cursor += referencedSize;
       if (cursor > fileSize || !validBoundaries.has(cursor)) {
         return false;
       }
+      const refEnd = cursor;
+      // Every sidx reference MUST cover at least one complete media fragment (reject pure padding/free refs)
+      let coveredFrags = 0;
+      while (fragIdx < fragments.length) {
+        const f = fragments[fragIdx]!;
+        if (f.end <= refStart) {
+          fragIdx++;
+          continue;
+        }
+        if ((f.start >= refStart || f.moofStart >= refStart) && f.end <= refEnd) {
+          coveredFrags++;
+          fragIdx++;
+          continue;
+        }
+        break;
+      }
+      if (coveredFrags === 0) return false;
     }
 
-    return cursor === lastMediaBoxEnd;
+    return cursor === lastMediaBoxEnd && fragIdx === fragments.length;
   } catch {
     return false;
   } finally {
@@ -443,7 +462,63 @@ function parseSampleEntryCodec(buf: Uint8Array, view: DataView, stsdBodyStart: n
   }
 
   if (fourcc === "mp4a") {
-    return "mp4a.40.2";
+    // Parse exact MPEG-4 audioObjectType from `esds` (AudioSampleEntry fixed size = 36, or 52 for QT v1)
+    // instead of guessing AAC-LC ("mp4a.40.2") which would clobber HE-AAC ("mp4a.40.5").
+    const readDescLen = (pos: number, limit: number): { len: number; next: number } | null => {
+      let len = 0;
+      let i = 0;
+      while (i < 4 && pos + i < limit) {
+        const b = buf[pos + i]!;
+        len = (len << 7) | (b & 0x7f);
+        i++;
+        if ((b & 0x80) === 0) return { len, next: pos + i };
+      }
+      return null;
+    };
+    const esds =
+      (entryStart + 36 < entry.end ? findChildBox(buf, view, entryStart + 36, entry.end, "esds") : null) ||
+      (entryStart + 52 < entry.end ? findChildBox(buf, view, entryStart + 52, entry.end, "esds") : null);
+    if (esds && esds.bodyStart + 8 <= esds.end) {
+      let pos = esds.bodyStart + 4; // skip FullBox version(1) + flags(3)
+      const limit = esds.end;
+      if (pos < limit && buf[pos] === 0x03) {
+        const esLen = readDescLen(pos + 1, limit);
+        if (esLen) {
+          pos = esLen.next;
+          if (pos + 3 <= limit) {
+            const flags = buf[pos + 2]!;
+            pos += 3; // ES_ID(2) + flags(1)
+            if (flags & 0x80) pos += 2;
+            if (flags & 0x40 && pos < limit) pos += 1 + buf[pos]!;
+            if (flags & 0x20) pos += 2;
+          }
+        }
+      }
+      if (pos < limit && buf[pos] === 0x04) {
+        const dcLen = readDescLen(pos + 1, limit);
+        if (dcLen && dcLen.next + 13 <= limit) {
+          const objectTypeIndication = buf[dcLen.next]!;
+          pos = dcLen.next + 13;
+          if (objectTypeIndication === 0x40) {
+            if (pos < limit && buf[pos] === 0x05) {
+              const dsiLen = readDescLen(pos + 1, limit);
+              if (dsiLen && dsiLen.next < limit) {
+                let aot = (buf[dsiLen.next]! >> 3) & 0x1f;
+                if (aot === 31 && dsiLen.next + 1 < limit) {
+                  aot = 32 + (((buf[dsiLen.next]! & 0x07) << 3) | ((buf[dsiLen.next + 1]! >> 5) & 0x07));
+                }
+                if (aot > 0) return `mp4a.40.${aot}`;
+              }
+            }
+            return undefined;
+          }
+          if (objectTypeIndication > 0) {
+            return `mp4a.${hex2(objectTypeIndication)}`;
+          }
+        }
+      }
+    }
+    return undefined;
   }
   if (fourcc === "Opus") {
     return "opus";
@@ -921,6 +996,32 @@ async function readBoundedBytes(res: Response, maxBytes: number): Promise<Uint8A
   return out;
 }
 
+function hasDisallowedContentEncoding(res: Response): boolean {
+  const ce = (res.headers.get("content-encoding") || "").trim().toLowerCase();
+  return ce.length > 0 && ce !== "identity";
+}
+
+function parseStrictPartialContentRange(
+  header: string | null,
+): { start: number; end: number; total: number | null } | null {
+  if (!header) return null;
+  const m = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(header.trim());
+  if (!m) return null;
+  const start = Number(m[1]);
+  const end = Number(m[2]);
+  const total = m[3] === "*" ? null : Number(m[3]);
+  if (
+    !Number.isFinite(start) ||
+    !Number.isFinite(end) ||
+    start < 0 ||
+    end < start ||
+    (total !== null && (!Number.isFinite(total) || end >= total))
+  ) {
+    return null;
+  }
+  return { start, end, total };
+}
+
 /**
  * Probe DASH init/index byte ranges from an upstream HTTP(S) URL over IPv4
  * using a strictly bounded byte-range GET (bytes=0-16383).
@@ -948,21 +1049,32 @@ export async function probeRemoteDashRanges(
     allowedHost: (h) => ALLOWED_GOOGLEVIDEO_HOST.test(h),
   });
 
-  // Only parse partial responses (or bounded byte 0 prefix); always cancel unread body on errors
-  if (res.status !== 206 && res.status !== 200) {
+  // Only parse partial responses (or bounded byte 0 prefix); reject compressed raw bodies
+  if ((res.status !== 206 && res.status !== 200) || hasDisallowedContentEncoding(res)) {
     await res.body?.cancel().catch(() => {});
     return null;
   }
+  let validPrefixEnd: number | null = null;
   if (res.status === 206) {
-    const cr = res.headers.get("content-range") || "";
-    if (!cr || !cr.startsWith("bytes 0-")) {
+    const cr = parseStrictPartialContentRange(res.headers.get("content-range"));
+    if (!cr || cr.start !== 0) {
       await res.body?.cancel().catch(() => {});
       return null;
     }
+    const cl = res.headers.get("content-length");
+    const expectedLen = cr.end - cr.start + 1;
+    if (cl !== null && (!/^\d+$/.test(cl.trim()) || Number(cl.trim()) !== expectedLen)) {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
+    validPrefixEnd = cr.end;
   }
 
   const buf = await readBoundedBytes(res, MAX_HEADER_PROBE);
   if (buf.byteLength < 16) return null;
+  if (validPrefixEnd !== null && buf.byteLength !== Math.min(MAX_HEADER_PROBE, validPrefixEnd + 1)) {
+    return null;
+  }
 
   const attachHashes = (ranges: DashByteRanges | null): DashByteRanges | null => {
     if (!ranges) return null;
@@ -992,11 +1104,17 @@ export async function probeRemoteDashRanges(
         publicIpv4Only: true,
         allowedHost: (h) => ALLOWED_GOOGLEVIDEO_HOST.test(h),
       });
-      if (cuesRes.status === 206) {
-        const cr = cuesRes.headers.get("content-range") || "";
-        if (cr && cr.startsWith(`bytes ${parsed.cuesOffset}-`)) {
+      if (cuesRes.status === 206 && !hasDisallowedContentEncoding(cuesRes)) {
+        const cr = parseStrictPartialContentRange(cuesRes.headers.get("content-range"));
+        const rawCl = cuesRes.headers.get("content-length");
+        const expectedLen = cr ? cr.end - cr.start + 1 : 0;
+        const clOk = rawCl === null || (/^\d+$/.test(rawCl.trim()) && Number(rawCl.trim()) === expectedLen);
+        if (cr && cr.start === parsed.cuesOffset && clOk) {
           const hdrBuf = await readBoundedBytes(cuesRes, 32);
-          return attachHashes(parseCuesElementHeaderAt(hdrBuf, parsed.cuesOffset, parsed.initEnd));
+          if (hdrBuf.byteLength === Math.min(32, expectedLen)) {
+            return attachHashes(parseCuesElementHeaderAt(hdrBuf, parsed.cuesOffset, parsed.initEnd));
+          }
+          return null;
         }
       }
       await cuesRes.body?.cancel().catch(() => {});
@@ -1040,20 +1158,24 @@ export async function verifyRemoteDashRangeDigests(
       publicIpv4Only: true,
       allowedHost: (h) => ALLOWED_GOOGLEVIDEO_HOST.test(h),
     });
-    if (res.status !== 206) {
+    if (res.status !== 206 || hasDisallowedContentEncoding(res)) {
       await res.body?.cancel().catch(() => {});
       return null;
     }
-    const cr = (res.headers.get("content-range") || "").trim();
-    const crMatch = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(cr);
-    if (!crMatch || Number(crMatch[1]) !== start || Number(crMatch[2]) !== end) {
+    const parsedCr = parseStrictPartialContentRange(res.headers.get("content-range"));
+    if (!parsedCr || parsedCr.start !== start || parsedCr.end !== end) {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
+    const rawCl = res.headers.get("content-length");
+    if (rawCl !== null && (!/^\d+$/.test(rawCl.trim()) || Number(rawCl.trim()) !== len)) {
       await res.body?.cancel().catch(() => {});
       return null;
     }
     if (
       expected.expectedTotal &&
       expected.expectedTotal > 0 &&
-      (crMatch[3] === "*" || Number(crMatch[3]) !== expected.expectedTotal)
+      (parsedCr.total === null || parsedCr.total !== expected.expectedTotal)
     ) {
       await res.body?.cancel().catch(() => {});
       return null;

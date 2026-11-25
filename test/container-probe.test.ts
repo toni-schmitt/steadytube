@@ -293,6 +293,22 @@ describe("container-probe", () => {
       );
       expect(hasValidGlobalMp4Sidx(noMdatPath)).toBe(false);
 
+      // Middle sidx reference covering only a `free` padding box (no media fragment) -> MUST be rejected!
+      const freePad = makeMp4Box("free", 32);
+      const freeRefPath = path.join(tmpDir, "free-ref.mp4");
+      fs.writeFileSync(
+        freeRefPath,
+        concatBytes(
+          ftyp,
+          moov,
+          makeSidxBox([frag1.byteLength, freePad.byteLength, frag2.byteLength]),
+          frag1,
+          freePad,
+          frag2,
+        ),
+      );
+      expect(hasValidGlobalMp4Sidx(freeRefPath)).toBe(false);
+
       // Real FFmpeg verification if ffmpeg is installed locally
       const ffmpegBin =
         Bun.which("ffmpeg") ||
@@ -514,5 +530,178 @@ describe("container-probe", () => {
       serveSlice(payload, "999"),
     );
     expect(badTotal).toBeNull();
+
+    // Non-identity Content-Encoding on 206 -> MUST reject!
+    const compressed = await verifyRemoteDashRangeDigests(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+      {
+        initRange: { start: 0, end: 99 },
+        initHash: expectedInitHash,
+        expectedTotal: 300,
+      },
+      async () =>
+        new Response(initSlice, {
+          status: 206,
+          headers: {
+            "Content-Range": "bytes 0-99/300",
+            "Content-Encoding": "gzip",
+          },
+        }),
+    );
+    expect(compressed).toBeNull();
+
+    // Out-of-bounds Content-Range (end >= total) or mismatched Content-Length -> MUST reject!
+    const badBounds = await verifyRemoteDashRangeDigests(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+      {
+        initRange: { start: 0, end: 99 },
+        initHash: expectedInitHash,
+      },
+      async () =>
+        new Response(initSlice, {
+          status: 206,
+          headers: { "Content-Range": "bytes 0-99/100" },
+        }),
+    );
+    expect(badBounds).toEqual({ initHash: expectedInitHash, indexHash: undefined });
+
+    const endEqTotal = await verifyRemoteDashRangeDigests(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+      {
+        initRange: { start: 0, end: 99 },
+        initHash: expectedInitHash,
+      },
+      async () =>
+        new Response(initSlice, {
+          status: 206,
+          headers: { "Content-Range": "bytes 0-99/99" },
+        }),
+    );
+    expect(endEqTotal).toBeNull();
+
+    const badCl = await verifyRemoteDashRangeDigests(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+      {
+        initRange: { start: 0, end: 99 },
+        initHash: expectedInitHash,
+      },
+      async () =>
+        new Response(initSlice, {
+          status: 206,
+          headers: {
+            "Content-Range": "bytes 0-99/300",
+            "Content-Length": "99",
+          },
+        }),
+    );
+    expect(badCl).toBeNull();
+
+    // probeRemoteDashRanges also rejects gzip Content-Encoding and mismatched Content-Length
+    const mp4Prefix = concatBytes(makeMp4Box("ftyp", 20), makeMp4Box("moov", 200), makeMp4Box("sidx", 60));
+    const gzipProbe = await probeRemoteDashRanges(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+      "video/mp4",
+      async () =>
+        new Response(mp4Prefix, {
+          status: 206,
+          headers: {
+            "Content-Range": `bytes 0-${mp4Prefix.byteLength - 1}/2000`,
+            "Content-Encoding": "gzip",
+          },
+        }),
+    );
+    expect(gzipProbe).toBeNull();
+
+    const badClProbe = await probeRemoteDashRanges(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+      "video/mp4",
+      async () =>
+        new Response(mp4Prefix, {
+          status: 206,
+          headers: {
+            "Content-Range": `bytes 0-${mp4Prefix.byteLength - 1}/2000`,
+            "Content-Length": String(mp4Prefix.byteLength + 10),
+          },
+        }),
+    );
+    expect(badClProbe).toBeNull();
+  });
+
+  test("probeMp4TrackMetadata parses real mp4a esds objectType/AOT and does not guess mp4a.40.2 without esds", () => {
+    const makeContainerBox = (type: string, ...children: Uint8Array[]): Uint8Array => {
+      const payload = concatBytes(...children);
+      const out = new Uint8Array(8 + payload.byteLength);
+      new DataView(out.buffer).setUint32(0, out.byteLength, false);
+      for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+      out.set(payload, 8);
+      return out;
+    };
+
+    const makeMvhd = (timescale: number, duration: number): Uint8Array => {
+      const body = new Uint8Array(100);
+      const v = new DataView(body.buffer);
+      v.setUint32(12, timescale, false);
+      v.setUint32(16, duration, false);
+      return makeContainerBox("mvhd", body);
+    };
+
+    const makeHdlr = (handler: string): Uint8Array => {
+      const body = new Uint8Array(24);
+      for (let i = 0; i < 4; i++) body[8 + i] = handler.charCodeAt(i);
+      return makeContainerBox("hdlr", body);
+    };
+
+    const makeEsds = (objectTypeIndication: number, audioObjectType: number): Uint8Array => {
+      // FullBox header (4) + ES_Descriptor (0x03) + DecoderConfigDescriptor (0x04) + DecSpecificInfo (0x05)
+      const dsi = new Uint8Array([0x05, 0x02, (audioObjectType & 0x1f) << 3, 0x00]);
+      const dcHeader = new Uint8Array(13);
+      dcHeader[0] = objectTypeIndication;
+      const dc = concatBytes(new Uint8Array([0x04, dcHeader.byteLength + dsi.byteLength]), dcHeader, dsi);
+      const esHeader = new Uint8Array([0x00, 0x01, 0x00]); // ES_ID=1, flags=0
+      const es = concatBytes(new Uint8Array([0x03, esHeader.byteLength + dc.byteLength]), esHeader, dc);
+      return makeContainerBox("esds", new Uint8Array(4), es);
+    };
+
+    const makeAudioMp4 = (esdsBox?: Uint8Array): Uint8Array => {
+      // AudioSampleEntry fixed body = 28 bytes (36 bytes including 8-byte box header)
+      const mp4aBody = esdsBox ? concatBytes(new Uint8Array(28), esdsBox) : new Uint8Array(28);
+      const mp4a = makeContainerBox("mp4a", mp4aBody);
+      const stsdHdr = new Uint8Array(8);
+      new DataView(stsdHdr.buffer).setUint32(4, 1, false); // entry_count = 1
+      const stsd = makeContainerBox("stsd", stsdHdr, mp4a);
+      const stbl = makeContainerBox("stbl", stsd);
+      const minf = makeContainerBox("minf", stbl);
+      const mdia = makeContainerBox("mdia", makeHdlr("soun"), minf);
+      const trak = makeContainerBox("trak", mdia);
+      const moov = makeContainerBox("moov", makeMvhd(1000, 12_500), trak);
+      return concatBytes(makeMp4Box("ftyp", 16), moov);
+    };
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-esds-"));
+    try {
+      // HE-AAC (objectTypeIndication=0x40, audioObjectType=5) -> mp4a.40.5
+      const heAacPath = path.join(tmpDir, "he-aac.m4a");
+      fs.writeFileSync(heAacPath, makeAudioMp4(makeEsds(0x40, 5)));
+      const heMeta = probeMp4TrackMetadata(heAacPath);
+      expect(heMeta).not.toBeNull();
+      expect(heMeta!.isAudio).toBe(true);
+      expect(heMeta!.codec).toBe("mp4a.40.5");
+      expect(heMeta!.durationSec).toBe(12.5);
+
+      // AAC-LC (objectTypeIndication=0x40, audioObjectType=2) -> mp4a.40.2
+      const aacLcPath = path.join(tmpDir, "aac-lc.m4a");
+      fs.writeFileSync(aacLcPath, makeAudioMp4(makeEsds(0x40, 2)));
+      expect(probeMp4TrackMetadata(aacLcPath)!.codec).toBe("mp4a.40.2");
+
+      // Missing esds -> codec MUST be undefined (never blindly guessed as mp4a.40.2)
+      const noEsdsPath = path.join(tmpDir, "no-esds.m4a");
+      fs.writeFileSync(noEsdsPath, makeAudioMp4());
+      const noEsdsMeta = probeMp4TrackMetadata(noEsdsPath);
+      expect(noEsdsMeta).not.toBeNull();
+      expect(noEsdsMeta!.codec).toBeUndefined();
+      expect(noEsdsMeta!.durationSec).toBe(12.5);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

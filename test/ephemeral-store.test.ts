@@ -453,8 +453,10 @@ describe("EphemeralStore & HTTP Range parsing", () => {
       const recovered = store2.get("vidA", "251-en.4");
       expect(recovered).not.toBeNull();
       expect(recovered!.filePath).toBe(p1);
+      expect(recovered!.mimeType).toBe("audio/webm");
       expect(recovered!.meta).toEqual({
         formatId: "251-en.4",
+        mimeType: "audio/webm",
         layout: "0-99_100-199",
         rev: "1700000000",
         xtags: "acont=original:lang=en",
@@ -641,6 +643,132 @@ describe("EphemeralStore & HTTP Range parsing", () => {
       expect(oobRes.status).toBe(416);
       expect(oobRes.headers.get("content-range")).toBe("bytes */100");
       expect(oobRes.headers.get("content-length")).toBe("0");
+
+      // Leading-zero suffix must strip leading zeros before digit-length saturation
+      expect(parseHttpRangeHeader("bytes=-00000000000000000001", 100)).toEqual({
+        start: 99,
+        end: 99,
+        isPartial: true,
+      });
+      const lzRes = store.serveFile(
+        entry,
+        new Request("http://127.0.0.1/videoplayback", {
+          headers: { Range: "bytes=-00000000000000000001" },
+        }),
+      );
+      expect(lzRes.status).toBe(206);
+      expect(lzRes.headers.get("content-range")).toBe("bytes 99-99/100");
+      expect((await lzRes.arrayBuffer()).byteLength).toBe(1);
+      store.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("standby takeover rescans files written by primary and terminal shutdown blocks lock reacquisition", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-takeover-"));
+    try {
+      const primary = new EphemeralStore(tmpDir, 2000, 60_000);
+      expect(primary.hasExclusiveLock()).toBe(true);
+
+      // Start standby while primary owns lock; arm periodic cleanup on standby too
+      const standby = new EphemeralStore(tmpDir, 2000, 60_000);
+      standby.startPeriodicCleanup(60_000);
+      expect(standby.hasExclusiveLock()).toBe(false);
+
+      // Primary writes an entry AFTER standby finished its initial startup scan
+      const p1 = primary.getPathFor("vidAfterStart", "251", "webm");
+      fs.writeFileSync(p1, new Uint8Array(1500).fill(5));
+      primary.register("vidAfterStart", "251", p1, "audio/webm");
+
+      // Standby cannot take over while primary still holds lock
+      expect(standby.reserveBytes("vidOther:137", 400)).toBe(false);
+
+      // Primary closes cleanly -> standby takes over on next write, rescans disk inventory,
+      // sees the 1500-byte entry (with persisted audio/webm MIME!), and evicts it when reserving 1000
+      primary.close();
+      expect(standby.getAvailableBudgetFor("vidOther:137")).toBe(2000);
+      expect(standby.hasExclusiveLock()).toBe(true);
+      const discovered = standby.get("vidAfterStart", "251");
+      expect(discovered).not.toBeNull();
+      expect(discovered!.mimeType).toBe("audio/webm");
+      expect(standby.getStats().totalBytes).toBe(1500);
+
+      // Reserve 1000 bytes -> standby knows about the 1500-byte entry and evicts it to stay under 2000 cap
+      expect(standby.reserveBytes("vidOther:137", 1000)).toBe(true);
+      expect(fs.existsSync(p1)).toBe(false);
+      standby.releaseReservation("vidOther:137");
+
+      // beginShutdown() blocks new reservations/registrations while keeping the lock held until close()
+      standby.beginShutdown();
+      expect(standby.isClosed()).toBe(true);
+      expect(standby.hasExclusiveLock()).toBe(false);
+      expect(standby.reserveBytes("vidAfterClose:137", 100)).toBe(false);
+      expect(standby.getAvailableBudgetFor("vidAfterClose:137")).toBe(0);
+      // Lockfile is STILL held during drain so another store cannot stomp staging files yet
+      const contester = new EphemeralStore(tmpDir, 2000, 60_000);
+      expect(contester.hasExclusiveLock()).toBe(false);
+      contester.close();
+
+      // Once standby calls close(), lockfile is released and a fresh store can take ownership
+      standby.close();
+      const fresh = new EphemeralStore(tmpDir, 2000, 60_000);
+      expect(fresh.hasExclusiveLock()).toBe(true);
+      fresh.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("stale lockfile reclamation rejects live PIDs and takes over dead PIDs cleanly via atomic link", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-lock-stale-"));
+    try {
+      const lockPath = path.join(tmpDir, ".steadytube.lock");
+      // Write a dead-PID lockfile (PID 99999999 is non-existent)
+      fs.writeFileSync(lockPath, JSON.stringify({ pid: 99999999, lockId: "dead-owner", ts: 1 }));
+      const store = new EphemeralStore(tmpDir, 10_000, 60_000);
+      expect(store.hasExclusiveLock()).toBe(true);
+      const lockBody = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { pid: number; lockId: string };
+      expect(lockBody.pid).toBe(process.pid);
+      expect(lockBody.lockId).not.toBe("dead-owner");
+      store.close();
+      expect(fs.existsSync(lockPath)).toBe(false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("failed unlink keeps disk bytes accounted until subsequent cleanup removes the file", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-unlink-fail-"));
+    try {
+      const store = new EphemeralStore(tmpDir, 2000, 60_000);
+      const p1 = store.getPathFor("vidLocked", "137", "mp4");
+      fs.writeFileSync(p1, new Uint8Array(1200).fill(9));
+      store.register("vidLocked", "137", p1, "video/mp4");
+
+      // Make parent dir read-only so unlinkSync fails with EACCES
+      const vidDir = path.dirname(p1);
+      fs.chmodSync(vidDir, 0o555);
+      try {
+        store.delete("vidLocked", "137");
+        // Entry is gone from lookup, but file still exists on disk and bytes remain accounted!
+        expect(store.get("vidLocked", "137")).toBeNull();
+        expect(fs.existsSync(p1)).toBe(true);
+        expect(store.getStats().totalBytes).toBe(1200);
+        expect(store.getAvailableBudgetFor("vidOther:137")).toBe(800);
+        expect(store.reserveBytes("vidOther:137", 1000)).toBe(false);
+      } finally {
+        fs.chmodSync(vidDir, 0o755);
+      }
+
+      // Once directory is writable again, cleanup retries the failed unlink and reclaims budget!
+      const cleaned = store.cleanup();
+      expect(cleaned.removedCount).toBe(1);
+      expect(cleaned.freedBytes).toBe(1200);
+      expect(fs.existsSync(p1)).toBe(false);
+      expect(store.getStats().totalBytes).toBe(0);
+      expect(store.reserveBytes("vidOther:137", 1500)).toBe(true);
+      store.releaseReservation("vidOther:137");
       store.close();
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });

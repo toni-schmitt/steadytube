@@ -7,10 +7,14 @@ import { noopLogger } from "../logger.ts";
 export interface EphemeralEntryMeta {
   /** Logical client formatId (e.g. "137" or "tier3-v-137") */
   formatId?: string;
+  /** Exact MIME type persisted across restarts (prevents .webm audio -> video/webm fallback) */
+  mimeType?: string;
   /** Authoritative DASH layout key ("<init>_<index>") */
   layout?: string | null;
   /** Authoritative representation revision (lmt or init/index digest) */
   rev?: string | null;
+  /** Upstream source revision (lmt) bound to cold Tier 3 cached tracks */
+  sourceRev?: string | null;
   /** Audio/variant xtags if present */
   xtags?: string | null;
   initHash?: string;
@@ -119,10 +123,11 @@ export function parseHttpRangeHeader(
   let end: number;
 
   if (rawStart === "") {
-    // Reject "-0", but saturate huge positive decimal suffixes (e.g. 400 digits) to totalSize
-    // instead of overflowing to Infinity and returning 416 for a valid suffix covering the whole file.
-    if (/^0+$/.test(rawEnd!)) return "unsatisfiable";
-    const suffixLen = rawEnd!.length > 15 ? totalSize : Number(rawEnd);
+    // Strip leading zeroes BEFORE checking digit length so `bytes=-0000000000000001`
+    // resolves to 1 byte rather than saturating, while huge positive suffixes still saturate.
+    const trimmedDigits = rawEnd!.replace(/^0+/, "");
+    if (trimmedDigits === "") return "unsatisfiable";
+    const suffixLen = trimmedDigits.length > 15 ? totalSize : Number(trimmedDigits);
     if (!Number.isFinite(suffixLen) || suffixLen <= 0) return "unsatisfiable";
     start = Math.max(0, totalSize - suffixLen);
     end = totalSize - 1;
@@ -196,24 +201,27 @@ function writeMetaSidecar(filePath: string, meta?: EphemeralEntryMeta): void {
   }
 }
 
-function unlinkWithMetaSidecar(filePath: string): void {
+function unlinkWithMetaSidecar(filePath: string): boolean {
+  let mediaRemoved = true;
   try {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   } catch {
-    // Ignore
+    mediaRemoved = !fs.existsSync(filePath);
   }
   const metaPath = getMetaSidecarPath(filePath);
   try {
     if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
   } catch {
-    // Ignore
+    // Ignore sidecar unlink errors
   }
+  return mediaRemoved && !fs.existsSync(filePath);
 }
 
 export class EphemeralStore {
   private readonly resolvedBaseDir: string;
   private readonly entries = new Map<string, EphemeralFileEntry>();
   private readonly retiredEntriesByKey = new Map<string, EphemeralFileEntry[]>();
+  private readonly failedUnlinkEntries = new Map<string, EphemeralFileEntry>();
   private readonly retiredPaths = new Set<string>();
   private readonly pinnedCounts = new Map<string, number>();
   private readonly reservedBytesByKey = new Map<string, number>();
@@ -221,6 +229,8 @@ export class EphemeralStore {
   private readonly lockId = `${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
   private ownsCleanupLock = false;
   private initialized = false;
+  private closed = false;
+  private periodicCleanupIntervalMs: number | null = null;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -238,17 +248,22 @@ export class EphemeralStore {
   }
 
   hasExclusiveLock(): boolean {
-    return this.ownsCleanupLock;
+    return this.ownsCleanupLock && !this.closed;
+  }
+
+  isClosed(): boolean {
+    return this.closed;
   }
 
   initialize(): void {
-    if (this.initialized) return;
+    if (this.initialized || this.closed) return;
     this.initialized = true;
     this.scanExistingFiles();
   }
 
   startPeriodicCleanup(intervalMs = 5 * 60 * 1000): void {
-    if (this.cleanupTimer) return;
+    this.periodicCleanupIntervalMs = intervalMs;
+    if (this.cleanupTimer || this.closed) return;
     this.cleanupTimer = setInterval(() => {
       this.cleanup();
     }, intervalMs);
@@ -262,12 +277,24 @@ export class EphemeralStore {
     }
   }
 
+  /**
+   * Mark shutdown in progress: blocks all new lock acquisitions, reservations,
+   * and registrations immediately while keeping the current lock held until
+   * active disk jobs finish draining, after which `close()` releases the lock.
+   */
+  beginShutdown(): void {
+    this.closed = true;
+    this.stopPeriodicCleanup();
+  }
+
   close(): void {
+    this.closed = true;
     this.stopPeriodicCleanup();
     this.releaseCleanupLock();
   }
 
-  private tryAcquireCleanupLock(): boolean {
+  private tryAcquireCleanupLock(isInitialScan = false): boolean {
+    if (this.closed) return false;
     if (this.ownsCleanupLock) return true;
     const existingToken = activeStoreLocks.get(this.resolvedBaseDir);
     if (existingToken && existingToken !== this.lockToken) {
@@ -275,78 +302,134 @@ export class EphemeralStore {
     }
 
     const lockPath = path.join(this.resolvedBaseDir, LOCK_FILENAME);
+    const reclaimDir = `${lockPath}.reclaim`;
+    const tmpPath = `${lockPath}.tmp-${this.lockId}`;
     const payload = JSON.stringify({ pid: process.pid, lockId: this.lockId, ts: Date.now() });
 
-    for (let attempt = 0; attempt < 2; attempt++) {
+    const isLockFileStale = (): boolean => {
       try {
-        const fd = fs.openSync(lockPath, "wx");
-        try {
-          fs.writeFileSync(fd, payload);
-        } finally {
-          fs.closeSync(fd);
-        }
-        // Verify we still own the on-disk lock file before recording ownership
-        const verified = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { lockId?: string };
-        if (verified.lockId === this.lockId) {
-          activeStoreLocks.set(this.resolvedBaseDir, this.lockToken);
-          this.ownsCleanupLock = true;
+        const raw = fs.readFileSync(lockPath, "utf8");
+        const parsed = JSON.parse(raw) as { pid?: number; lockId?: string };
+        if (typeof parsed.pid === "number" && parsed.pid > 0) {
+          if (parsed.pid !== process.pid && isPidAlive(parsed.pid)) {
+            return false;
+          }
+          if (parsed.pid === process.pid && activeStoreLocks.has(this.resolvedBaseDir)) {
+            return false;
+          }
           return true;
         }
+      } catch {
+        // Fall through to mtime age check below
+      }
+      // Corrupt, partial, or missing-pid lock file: only treat as stale if aged >2s so we never
+      // displace a freshly-created legacy lockfile mid-write.
+      try {
+        const st = fs.statSync(lockPath);
+        return Date.now() - st.mtimeMs > 2000;
+      } catch {
         return false;
+      }
+    };
+
+    const claimOwnership = (): boolean => {
+      try {
+        const verified = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { lockId?: string };
+        if (verified.lockId !== this.lockId) return false;
+      } catch {
+        return false;
+      }
+      activeStoreLocks.set(this.resolvedBaseDir, this.lockToken);
+      this.ownsCleanupLock = true;
+      // Standby takeover after startup: rebuild disk inventory under the newly acquired lock
+      // and ensure periodic cleanup is running BEFORE admitting any new writes.
+      if (!isInitialScan && this.initialized) {
+        this.rescanExistingFilesUnderLock();
+        if (this.periodicCleanupIntervalMs !== null && !this.cleanupTimer && !this.closed) {
+          this.startPeriodicCleanup(this.periodicCleanupIntervalMs);
+        }
+      }
+      return true;
+    };
+
+    try {
+      // Write full JSON payload into a private temp file FIRST so `lockPath` NEVER appears
+      // empty to contenders; `linkSync` atomically publishes the complete file or fails EEXIST.
+      const fd = fs.openSync(tmpPath, "wx");
+      try {
+        fs.writeFileSync(fd, payload);
+      } finally {
+        fs.closeSync(fd);
+      }
+
+      try {
+        fs.linkSync(tmpPath, lockPath);
+        return claimOwnership();
       } catch (err) {
         if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") {
           return false;
         }
-        let staleLockId: string | undefined;
-        try {
-          const raw = fs.readFileSync(lockPath, "utf8");
-          const parsed = JSON.parse(raw) as { pid?: number; lockId?: string };
-          staleLockId = parsed.lockId;
-          if (typeof parsed.pid === "number" && parsed.pid > 0) {
-            if (parsed.pid !== process.pid && isPidAlive(parsed.pid)) {
-              return false;
-            }
-            if (parsed.pid === process.pid && activeStoreLocks.has(this.resolvedBaseDir)) {
-              return false;
-            }
-          }
-        } catch {
-          // Corrupt or unreadable lock file from crashed process -> treat as stale
-        }
-        // Move the stale lock aside before unlinking so we cannot unlink a brand-new lock
-        // created concurrently by another process after our read.
-        const staleTmp = `${lockPath}.stale-${this.lockId}`;
-        try {
-          fs.renameSync(lockPath, staleTmp);
+      }
+
+      if (!isLockFileStale()) {
+        return false;
+      }
+
+      // Serialize stale-lock reclaim via atomic `mkdirSync(reclaimDir)` so two contenders
+      // can NEVER race on unlinking and replacing a newly-published live owner's lock.
+      let holdsReclaim = false;
+      try {
+        fs.mkdirSync(reclaimDir);
+        holdsReclaim = true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "EEXIST") {
+          // Clean up an abandoned reclaim dir left behind by a crashed reclaimer (>10s old)
           try {
-            const movedRaw = fs.readFileSync(staleTmp, "utf8");
-            const movedParsed = JSON.parse(movedRaw) as { pid?: number; lockId?: string };
-            if (
-              staleLockId &&
-              movedParsed.lockId &&
-              movedParsed.lockId !== staleLockId &&
-              typeof movedParsed.pid === "number" &&
-              isPidAlive(movedParsed.pid)
-            ) {
-              // Raced with a live contender -> restore best-effort and bail
-              try {
-                fs.linkSync(staleTmp, lockPath);
-              } catch {
-                // Another contender already created lockPath
-              }
-              fs.unlinkSync(staleTmp);
-              return false;
+            const st = fs.statSync(reclaimDir);
+            if (Date.now() - st.mtimeMs > 10_000) {
+              fs.rmdirSync(reclaimDir);
+              fs.mkdirSync(reclaimDir);
+              holdsReclaim = true;
             }
           } catch {
-            // Unparseable stale lock
+            return false;
           }
-          fs.unlinkSync(staleTmp);
+        }
+      }
+      if (!holdsReclaim) return false;
+
+      try {
+        // Re-check staleness INSIDE the serialized reclaim guard before unlinking
+        if (fs.existsSync(lockPath) && !isLockFileStale()) {
+          return false;
+        }
+        try {
+          if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
         } catch {
           return false;
         }
+        try {
+          fs.linkSync(tmpPath, lockPath);
+        } catch {
+          return false;
+        }
+        return claimOwnership();
+      } finally {
+        try {
+          fs.rmdirSync(reclaimDir);
+        } catch {
+          // Ignore
+        }
+      }
+    } catch {
+      return false;
+    } finally {
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {
+        // Ignore
       }
     }
-    return false;
   }
 
   private releaseCleanupLock(): void {
@@ -409,7 +492,9 @@ export class EphemeralStore {
           this.retiredPaths.delete(entry.filePath);
           if (liveEntry && liveEntry.filePath === entry.filePath) continue;
           if (this.ownsCleanupLock) {
-            unlinkWithMetaSidecar(entry.filePath);
+            if (!unlinkWithMetaSidecar(entry.filePath)) {
+              this.failedUnlinkEntries.set(entry.filePath, entry);
+            }
           }
         }
         if (this.ownsCleanupLock) {
@@ -447,6 +532,9 @@ export class EphemeralStore {
         sum += entry.size;
       }
     }
+    for (const entry of this.failedUnlinkEntries.values()) {
+      sum += entry.size;
+    }
     return sum;
   }
 
@@ -458,6 +546,7 @@ export class EphemeralStore {
    * evict or over-subscribe the primary daemon's cache.
    */
   reserveBytes(key: string, bytes: number): boolean {
+    if (this.closed) return false;
     if (!this.ownsCleanupLock && !this.tryAcquireCleanupLock()) {
       return false;
     }
@@ -513,6 +602,7 @@ export class EphemeralStore {
    * entries, retired pinned entries, and other active reservations.
    */
   getAvailableBudgetFor(key: string): number {
+    if (this.closed) return 0;
     if (!this.ownsCleanupLock && !this.tryAcquireCleanupLock()) {
       return 0;
     }
@@ -534,6 +624,9 @@ export class EphemeralStore {
     mimeType: string,
     meta?: EphemeralEntryMeta,
   ): EphemeralFileEntry {
+    if (this.closed) {
+      throw new Error("EphemeralStore is closed");
+    }
     const safePath = this.assertContainedPath(filePath);
     if (this.retiredPaths.has(safePath)) {
       throw new Error(`Refusing to re-register retired cache path: ${safePath}`);
@@ -553,9 +646,11 @@ export class EphemeralStore {
         this.removeEntry(key, prev);
       }
     }
-    const mergedMeta: EphemeralEntryMeta | undefined = meta
-      ? { formatId, ...meta }
-      : undefined;
+    const mergedMeta: EphemeralEntryMeta = {
+      formatId,
+      mimeType,
+      ...(meta ?? {}),
+    };
     if (this.ownsCleanupLock) {
       writeMetaSidecar(safePath, mergedMeta);
     }
@@ -568,6 +663,7 @@ export class EphemeralStore {
       lastAccessedAt: now,
       meta: mergedMeta,
     };
+    this.failedUnlinkEntries.delete(safePath);
     this.entries.set(key, entry);
     this.cleanup();
     return entry;
@@ -1078,18 +1174,30 @@ export class EphemeralStore {
 
   cleanup(extraReservedBytes = this.getReservedBytes()): { removedCount: number; freedBytes: number } {
     // Never evict or unlink files from disk unless this instance owns the exclusive cacheDir lock.
-    if (!this.ownsCleanupLock) {
+    if (!this.ownsCleanupLock || this.closed) {
       return { removedCount: 0, freedBytes: 0 };
     }
     const now = Date.now();
     let removedCount = 0;
     let freedBytes = 0;
 
+    // First retry any previously failed unlinks so stuck files stay accounted until actually removed
+    for (const [failedPath, failedEntry] of [...this.failedUnlinkEntries]) {
+      if (unlinkWithMetaSidecar(failedPath)) {
+        this.failedUnlinkEntries.delete(failedPath);
+        freedBytes += failedEntry.size;
+        removedCount++;
+      }
+    }
+
     for (const [key, entry] of this.entries) {
       if (this.isPinned(key)) continue;
       if (now - entry.lastAccessedAt >= this.ttlMs) {
-        freedBytes += this.removeEntry(key, entry);
-        removedCount++;
+        const freed = this.removeEntry(key, entry);
+        if (freed > 0) {
+          freedBytes += freed;
+          removedCount++;
+        }
       }
     }
 
@@ -1107,9 +1215,11 @@ export class EphemeralStore {
         if (totalBytes <= effectiveCap) break;
         if (this.isPinned(entry.key)) continue;
         const freed = this.removeEntry(entry.key, entry);
-        totalBytes -= freed;
-        freedBytes += freed;
-        removedCount++;
+        if (freed > 0) {
+          totalBytes -= freed;
+          freedBytes += freed;
+          removedCount++;
+        }
       }
     }
 
@@ -1136,31 +1246,48 @@ export class EphemeralStore {
   private removeEntry(key: string, entry: EphemeralFileEntry): number {
     this.entries.delete(key);
     if (!this.ownsCleanupLock) {
-      return entry.size;
+      return 0;
     }
-    try {
-      unlinkWithMetaSidecar(entry.filePath);
-    } catch (err) {
-      this.logger.warn("Failed to delete ephemeral cache file", {
+    if (!unlinkWithMetaSidecar(entry.filePath)) {
+      this.failedUnlinkEntries.set(entry.filePath, entry);
+      this.logger.warn("Failed to delete ephemeral cache file; keeping disk bytes accounted", {
         filePath: entry.filePath,
-        error: err instanceof Error ? err.message : String(err),
+        size: entry.size,
       });
+      return 0;
     }
+    this.failedUnlinkEntries.delete(entry.filePath);
     return entry.size;
   }
 
   private scanExistingFiles(): void {
-    const canCleanStaging = this.tryAcquireCleanupLock();
+    const canCleanStaging = this.tryAcquireCleanupLock(true);
     if (!canCleanStaging) {
       this.logger.warn("Another SteadyTube instance owns cacheDir; running read-only without evicting or cleaning staging files", {
         baseDir: this.resolvedBaseDir,
       });
+    }
+    this.performDiskScan(canCleanStaging, false);
+  }
+
+  private rescanExistingFilesUnderLock(): void {
+    this.performDiskScan(true, true);
+  }
+
+  private performDiskScan(canCleanStaging: boolean, preservePinnedExisting: boolean): void {
+    if (preservePinnedExisting) {
+      for (const key of [...this.entries.keys()]) {
+        if (!this.isPinned(key)) {
+          this.entries.delete(key);
+        }
+      }
     }
     try {
       const videoDirs = fs.readdirSync(this.resolvedBaseDir, { withFileTypes: true });
       const now = Date.now();
       for (const dirent of videoDirs) {
         if (!dirent.isDirectory()) continue;
+        if (dirent.name.startsWith(".")) continue;
         const dirPath = path.join(this.resolvedBaseDir, dirent.name);
         const files = fs.readdirSync(dirPath, { withFileTypes: true });
         for (const f of files) {
@@ -1226,21 +1353,27 @@ export class EphemeralStore {
             }
             const formatId = f.name.replace(/\.[^.]+$/, "");
             const key = this.makeKey(dirent.name, formatId);
-            const mimeType = f.name.endsWith(".webm")
+            if (this.retiredPaths.has(path.resolve(filePath))) {
+              continue;
+            }
+            const inferredMime = f.name.endsWith(".webm")
               ? "video/webm"
               : f.name.endsWith(".m4a")
                 ? "audio/mp4"
                 : "video/mp4";
             const meta = readMetaSidecar(filePath);
-            this.entries.set(key, {
-              key,
-              filePath,
-              size: stat.size,
-              mimeType,
-              createdAt: stat.birthtimeMs || stat.mtimeMs,
-              lastAccessedAt: stat.atimeMs || stat.mtimeMs,
-              meta,
-            });
+            const mimeType = meta?.mimeType || inferredMime;
+            if (!preservePinnedExisting || !this.entries.has(key)) {
+              this.entries.set(key, {
+                key,
+                filePath,
+                size: stat.size,
+                mimeType,
+                createdAt: stat.birthtimeMs || stat.mtimeMs,
+                lastAccessedAt: stat.atimeMs || stat.mtimeMs,
+                meta,
+              });
+            }
           } catch {
             // Ignore unreadable file
           }

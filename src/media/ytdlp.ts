@@ -475,7 +475,7 @@ export function createYtDlpRunner(
   let stagingSeq = 0;
   let stopped = false;
   const stopController = new AbortController();
-  const extractSemaphore = new Semaphore(MAX_CONCURRENT_EXTRACTIONS);
+  const extractSemaphore = new Semaphore(MAX_CONCURRENT_EXTRACTIONS, 256);
 
   interface TrackedJob {
     killSync: () => void;
@@ -530,8 +530,15 @@ export function createYtDlpRunner(
 
     let available = false;
     try {
-      const pingUrl = new URL("/ping", config.playback.bgutilPotUrl).toString();
-      const res = await ipv4Fetch(pingUrl, { method: "GET", timeoutMs: 350 });
+      const pingUrl = new URL("/ping", config.playback.bgutilPotUrl);
+      if (pingUrl.hostname !== "127.0.0.1" && pingUrl.hostname !== "localhost") {
+        return false;
+      }
+      const res = await ipv4Fetch(pingUrl.toString(), {
+        method: "GET",
+        timeoutMs: 350,
+        allowedHost: (h) => h === "127.0.0.1" || h === "localhost",
+      });
       available = res.ok;
       await res.body?.cancel().catch(() => {});
     } catch {
@@ -603,6 +610,7 @@ export function createYtDlpRunner(
       timedOut = true;
       killProc();
     }, timeoutMs);
+    timer.unref?.();
 
     let sizePollTimer: ReturnType<typeof setInterval> | null = null;
     if (monitor && ((monitor.maxBytes && monitor.maxBytes > 0) || monitor.onStagingBytes)) {

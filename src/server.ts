@@ -101,11 +101,11 @@ export function startServer(config: AppConfig, overrides: AppOverrides = {}) {
   });
 
   app.ephemeralStore.initialize();
-  if (app.ephemeralStore.hasExclusiveLock()) {
-    app.ephemeralStore.startPeriodicCleanup();
-  } else {
+  // Always arm periodic cleanup (no-op while standby without lock, active immediately on takeover)
+  app.ephemeralStore.startPeriodicCleanup();
+  if (!app.ephemeralStore.hasExclusiveLock()) {
     app.logger.warn(
-      "Ephemeral cache directory is locked by another live SteadyTube instance; Tier 3 disk writes and cleanup are disabled for this instance",
+      "Ephemeral cache directory is locked by another live SteadyTube instance; Tier 3 disk writes and cleanup are disabled until lock acquisition",
       { cacheDir: config.cacheDir },
     );
   }
