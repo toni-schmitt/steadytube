@@ -47,13 +47,17 @@ export function isPrivateOrReservedIpv4(ip: string): boolean {
   if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) {
     return true;
   }
-  const [a, b] = parts as [number, number, number, number];
+  const [a, b, c] = parts as [number, number, number, number];
   if (a === 0) return true; // 0.0.0.0/8
   if (a === 10) return true; // 10.0.0.0/8
   if (a === 127) return true; // 127.0.0.0/8
   if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
   if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // 192.0.0.0/24 & 192.0.2.0/24
   if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmarking
+  if (a === 198 && b === 51 && c === 100) return true; // 198.51.100.0/24 TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true; // 203.0.113.0/24 TEST-NET-3
   if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
   if (a >= 224) return true; // Multicast & reserved
   return false;
@@ -187,6 +191,8 @@ export interface Ipv4FetchOptions extends RequestInit {
   httpsOnly?: boolean;
   /** Optional allowlist validator invoked on the initial URL and every redirect hop. */
   allowedHost?: (hostname: string) => boolean;
+  /** Optional hard upper bound on response body bytes (errors stream and destroys socket if exceeded). */
+  maxBodyBytes?: number;
 }
 
 export type FetchLike = (
@@ -221,6 +227,7 @@ async function doSingleIpv4Request(
     publicIpv4Only: boolean;
     httpsOnly: boolean;
     allowedHost?: (hostname: string) => boolean;
+    maxBodyBytes?: number;
   },
 ): Promise<{
   status: number;
@@ -236,17 +243,43 @@ async function doSingleIpv4Request(
   const defaultPort = isHttps ? 443 : 80;
   const port = url.port ? Number(url.port) : defaultPort;
 
-  // Enforce deadline across DNS resolution as well as socket headers
-  const ipv4 = await Promise.race([
-    resolveIpv4(url.hostname, { publicIpv4Only: options.publicIpv4Only }),
-    new Promise<never>((_, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error(`IPv4 DNS resolution timed out after ${options.timeoutMs}ms: ${url.hostname}`)),
-        options.timeoutMs,
-      );
-      timer.unref?.();
-    }),
-  ]);
+  const getAbortError = () =>
+    options.signal?.reason instanceof Error
+      ? options.signal.reason
+      : new DOMException("The operation was aborted.", "AbortError");
+
+  if (options.signal?.aborted) {
+    throw getAbortError();
+  }
+
+  // Enforce deadline and abort signal across DNS resolution as well as socket headers
+  let dnsTimer: ReturnType<typeof setTimeout> | null = null;
+  let onDnsAbort: (() => void) | null = null;
+  let ipv4: string;
+  try {
+    ipv4 = await Promise.race([
+      resolveIpv4(url.hostname, { publicIpv4Only: options.publicIpv4Only }),
+      new Promise<never>((_, reject) => {
+        dnsTimer = setTimeout(
+          () =>
+            reject(
+              new Error(`IPv4 DNS resolution timed out after ${options.timeoutMs}ms: ${url.hostname}`),
+            ),
+          options.timeoutMs,
+        );
+        dnsTimer.unref?.();
+        if (options.signal) {
+          onDnsAbort = () => reject(getAbortError());
+          options.signal.addEventListener("abort", onDnsAbort, { once: true });
+        }
+      }),
+    ]);
+  } finally {
+    if (dnsTimer) clearTimeout(dnsTimer);
+    if (onDnsAbort && options.signal) {
+      options.signal.removeEventListener("abort", onDnsAbort);
+    }
+  }
 
   const remainingMs = Math.max(100, deadlineAt - Date.now());
 
@@ -261,11 +294,14 @@ async function doSingleIpv4Request(
 
   return await new Promise((resolve, reject) => {
     let settled = false;
+    let onBodyAbort: (() => void) | null = null;
 
     const onAbort = () => {
-      const abortErr = options.signal?.reason instanceof Error
-        ? options.signal.reason
-        : new DOMException("The operation was aborted.", "AbortError");
+      if (onBodyAbort) {
+        onBodyAbort();
+        return;
+      }
+      const abortErr = getAbortError();
       req.destroy(abortErr);
       if (!settled) {
         settled = true;
@@ -274,11 +310,7 @@ async function doSingleIpv4Request(
     };
 
     if (options.signal?.aborted) {
-      reject(
-        options.signal.reason instanceof Error
-          ? options.signal.reason
-          : new DOMException("The operation was aborted.", "AbortError"),
-      );
+      reject(getAbortError());
       return;
     }
 
@@ -314,10 +346,23 @@ async function doSingleIpv4Request(
     req.on("error", (err) => {
       clearTimeout(headerTimer);
       options.signal?.removeEventListener("abort", onAbort);
-      rotateIpv4OnError(url.hostname, ipv4);
+      if (!options.signal?.aborted) {
+        rotateIpv4OnError(url.hostname, ipv4);
+      }
       if (!settled) {
         settled = true;
-        reject(err);
+        reject(options.signal?.aborted ? getAbortError() : err);
+      }
+    });
+
+    req.on("upgrade", (_res, socket) => {
+      clearTimeout(headerTimer);
+      options.signal?.removeEventListener("abort", onAbort);
+      socket.destroy();
+      req.destroy();
+      if (!settled) {
+        settled = true;
+        reject(new Error("HTTP 101 protocol upgrade is not supported by ipv4Fetch"));
       }
     });
 
@@ -325,6 +370,16 @@ async function doSingleIpv4Request(
       clearTimeout(headerTimer);
 
       const status = res.statusCode ?? 500;
+      if (status < 200) {
+        options.signal?.removeEventListener("abort", onAbort);
+        res.destroy();
+        req.destroy();
+        if (!settled) {
+          settled = true;
+          reject(new Error(`Unsupported informational HTTP status ${status} in ipv4Fetch`));
+        }
+        return;
+      }
       const statusText = res.statusMessage ?? "";
       const resHeaders = new Headers();
       for (const [k, v] of Object.entries(res.headers)) {
@@ -338,7 +393,7 @@ async function doSingleIpv4Request(
 
       const location = resHeaders.get("location");
 
-      if (method === "HEAD" || status === 204 || status === 304) {
+      if (method === "HEAD" || status === 204 || status === 205 || status === 304) {
         res.resume();
         options.signal?.removeEventListener("abort", onAbort);
         settled = true;
@@ -367,9 +422,49 @@ async function doSingleIpv4Request(
       const webStream = new ReadableStream<Uint8Array>({
         start(controller) {
           let closed = false;
+          let receivedBytes = 0;
           const cleanup = () => {
+            onBodyAbort = null;
             options.signal?.removeEventListener("abort", onAbort);
           };
+
+          const abortBodyStream = () => {
+            cleanup();
+            if (!closed) {
+              closed = true;
+              try {
+                controller.error(getAbortError());
+              } catch {
+                // Already closed
+              }
+            }
+            if (sourceStream !== res) sourceStream.destroy();
+            res.destroy();
+            req.destroy();
+          };
+
+          onBodyAbort = abortBodyStream;
+          if (options.signal?.aborted) {
+            abortBodyStream();
+            return;
+          }
+
+          if (options.maxBodyBytes && options.maxBodyBytes > 0) {
+            const declaredLen = Number(resHeaders.get("content-length") || "0");
+            if (Number.isFinite(declaredLen) && declaredLen > options.maxBodyBytes) {
+              closed = true;
+              cleanup();
+              if (sourceStream !== res) sourceStream.destroy();
+              res.destroy();
+              req.destroy();
+              controller.error(
+                new Error(
+                  `Upstream response Content-Length exceeded limit (${declaredLen} > ${options.maxBodyBytes})`,
+                ),
+              );
+              return;
+            }
+          }
 
           sourceStream.on("data", (chunk: Buffer | Uint8Array) => {
             if (closed) return;
@@ -377,12 +472,28 @@ async function doSingleIpv4Request(
               const bytes = chunk instanceof Uint8Array
                 ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
                 : new Uint8Array(chunk);
+              receivedBytes += bytes.byteLength;
+              if (options.maxBodyBytes && options.maxBodyBytes > 0 && receivedBytes > options.maxBodyBytes) {
+                closed = true;
+                cleanup();
+                if (sourceStream !== res) sourceStream.destroy();
+                req.destroy();
+                res.destroy();
+                controller.error(
+                  new Error(
+                    `Upstream response body exceeded limit (${receivedBytes} > ${options.maxBodyBytes})`,
+                  ),
+                );
+                return;
+              }
               controller.enqueue(bytes);
               if (controller.desiredSize !== null && controller.desiredSize <= 0) {
                 sourceStream.pause();
               }
             } catch {
               closed = true;
+              cleanup();
+              if (sourceStream !== res) sourceStream.destroy();
               req.destroy();
               res.destroy();
             }
@@ -393,7 +504,11 @@ async function doSingleIpv4Request(
             if (!closed) {
               closed = true;
               try {
-                controller.close();
+                if (options.signal?.aborted) {
+                  controller.error(getAbortError());
+                } else {
+                  controller.close();
+                }
               } catch {
                 // Already closed
               }
@@ -402,10 +517,13 @@ async function doSingleIpv4Request(
 
           sourceStream.on("error", (err) => {
             cleanup();
+            if (sourceStream !== res) sourceStream.destroy();
+            res.destroy();
+            req.destroy();
             if (!closed) {
               closed = true;
               try {
-                controller.error(err);
+                controller.error(options.signal?.aborted ? getAbortError() : err);
               } catch {
                 // Already closed
               }
@@ -414,10 +532,32 @@ async function doSingleIpv4Request(
 
           res.on("aborted", () => {
             cleanup();
+            if (sourceStream !== res) sourceStream.destroy();
             if (!closed) {
               closed = true;
               try {
-                controller.error(new Error("Upstream connection aborted"));
+                controller.error(
+                  options.signal?.aborted
+                    ? getAbortError()
+                    : new Error("Upstream connection aborted"),
+                );
+              } catch {
+                // Already closed
+              }
+            }
+          });
+
+          res.on("close", () => {
+            if (!closed && !res.complete) {
+              cleanup();
+              if (sourceStream !== res) sourceStream.destroy();
+              closed = true;
+              try {
+                controller.error(
+                  options.signal?.aborted
+                    ? getAbortError()
+                    : new Error("Upstream connection closed prematurely"),
+                );
               } catch {
                 // Already closed
               }
@@ -428,6 +568,7 @@ async function doSingleIpv4Request(
           sourceStream.resume();
         },
         cancel() {
+          onBodyAbort = null;
           options.signal?.removeEventListener("abort", onAbort);
           sourceStream.destroy();
           res.destroy();
@@ -460,14 +601,13 @@ export async function ipv4Fetch(
   const publicIpv4Only = init.publicIpv4Only ?? false;
   const httpsOnly = init.httpsOnly ?? false;
   const allowedHost = init.allowedHost;
+  const maxBodyBytes = init.maxBodyBytes;
 
-  const headers = new Headers(isRequest ? input.headers : undefined);
-  if (init.headers) {
-    const overrides = new Headers(init.headers);
-    overrides.forEach((value, key) => {
-      headers.set(key, value);
-    });
-  }
+  // Per Fetch spec, explicit `init.headers` replaces `input.headers` rather than merging on top
+  // (preventing deleted headers such as stripped `Cookie` from resurfacing via `input.headers`).
+  const headers = new Headers(
+    init.headers !== undefined ? init.headers : isRequest ? input.headers : undefined,
+  );
 
   let bodyBuf: Buffer | null = null;
   if (init.body !== undefined) {
@@ -484,6 +624,7 @@ export async function ipv4Fetch(
       publicIpv4Only,
       httpsOnly,
       allowedHost,
+      maxBodyBytes,
     });
 
     const isRedirect =
@@ -507,7 +648,10 @@ export async function ipv4Fetch(
         headers.delete("authorization");
         headers.delete("cookie");
       }
-      if (result.status === 303 || ((result.status === 301 || result.status === 302) && method === "POST")) {
+      if (
+        (result.status === 303 && method !== "HEAD") ||
+        ((result.status === 301 || result.status === 302) && method === "POST")
+      ) {
         method = "GET";
         bodyBuf = null;
         headers.delete("content-length");
@@ -545,4 +689,48 @@ export function ipv4FetchRaw(
   init: Omit<Ipv4FetchOptions, "raw"> = {},
 ): Promise<Response> {
   return ipv4Fetch(input, { ...init, raw: true });
+}
+
+/**
+ * Drain an HTTP Response body into memory with a strict upper byte limit,
+ * cancelling the stream immediately if Content-Length or streamed bytes exceed `maxBytes`.
+ */
+export async function readBoundedResponseBytes(
+  res: Response,
+  maxBytes: number,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const declaredLen = Number(res.headers.get("content-length") || "0");
+  if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`Upstream response Content-Length exceeded limit (${declaredLen} > ${maxBytes})`);
+  }
+  if (!res.body) return new Uint8Array(0);
+
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new Error(`Upstream response body exceeded limit (${total} > ${maxBytes})`);
+      }
+      chunks.push(value);
+    }
+  } catch (err) {
+    await reader.cancel().catch(() => {});
+    throw err;
+  }
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }

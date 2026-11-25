@@ -17,6 +17,7 @@ export interface AppOverrides {
   innertube?: AnonymousInnertubeProvider;
   fetchFn?: FetchLike;
   fetchRawFn?: FetchLike;
+  deferCacheScan?: boolean;
 }
 
 export interface RunningApp {
@@ -26,6 +27,7 @@ export interface RunningApp {
   resolver: VideoResolver;
   fetch: (req: Request) => Promise<Response>;
   stop(): void;
+  awaitShutdown(timeoutMs?: number): Promise<void>;
 }
 
 export function createApp(config: AppConfig, overrides: AppOverrides = {}): RunningApp {
@@ -45,6 +47,7 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
     config.playback.ephemeralBuffer.maxCacheBytes,
     config.playback.ephemeralBuffer.ttlSeconds * 1000,
     logger,
+    { deferScan: overrides.deferCacheScan },
   );
 
   const innertube = overrides.innertube ?? new AnonymousInnertubeProvider(logger);
@@ -69,6 +72,16 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
     logger,
   });
 
+  let drainClosePromise: Promise<void> | null = null;
+  const scheduleDrainClose = (): Promise<void> => {
+    if (!drainClosePromise) {
+      drainClosePromise = resolver.waitForAllDiskWorkSettled().finally(() => {
+        ephemeralStore.close();
+      });
+    }
+    return drainClosePromise;
+  };
+
   return {
     config,
     logger,
@@ -76,14 +89,47 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
     resolver,
     fetch: handler,
     stop() {
-      ephemeralStore.stopPeriodicCleanup();
+      resolver.stop();
+      if (resolver.hasActiveDiskWork()) {
+        // Keep the cache lock held until ALL active disk jobs actually settle,
+        // while immediately blocking all new lock acquisitions, reservations, and registrations.
+        ephemeralStore.beginShutdown();
+        void scheduleDrainClose();
+      } else {
+        ephemeralStore.close();
+      }
+    },
+    async awaitShutdown(timeoutMs = 1000): Promise<void> {
+      if (!resolver.hasActiveDiskWork()) {
+        await resolver.awaitShutdown(timeoutMs);
+        if (!resolver.hasActiveDiskWork()) {
+          ephemeralStore.close();
+        } else {
+          void scheduleDrainClose();
+        }
+        return;
+      }
+      const drain = scheduleDrainClose();
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      await Promise.race([
+        drain,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, timeoutMs);
+          timer.unref?.();
+        }),
+      ]).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+      // Do NOT close ephemeralStore on timeout — `drain.finally` releases the lock
+      // strictly after all active disk work has settled.
     },
   };
 }
 
 export function startServer(config: AppConfig, overrides: AppOverrides = {}) {
-  const app = createApp(config, overrides);
-  app.ephemeralStore.startPeriodicCleanup();
+  // Defer destructive startup staging-dir cleanup until AFTER the listening port is bound
+  // so an accidental second daemon failing with EADDRINUSE never touches live downloads.
+  const app = createApp(config, { ...overrides, deferCacheScan: true });
 
   const server = Bun.serve({
     hostname: config.host,
@@ -91,6 +137,16 @@ export function startServer(config: AppConfig, overrides: AppOverrides = {}) {
     idleTimeout: 120,
     fetch: app.fetch,
   });
+
+  app.ephemeralStore.initialize();
+  // Always arm periodic cleanup (no-op while standby without lock, active immediately on takeover)
+  app.ephemeralStore.startPeriodicCleanup();
+  if (!app.ephemeralStore.hasExclusiveLock()) {
+    app.logger.warn(
+      "Ephemeral cache directory is locked by another live SteadyTube instance; Tier 3 disk writes and cleanup are disabled until lock acquisition",
+      { cacheDir: config.cacheDir },
+    );
+  }
 
   app.logger.info("steadytube listening", {
     url: `http://${server.hostname}:${server.port}`,
@@ -110,6 +166,9 @@ export function startServer(config: AppConfig, overrides: AppOverrides = {}) {
     stop() {
       app.stop();
       server.stop(true);
+    },
+    async awaitShutdown(timeoutMs = 1000): Promise<void> {
+      await app.awaitShutdown(timeoutMs);
     },
   };
 }

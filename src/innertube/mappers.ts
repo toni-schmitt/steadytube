@@ -105,9 +105,9 @@ export function escapeHtml(input: string): string {
 export function descriptionToHtml(text: string): string {
   if (!text) return "";
   const escaped = escapeHtml(text);
-  // Linkify URLs
+  // Linkify URLs without swallowing trailing HTML entities (&lt;, &gt;, &quot;, &#39;)
   const withUrls = escaped.replace(
-    /\bhttps?:\/\/[^\s<>"']+/g,
+    /\bhttps?:\/\/(?:[^\s<>&"']|&(?!lt;|gt;|quot;|#39;))+/g,
     (url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`,
   );
   return withUrls.replace(/\r?\n/g, "<br>");
@@ -962,6 +962,8 @@ export function buildProxyPlaybackUrl(params: {
   durSec: number;
   expireSec: number;
   clen: number;
+  layout?: string | null;
+  rev?: string | null;
   xtags?: string | null;
 }): string {
   const u = new URL("/videoplayback", params.origin);
@@ -972,6 +974,12 @@ export function buildProxyPlaybackUrl(params: {
   u.searchParams.set("expire", String(params.expireSec));
   if (params.clen > 0) {
     u.searchParams.set("clen", String(params.clen));
+  }
+  if (params.layout) {
+    u.searchParams.set("layout", params.layout);
+  }
+  if (params.rev) {
+    u.searchParams.set("rev", params.rev);
   }
   if (params.xtags) {
     u.searchParams.set("xtags", params.xtags);

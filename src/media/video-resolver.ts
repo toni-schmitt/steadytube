@@ -1,9 +1,18 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import type { AppConfig } from "../config.ts";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
 import { Semaphore, TtlLruCache } from "../cache/memory-cache.ts";
-import type { EphemeralStore } from "../cache/ephemeral-store.ts";
+import {
+  registerActiveStagingDir,
+  unregisterActiveStagingDir,
+  type EphemeralEntryMeta,
+  type EphemeralFileEntry,
+  type EphemeralStore,
+  type ProgressiveStreamSource,
+} from "../cache/ephemeral-store.ts";
 import type { AnonymousInnertubeProvider } from "../innertube/client.ts";
 import {
   type AdaptiveFormatOutput,
@@ -21,12 +30,20 @@ import {
 } from "../innertube/mappers.ts";
 import { ipv4FetchRaw, type FetchLike } from "../net/ipv4-fetch.ts";
 import {
+  computeFileRangeSha256,
   type DashByteRanges,
+  hasValidGlobalMp4Sidx,
+  MAX_DASH_HEADER_PROBE_BYTES,
   probeLocalFileDashRanges,
+  probeMp4TrackMetadata,
   probeRemoteDashRanges,
+  sha256Hex,
+  verifyRemoteDashRangeDigests,
 } from "./container-probe.ts";
 import {
   assertValidVideoId,
+  type ProgressiveDownloadHandle,
+  spawnProcessGroup,
   YtDlpError,
   type YtDlpFormat,
   type YtDlpRunner,
@@ -35,6 +52,27 @@ import {
 
 export type PlaybackTier = 1 | 2 | 3;
 
+/**
+ * Maximum sequential catch-up distance (in bytes) we are willing to download
+ * from byte 0 when starting a mid-playback Tier 3 progressive buffer.
+ * Prevents burning hundreds of MB when a failure happens far into a long 4K VOD.
+ */
+export const MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES = 64 * 1024 * 1024; // 64 MiB
+
+export interface DashRangeIdentity {
+  init: string;
+  index: string;
+  /** Optional SHA-256 hex digest of the initRange bytes (captured on probe or first 206) */
+  initHash?: string;
+  /** Optional SHA-256 hex digest of the indexRange bytes (captured on probe or first 206) */
+  indexHash?: string;
+}
+
+export type RequestedRangeInfo =
+  | { kind: "offset"; start: number }
+  | { kind: "indeterminate_suffix" }
+  | { kind: "unsatisfiable" };
+
 export interface StreamTargetRemote {
   kind: "remote";
   videoId: string;
@@ -42,11 +80,30 @@ export interface StreamTargetRemote {
   itag: number;
   url: string;
   mimeType: string;
+  /** Strictly authoritative exact byte length (0 if unknown; NEVER populated from filesize_approx) */
   clen: number;
+  /** Approximate size hint (e.g. yt-dlp filesize_approx) used only for bitrate/budget estimates */
+  approxSize?: number;
+  /** Exact DASH init/index byte ranges advertised in the manifest for this representation */
+  dashRanges?: DashRangeIdentity;
+  /** Upstream last-modified timestamp (lmt) if known, for representation stability verification */
+  lmt?: string;
+  /** Authoritative revision token embedded in issued playback URLs (lmt or init/index digest) */
+  rev?: string | null;
+  /** Upstream xtags (e.g. audio track / DRC tags) if present */
+  xtags?: string | null;
   expireSec: number;
   httpHeaders: Record<string, string>;
   tier: 1 | 2;
+  resolvedBy: "innertube" | "ytdlp";
+  /** Verified yt-dlp format_id selector (differs from InnerTube synthetic fid on multi-audio tracks) */
+  ytDlpFormatId?: string;
+  isDrc?: boolean;
+  /** Monotonic generation of the ResolvedVideoRecord that produced this target */
+  recordGen?: number;
+  resolvedAt: number;
   stale?: boolean;
+  tier3CooldownUntil?: number;
 }
 
 export interface StreamTargetLocal {
@@ -55,12 +112,35 @@ export interface StreamTargetLocal {
   formatId: string;
   itag: number;
   filePath: string;
+  /** Exact EphemeralStore key backing this immutable representation file */
+  storeKey?: string;
   mimeType: string;
   size: number;
+  dashRanges?: DashRangeIdentity;
+  rev?: string | null;
+  xtags?: string | null;
   tier: 3;
 }
 
-export type StreamTarget = StreamTargetRemote | StreamTargetLocal;
+export interface StreamTargetProgressive {
+  kind: "progressive";
+  videoId: string;
+  formatId: string;
+  itag: number;
+  /** Exact EphemeralStore key backing this immutable representation stream */
+  storeKey?: string;
+  mimeType: string;
+  size: number;
+  dashRanges?: DashRangeIdentity;
+  rev?: string | null;
+  xtags?: string | null;
+  /** Original remote target to restore/recover if this progressive stream fails */
+  fallbackRemote?: StreamTargetRemote;
+  tier: 3;
+  source: ProgressiveStreamSource;
+}
+
+export type StreamTarget = StreamTargetRemote | StreamTargetLocal | StreamTargetProgressive;
 
 export interface CaptionTrackRef {
   label: string;
@@ -74,6 +154,16 @@ export interface ResolvedVideoRecord {
   resolvedBy: "innertube" | "ytdlp" | "ephemeral";
   resolvedAt: number;
   expiresAt: number;
+  /** Monotonic generation counter for this resolved record */
+  recordGen?: number;
+  /** Monotonic start sequence of the resolveVideo() producer that created this record */
+  startedSeq?: number;
+  /** Timestamp when the resolveVideo() producer started */
+  startedAt?: number;
+  /** Whether the resolveVideo() producer explicitly forced a refresh */
+  producerForceRefresh?: boolean;
+  /** Set when mid-playback recovery exhausts after observing an incompatible upstream layout */
+  needsMetadataRefresh?: boolean;
   payload: Record<string, unknown>;
   adaptiveFormats: AdaptiveFormatOutput[];
   durationSec: number;
@@ -195,12 +285,460 @@ function makeRangeKey(itag: number, isDrc: boolean, lang?: string | null): strin
   return `${itag}:${isDrc ? "drc" : "std"}:${(lang || "").toLowerCase()}`;
 }
 
+function isVisionOsClientUrl(url?: string): boolean {
+  if (!url) return false;
+  try {
+    return new URL(url).searchParams.get("c")?.toUpperCase() === "VISIONOS";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * When yt-dlp runs with multiple player clients (e.g. `visionos,default,-tv_samsung`),
+ * multiple clients can emit entries with the same `format_id`. Prefer the first
+ * entry — upgrading only if a later duplicate comes from `VISIONOS` while the
+ * earlier one did not — so `default` client URLs never clobber `VISIONOS` URLs.
+ */
+export function deduplicateYtDlpFormats(formats: YtDlpFormat[]): YtDlpFormat[] {
+  const byId = new Map<string, number>();
+  const out: YtDlpFormat[] = [];
+
+  for (const fmt of formats) {
+    const existingIdx = byId.get(fmt.format_id);
+    if (existingIdx === undefined) {
+      byId.set(fmt.format_id, out.length);
+      out.push(fmt);
+    } else if (isVisionOsClientUrl(fmt.url) && !isVisionOsClientUrl(out[existingIdx]?.url)) {
+      out[existingIdx] = fmt;
+    }
+  }
+
+  return out;
+}
+
+function withTimeoutNull<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function isYtDlpFormatDrc(fmt: YtDlpFormat): boolean {
+  return fmt.format_id.includes("drc") || (fmt.format_note || "").includes("DRC");
+}
+
+function getYtDlpFormatExactClen(fmt: YtDlpFormat): number {
+  const meta = extractUrlMeta(fmt.url, 0);
+  return meta.clen || Number(fmt.filesize || 0);
+}
+
+function getYtDlpFormatApproxSize(fmt: YtDlpFormat): number {
+  return getYtDlpFormatExactClen(fmt) || Number(fmt.filesize_approx || 0);
+}
+
+export function formatDashLayoutKey(ranges?: DashRangeIdentity | null): string | null {
+  if (!ranges || !ranges.init || !ranges.index) return null;
+  return `${ranges.init}_${ranges.index}`;
+}
+
+export function computeRepresentationRev(opts: {
+  lmt?: string | null;
+  dashRanges?: DashRangeIdentity | null;
+}): string | null {
+  if (opts.lmt && opts.lmt !== "0") {
+    return opts.lmt;
+  }
+  const initHash = opts.dashRanges?.initHash || "";
+  const indexHash = opts.dashRanges?.indexHash || "";
+  if (initHash || indexHash) {
+    const digest = sha256Hex(new TextEncoder().encode(`${initHash}:${indexHash}`)).slice(0, 16);
+    return `h:${digest}`;
+  }
+  return null;
+}
+
+export function computeRepresentationStorageFormatId(
+  cacheFormatId: string,
+  identity: {
+    clen: number;
+    layout?: string | null;
+    rev?: string | null;
+    xtags?: string | null;
+    initHash?: string;
+    indexHash?: string;
+  },
+): string {
+  const safeBase = cacheFormatId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 62) || "fmt";
+  const canonical = JSON.stringify([
+    cacheFormatId,
+    identity.clen || 0,
+    identity.layout || "",
+    identity.rev || "",
+    identity.xtags || "",
+    identity.initHash || "",
+    identity.indexHash || "",
+  ]);
+  const suffix = crypto.createHash("sha256").update(canonical).digest("hex").slice(0, 12);
+  return `${safeBase}-r${suffix}`;
+}
+
+export interface ExpectedTargetIdentity {
+  clen?: number;
+  layout?: string | null;
+  rev?: string | null;
+  xtags?: string | null;
+}
+
+export function hasCompleteDashPair(adaptiveFormats: AdaptiveFormatOutput[]): boolean {
+  let hasVideo = false;
+  let hasAudio = false;
+  for (const fmt of adaptiveFormats) {
+    if (fmt.type.startsWith("video/")) hasVideo = true;
+    else if (fmt.type.startsWith("audio/")) hasAudio = true;
+    if (hasVideo && hasAudio) return true;
+  }
+  return false;
+}
+
+/**
+ * Verify that a candidate StreamTarget matches the representation identity
+ * (`layout` init/index ranges, authoritative exact `clen`, `rev`, and `xtags`) embedded
+ * in an issued `/videoplayback` URL, preventing stale URLs from serving bytes
+ * from a different DASH box layout, revision, or variant.
+ */
+export function doesTargetMatchRequestIdentity(
+  target: StreamTarget,
+  expected?: ExpectedTargetIdentity,
+): boolean {
+  if (!expected) return true;
+  if (expected.layout) {
+    const actualLayout = formatDashLayoutKey(target.dashRanges);
+    if (!actualLayout || actualLayout !== expected.layout) {
+      return false;
+    }
+  }
+  if (expected.clen && expected.clen > 0) {
+    const exactSize = target.kind === "remote" ? target.clen : target.size;
+    // Unknown length (0) must NEVER satisfy a URL issued with an exact clen
+    if (exactSize !== expected.clen) {
+      return false;
+    }
+  }
+  if (expected.rev) {
+    if (!target.rev || target.rev !== expected.rev) {
+      return false;
+    }
+  }
+  if (expected.xtags) {
+    if (!target.xtags || target.xtags !== expected.xtags) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Look up a stream target in a resolved record while enforcing representation
+ * identity compatibility (`fid`, `layout`, exact `clen`, `rev`, `xtags`). Synthetic cold Tier 3
+ * IDs (`tier3-*`) NEVER fall back by `itag`, and other `fid` misses only fall
+ * back by `itag` when a unique verified representation matches 1:1.
+ */
+export function findStreamTargetInRecord(
+  rec: ResolvedVideoRecord,
+  formatId: string | null,
+  itag: number | null,
+  expected?: ExpectedTargetIdentity,
+): StreamTarget | null {
+  if (formatId) {
+    const exact = rec.targetsByFid.get(formatId);
+    if (exact) {
+      return doesTargetMatchRequestIdentity(exact, expected) ? exact : null;
+    }
+    if (formatId.startsWith("tier3-")) {
+      return null;
+    }
+    if (itag && itag > 0 && (expected?.layout || (expected?.clen && expected.clen > 0))) {
+      const wantDrc = formatId.includes("drc");
+      const matches: StreamTarget[] = [];
+      for (const candidate of rec.targetsByFid.values()) {
+        if (candidate.itag !== itag) continue;
+        if (candidate.formatId.startsWith("tier3-")) continue;
+        const candDrc =
+          candidate.kind === "remote"
+            ? Boolean(candidate.isDrc || candidate.formatId.includes("drc"))
+            : candidate.formatId.includes("drc");
+        if (candDrc !== wantDrc) continue;
+        if (!doesTargetMatchRequestIdentity(candidate, expected)) continue;
+        // If layout wasn't provided, require authoritative exact size equality for itag fallback
+        if (!expected.layout) {
+          const exactSize = candidate.kind === "remote" ? candidate.clen : candidate.size;
+          if (!expected.clen || exactSize !== expected.clen) continue;
+        }
+        matches.push(candidate);
+      }
+      // Require unambiguous match (prevents colliding same-itag/same-layout multi-audio languages)
+      if (matches.length === 1) {
+        return matches[0]!;
+      }
+    }
+    return null;
+  }
+
+  if (itag && itag > 0) {
+    const byItag = rec.targetsByItag.get(itag);
+    if (byItag && doesTargetMatchRequestIdentity(byItag, expected)) {
+      return byItag;
+    }
+  }
+  return null;
+}
+
+export function parseRangeBounds(rangeStr: string): { start: number; end: number } | null {
+  const m = /^(\d+)-(\d+)$/.exec(rangeStr.trim());
+  if (!m) return null;
+  const start = Number(m[1]);
+  const end = Number(m[2]);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
+  return { start, end };
+}
+
+function doesLocalFileMatchDashRanges(
+  filePath: string,
+  mimeType: string,
+  expected: DashRangeIdentity | undefined,
+): boolean {
+  if (!expected) return true;
+  const expectedInit = parseRangeBounds(expected.init);
+  const expectedIndex = parseRangeBounds(expected.index);
+  if (!expectedInit || !expectedIndex) return false;
+
+  const neededHeaderRead = Math.min(
+    MAX_DASH_HEADER_PROBE_BYTES,
+    Math.max(65536, Math.max(expectedInit.end, expectedIndex.end) + 1),
+  );
+  const probed = probeLocalFileDashRanges(
+    filePath,
+    mimeType,
+    neededHeaderRead,
+    expectedIndex.start,
+  );
+  if (!probed || probed.init !== expected.init || probed.index !== expected.index) {
+    return false;
+  }
+  if (expected.initHash) {
+    const actualInitHash = computeFileRangeSha256(filePath, expectedInit.start, expectedInit.end);
+    if (!actualInitHash || actualInitHash !== expected.initHash) {
+      return false;
+    }
+  }
+  if (expected.indexHash) {
+    const actualIndexHash = computeFileRangeSha256(filePath, expectedIndex.start, expectedIndex.end);
+    if (!actualIndexHash || actualIndexHash !== expected.indexHash) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function attachVerifiedLocalHashes(
+  filePath: string,
+  ranges: DashRangeIdentity | undefined,
+): DashRangeIdentity | undefined {
+  if (!ranges) return undefined;
+  const initB = parseRangeBounds(ranges.init);
+  const indexB = parseRangeBounds(ranges.index);
+  const initHash =
+    ranges.initHash ??
+    (initB ? computeFileRangeSha256(filePath, initB.start, initB.end) ?? undefined : undefined);
+  const indexHash =
+    ranges.indexHash ??
+    (indexB ? computeFileRangeSha256(filePath, indexB.start, indexB.end) ?? undefined : undefined);
+  return {
+    init: ranges.init,
+    index: ranges.index,
+    ...(initHash ? { initHash } : {}),
+    ...(indexHash ? { indexHash } : {}),
+  };
+}
+
+function makeRecoveryInflightKey(
+  videoId: string,
+  cacheFormatId: string,
+  target: StreamTargetRemote,
+): string {
+  const layout = formatDashLayoutKey(target.dashRanges) || "";
+  const drc = Boolean(target.isDrc || cacheFormatId.includes("drc")) ? "drc" : "std";
+  const xtags = target.xtags || "";
+  const lmt = target.lmt && target.lmt !== "0" ? target.lmt : "";
+  const rev = target.rev || "";
+  const initHash = target.dashRanges?.initHash || "";
+  const indexHash = target.dashRanges?.indexHash || "";
+  const gen = target.recordGen ?? 0;
+  return `${videoId}:${cacheFormatId}:g${gen}:${layout}:${target.clen || 0}:${drc}:${xtags}:${lmt}:${rev}:${initHash}:${indexHash}`;
+}
+
+/**
+ * Resolve a real, byte-compatible `yt-dlp` `format_id` for a remote target
+ * (needed when the target came from fast InnerTube with a synthetic `formatId`
+ * such as `251-en-US-en-US.4`).
+ */
+export function findMatchingYtDlpFormatId(
+  formats: YtDlpFormat[],
+  target: Pick<StreamTargetRemote, "formatId" | "itag" | "clen" | "isDrc" | "lmt" | "xtags">,
+): string | null {
+  const deduped = deduplicateYtDlpFormats(formats);
+  const targetIsDrc = Boolean(target.isDrc || target.formatId.includes("drc"));
+  const targetLmt = target.lmt && target.lmt !== "0" ? target.lmt : "";
+
+  const matchesMeta = (f: YtDlpFormat): boolean => {
+    const urlMeta = extractUrlMeta(f.url, 0);
+    if (targetLmt && urlMeta.lmt !== targetLmt) {
+      return false;
+    }
+    if (target.xtags && urlMeta.xtags !== target.xtags) {
+      return false;
+    }
+    return true;
+  };
+
+  const exact = deduped.find((f) => f.format_id === target.formatId);
+  if (exact && matchesMeta(exact)) {
+    const fmtClen = getYtDlpFormatExactClen(exact);
+    if (target.clen === 0 || fmtClen === target.clen) {
+      return exact.format_id;
+    }
+  }
+
+  if (target.itag > 0) {
+    const sameItagAndDrc = deduped.filter(
+      (f) =>
+        parseNumericItag(f.format_id, f.url) === target.itag &&
+        isYtDlpFormatDrc(f) === targetIsDrc &&
+        matchesMeta(f),
+    );
+    if (target.clen > 0) {
+      const byteExact = sameItagAndDrc.find((f) => getYtDlpFormatExactClen(f) === target.clen);
+      if (byteExact) return byteExact.format_id;
+    } else if (sameItagAndDrc.length === 1) {
+      return sameItagAndDrc[0]!.format_id;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Deterministically select the best MP4 video (`<= maxHeight`, preferring H.264/avc1)
+ * and M4A/MP4 audio tracks for cold Tier 3 buffering so the downloaded `format_id`
+ * matches the advertised codec, resolution, and frame rate 1:1.
+ */
+export function selectColdTier3Formats(
+  formats: YtDlpFormat[],
+  maxHeight: number,
+): { video: YtDlpFormat | null; audio: YtDlpFormat | null } {
+  const deduped = deduplicateYtDlpFormats(formats);
+
+  const videoCandidates = deduped.filter(
+    (f) =>
+      f.ext === "mp4" &&
+      Boolean(f.vcodec && f.vcodec !== "none") &&
+      (!f.acodec || f.acodec === "none") &&
+      (f.height || 0) > 0 &&
+      (f.height || 0) <= maxHeight,
+  );
+  videoCandidates.sort((a, b) => {
+    const aAvc = /^avc1/i.test(a.vcodec || "") ? 1 : 0;
+    const bAvc = /^avc1/i.test(b.vcodec || "") ? 1 : 0;
+    if (bAvc !== aAvc) return bAvc - aAvc;
+    const hDiff = (b.height || 0) - (a.height || 0);
+    if (hDiff !== 0) return hDiff;
+    const fpsDiff = (b.fps || 0) - (a.fps || 0);
+    if (fpsDiff !== 0) return fpsDiff;
+    return (b.tbr || b.vbr || 0) - (a.tbr || a.vbr || 0);
+  });
+
+  const audioCandidates = deduped.filter(
+    (f) =>
+      (f.ext === "m4a" || f.ext === "mp4") &&
+      Boolean(f.acodec && f.acodec !== "none") &&
+      (!f.vcodec || f.vcodec === "none"),
+  );
+  audioCandidates.sort((a, b) => {
+    const aNonDrc = isYtDlpFormatDrc(a) ? 0 : 1;
+    const bNonDrc = isYtDlpFormatDrc(b) ? 0 : 1;
+    if (bNonDrc !== aNonDrc) return bNonDrc - aNonDrc;
+    const aAac = /^mp4a/i.test(a.acodec || "") ? 1 : 0;
+    const bAac = /^mp4a/i.test(b.acodec || "") ? 1 : 0;
+    if (bAac !== aAac) return bAac - aAac;
+    return (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0);
+  });
+
+  return {
+    video: videoCandidates[0] ?? null,
+    audio: audioCandidates[0] ?? null,
+  };
+}
+
+interface RemoteRecoveryOutcome {
+  target: StreamTarget | null;
+  verifiedYtDlpFormatId?: string;
+  ytDlpCheckedAndUnmatched: boolean;
+  sawIncompatibleRefresh: boolean;
+}
+
+interface ProgressiveBinding {
+  formatId: string;
+  itag: number;
+  progressiveTarget: StreamTargetProgressive;
+  fallbackTarget: StreamTargetRemote;
+}
+
+interface ActiveProgressiveEntry {
+  videoId: string;
+  logicalFormatId: string;
+  handle: ProgressiveDownloadHandle;
+  storeKey: string;
+  storageFormatId: string;
+  expectedSize: number;
+  mimeType: string;
+  dashRanges?: DashRangeIdentity;
+  rev?: string | null;
+  xtags?: string | null;
+  bindings: ProgressiveBinding[];
+}
+
 export class VideoResolver {
   private readonly cache: TtlLruCache<string, ResolvedVideoRecord>;
-  private readonly recoveryInflight = new Map<string, Promise<StreamTarget | null>>();
+  private readonly remoteRecoveryInflight = new Map<string, Promise<RemoteRecoveryOutcome>>();
+  private readonly failedRemoteCooldownByKey = new Map<
+    string,
+    { expiresAt: number; outcome: RemoteRecoveryOutcome }
+  >();
+  private readonly tier3RecoveryInflight = new Map<string, Promise<StreamTarget | null>>();
+  private readonly coldTier3Inflight = new Map<string, Promise<ResolvedVideoRecord>>();
   private readonly videoRefreshInflight = new Map<string, Promise<ResolvedVideoRecord>>();
-  private readonly probeSemaphore = new Semaphore(6);
-  private readonly tier3Semaphore = new Semaphore(2);
+  private readonly activeProgressive = new Map<string, ActiveProgressiveEntry>();
+  private readonly startingHandles = new Set<ProgressiveDownloadHandle>();
+  private readonly claimedDestinations = new Set<string>();
+  private readonly activeDiskJobs = new Set<Promise<unknown>>();
+  private readonly activeRemuxProcs = new Set<{
+    killSync: () => void;
+    exited: Promise<unknown>;
+  }>();
+  private readonly probeSemaphore = new Semaphore(6, 256);
+  private readonly hintsSemaphore = new Semaphore(8, 256);
+  private readonly tier3Semaphore = new Semaphore(2, 256);
+  private readonly coldTier3Semaphore = new Semaphore(2, 256);
+  private remuxSeq = 0;
+  private writerSeq = 0;
+  private recordSeq = 0;
+  private resolveSeq = 0;
+  private stopped = false;
   private readonly metrics: PlaybackMetrics = {
     totalRequests: 0,
     tier1Hits: 0,
@@ -227,6 +765,104 @@ export class VideoResolver {
     return { ...this.metrics };
   }
 
+  stop(): void {
+    this.stopped = true;
+    for (const handle of this.startingHandles) {
+      handle.cancel("Server shutting down");
+    }
+    this.startingHandles.clear();
+    for (const entry of this.activeProgressive.values()) {
+      entry.handle.cancel("Server shutting down");
+    }
+    this.activeProgressive.clear();
+    for (const remux of [...this.activeRemuxProcs]) {
+      remux.killSync();
+    }
+    this.ytDlp.stop?.();
+  }
+
+  private trackDiskJob<T>(promise: Promise<T>): Promise<T> {
+    const settled = promise.then(
+      () => {},
+      () => {},
+    );
+    this.activeDiskJobs.add(settled);
+    settled.finally(() => {
+      this.activeDiskJobs.delete(settled);
+    });
+    return promise;
+  }
+
+  private claimUniqueDestination(
+    videoId: string,
+    baseStorageFormatId: string,
+    ext: string,
+    allowReuseExisting = false,
+  ): { storageFormatId: string; outPath: string; storeKey: string; releaseClaim: () => void } {
+    let storageFormatId = baseStorageFormatId;
+    let outPath = this.ephemeralStore.getPathFor(videoId, storageFormatId, ext);
+    let storeKey = this.ephemeralStore.makeKey(videoId, storageFormatId);
+    while (
+      this.claimedDestinations.has(outPath) ||
+      (!allowReuseExisting &&
+        (this.ephemeralStore.isRetired(storeKey, outPath) ||
+          Boolean(this.ephemeralStore.getByKey(storeKey)) ||
+          fs.existsSync(outPath)))
+    ) {
+      storageFormatId = `${baseStorageFormatId.slice(0, 56)}-g${++this.writerSeq}-${crypto.randomBytes(3).toString("hex")}`;
+      outPath = this.ephemeralStore.getPathFor(videoId, storageFormatId, ext);
+      storeKey = this.ephemeralStore.makeKey(videoId, storageFormatId);
+    }
+    this.claimedDestinations.add(outPath);
+    let released = false;
+    return {
+      storageFormatId,
+      outPath,
+      storeKey,
+      releaseClaim: () => {
+        if (released) return;
+        released = true;
+        this.claimedDestinations.delete(outPath);
+      },
+    };
+  }
+
+  hasActiveDiskWork(): boolean {
+    return (
+      this.activeDiskJobs.size > 0 ||
+      this.activeProgressive.size > 0 ||
+      this.startingHandles.size > 0 ||
+      this.activeRemuxProcs.size > 0
+    );
+  }
+
+  async waitForAllDiskWorkSettled(): Promise<void> {
+    while (true) {
+      const waiters: Array<Promise<unknown>> = [];
+      for (const job of [...this.activeDiskJobs]) {
+        waiters.push(job);
+      }
+      for (const entry of [...this.activeProgressive.values()]) {
+        waiters.push(entry.handle.done.catch(() => {}));
+      }
+      for (const h of [...this.startingHandles]) {
+        waiters.push(h.done.catch(() => {}));
+      }
+      for (const remux of [...this.activeRemuxProcs]) {
+        waiters.push(remux.exited);
+      }
+      if (waiters.length === 0) break;
+      await Promise.allSettled(waiters);
+    }
+    if (this.ytDlp.awaitShutdown) {
+      await this.ytDlp.awaitShutdown(60_000).catch(() => {});
+    }
+  }
+
+  async awaitShutdown(timeoutMs = 1000): Promise<void> {
+    await withTimeoutNull(this.waitForAllDiskWorkSettled(), timeoutMs);
+  }
+
   getCached(videoId: string): ResolvedVideoRecord | undefined {
     const rec = this.cache.get(videoId);
     if (rec && Date.now() >= rec.expiresAt - 60_000) {
@@ -240,11 +876,38 @@ export class VideoResolver {
     this.cache.delete(videoId);
   }
 
-  markTargetStale(videoId: string, formatId: string): void {
+  invalidateVideoIfTargetMatches(
+    videoId: string,
+    formatId: string,
+    expectedTarget: StreamTarget,
+  ): void {
+    const rec = this.cache.get(videoId);
+    if (rec && rec.targetsByFid.get(formatId) === expectedTarget) {
+      this.cache.delete(videoId);
+    }
+  }
+
+  /**
+   * Mark the owning cached record so the next manifest/video metadata request
+   * resolves fresh metadata from YouTube, without evicting other healthy in-flight
+   * tracks that are still streaming from this record.
+   */
+  markNeedsMetadataRefresh(
+    videoId: string,
+    formatId: string,
+    expectedTarget: StreamTarget,
+  ): void {
+    const rec = this.cache.get(videoId);
+    if (rec && rec.targetsByFid.get(formatId) === expectedTarget) {
+      rec.needsMetadataRefresh = true;
+    }
+  }
+
+  markTargetStale(videoId: string, formatId: string, expectedTarget?: StreamTargetRemote): void {
     const rec = this.cache.get(videoId);
     if (!rec) return;
     const t = rec.targetsByFid.get(formatId);
-    if (t && t.kind === "remote") {
+    if (t && t.kind === "remote" && (!expectedTarget || t === expectedTarget)) {
       t.stale = true;
     }
   }
@@ -257,70 +920,171 @@ export class VideoResolver {
     return hints.captions;
   }
 
-  getStreamTarget(videoId: string, formatId: string | null, itag: number | null): StreamTarget | null {
+  getStreamTarget(
+    videoId: string,
+    formatId: string | null,
+    itag: number | null,
+    expected?: ExpectedTargetIdentity,
+  ): StreamTarget | null {
     const rec = this.getCached(videoId);
     if (!rec) return null;
-    if (formatId) {
-      const exact = rec.targetsByFid.get(formatId);
-      if (exact) return exact;
-    }
-    if (itag && itag > 0) {
-      const byItag = rec.targetsByItag.get(itag);
-      if (byItag) return byItag;
-    }
-    return null;
+    return findStreamTargetInRecord(rec, formatId, itag, expected);
   }
 
   async resolveVideo(
     videoId: string,
     origin: string,
-    options: { forceRefresh?: boolean; minTier?: PlaybackTier; skipFastInnertube?: boolean } = {},
+    options: {
+      forceRefresh?: boolean;
+      minTier?: PlaybackTier;
+      maxTier?: PlaybackTier;
+      skipFastInnertube?: boolean;
+      publishToCache?: boolean;
+      requireDashPair?: boolean;
+    } = {},
   ): Promise<ResolvedVideoRecord> {
     assertValidVideoId(videoId);
     this.metrics.totalRequests++;
     const minTier = options.minTier ?? 1;
+    const maxTier = options.maxTier ?? 3;
+    const publishToCache = options.publishToCache ?? true;
+    const requireDashPair = options.requireDashPair ?? false;
 
-    if (!options.forceRefresh && minTier === 1) {
-      const cached = this.getCached(videoId);
-      if (cached) return cached;
-    } else if (options.forceRefresh) {
-      // Do not overwrite cache prematurely; only replace if resolution succeeds and does not downgrade tier
+    const cached = !options.forceRefresh && minTier === 1 && publishToCache
+      ? this.getCached(videoId)
+      : undefined;
+    const cachedUsable =
+      Boolean(cached) &&
+      !cached!.needsMetadataRefresh &&
+      (!requireDashPair || hasCompleteDashPair(cached!.adaptiveFormats));
+    if (cachedUsable) {
+      return cached!;
     }
 
-    const cacheKey = options.forceRefresh || minTier > 1 ? `${videoId}:t${minTier}:${Date.now()}` : videoId;
-    const record = await this.cache.getOrCompute(cacheKey, async () => {
+    // Mid-playback refreshes (`publishToCache: false`) are already single-flighted per
+    // manifest generation by `singleFlightRefresh`; bypass the cache inflight key so two
+    // different manifest generations never collide inside `cache.getOrCompute`.
+    if (!publishToCache) {
+      return await this.executeEscalationLadder(
+        videoId,
+        origin,
+        minTier,
+        maxTier,
+        Boolean(options.skipFastInnertube),
+        requireDashPair,
+      );
+    }
+
+    const forceBecauseStaleOrIncomplete = Boolean(cached && !cachedUsable);
+    const usePrimaryInflightKey =
+      !options.forceRefresh &&
+      !forceBecauseStaleOrIncomplete &&
+      !requireDashPair &&
+      minTier === 1 &&
+      maxTier === 3;
+    const inflightKey = usePrimaryInflightKey
+      ? `${videoId}:primary`
+      : `${videoId}:t${minTier}-${maxTier}:${requireDashPair ? "dash" : "any"}:${options.skipFastInnertube ? "ytdlp" : "all"}`;
+    const callerForceRefresh = Boolean(options.forceRefresh || forceBecauseStaleOrIncomplete);
+
+    // Always pass `cache: false` to `getOrCompute` (single-flight coalescing only) so ALL primary
+    // cache writes flow through `publishPrimaryRecord`. Assign `startedSeq`/`startedAt`/`producerForceRefresh`
+    // inside the producer callback so late waiters joining an older in-flight resolution cannot
+    // elevate its sequence past a newer record.
+    const candidate = await this.cache.getOrCompute(inflightKey, async () => {
+      const producerStartedAt = Date.now();
+      const producerStartSeq = ++this.resolveSeq;
       const resolved = await this.executeEscalationLadder(
         videoId,
         origin,
         minTier,
+        maxTier,
         Boolean(options.skipFastInnertube),
+        requireDashPair,
       );
-      const ttlMs = Math.max(
-        60_000,
-        Math.min(this.config.playback.videoCacheTtlSec * 1000, resolved.expiresAt - Date.now()),
-      );
-      return { value: resolved, ttlMs, cache: cacheKey === videoId };
+      resolved.startedAt = producerStartedAt;
+      resolved.startedSeq = producerStartSeq;
+      resolved.producerForceRefresh = callerForceRefresh;
+      return { value: resolved, ttlMs: 60_000, cache: false };
     });
 
-    if (cacheKey !== videoId) {
-      const existing = this.cache.get(videoId);
-      // Never let a slower lower-tier refresh clobber a newer higher-tier promotion
-      if (!existing || record.tier >= existing.tier || Date.now() >= existing.expiresAt - 60_000) {
-        const ttlMs = Math.max(
-          60_000,
-          Math.min(this.config.playback.videoCacheTtlSec * 1000, record.expiresAt - Date.now()),
-        );
-        this.cache.set(videoId, record, ttlMs);
-      }
+    return this.publishPrimaryRecord(videoId, candidate, {
+      startedAt: candidate.startedAt ?? candidate.resolvedAt,
+      startSeq: candidate.startedSeq ?? 0,
+      forceRefresh: Boolean(candidate.producerForceRefresh),
+      requireDashPair,
+    });
+  }
+
+  private storePrimaryRecord(videoId: string, record: ResolvedVideoRecord, startSeq: number): void {
+    record.startedSeq = Math.max(record.startedSeq ?? 0, startSeq);
+    const ttlMs = Math.max(
+      60_000,
+      Math.min(this.config.playback.videoCacheTtlSec * 1000, record.expiresAt - Date.now()),
+    );
+    this.cache.set(videoId, record, ttlMs);
+  }
+
+  private publishPrimaryRecord(
+    videoId: string,
+    candidate: ResolvedVideoRecord,
+    opts: { startedAt: number; startSeq: number; forceRefresh: boolean; requireDashPair: boolean },
+  ): ResolvedVideoRecord {
+    const now = Date.now();
+    const existing = this.cache.get(videoId);
+    if (existing === candidate) {
+      return existing;
+    }
+    const existingFresh =
+      Boolean(existing) &&
+      !existing!.needsMetadataRefresh &&
+      now < existing!.expiresAt - 60_000;
+
+    if (!existingFresh) {
+      this.storePrimaryRecord(videoId, candidate, opts.startSeq);
+      return candidate;
     }
 
-    return record;
+    const existingComplete = hasCompleteDashPair(existing!.adaptiveFormats);
+    const candidateComplete = hasCompleteDashPair(candidate.adaptiveFormats);
+
+    // Never downgrade a fresh complete DASH record with an incomplete/muxed-only record
+    if (existingComplete && !candidateComplete) {
+      return existing!;
+    }
+    // Always upgrade an incomplete record with a complete DASH pair
+    if (!existingComplete && candidateComplete) {
+      this.storePrimaryRecord(videoId, candidate, opts.startSeq);
+      return candidate;
+    }
+    // Never allow a slower older resolve to overwrite a fresh, equally-complete record
+    // produced by a newer resolve (even if the slower call escalated to a higher tier).
+    if (
+      opts.startSeq < (existing!.startedSeq ?? 0) ||
+      (!opts.forceRefresh && existing!.resolvedAt > opts.startedAt)
+    ) {
+      if (!opts.requireDashPair || existingComplete) {
+        return existing!;
+      }
+    }
+    if (opts.forceRefresh || candidate.tier >= existing!.tier || candidate.resolvedAt >= existing!.resolvedAt) {
+      this.storePrimaryRecord(videoId, candidate, opts.startSeq);
+      return candidate;
+    }
+    if (!opts.requireDashPair || existingComplete) {
+      return existing!;
+    }
+    this.storePrimaryRecord(videoId, candidate, opts.startSeq);
+    return candidate;
   }
 
   /**
    * Called by `/videoplayback` when an upstream `googlevideo.com` URL fails
    * mid-playback (403, 410, 429, 5xx, stall). Escalates silently:
    *   Tier 1 -> Tier 1 refresh (if stale) or Tier 2 (Firefox cookies) -> Tier 3 (local disk buffer).
+   *
+   * Remote refresh steps resolve with `publishToCache: false` and `maxTier` caps so
+   * incompatible layouts or lower tiers never poison the live cache or clobber other tracks.
    */
   async recoverFormatMidPlayback(
     videoId: string,
@@ -328,168 +1092,1295 @@ export class VideoResolver {
     itag: number,
     origin: string,
     failedTarget: StreamTargetRemote,
+    options: {
+      requestedRange?: RequestedRangeInfo;
+      requestedRangeStart?: number;
+      maxSequentialOffsetBytes?: number;
+    } = {},
   ): Promise<StreamTarget | null> {
     assertValidVideoId(videoId);
-    const inflightKey = `${videoId}:${formatId || itag}`;
-    const existing = this.recoveryInflight.get(inflightKey);
-    if (existing) return existing;
+    const cacheFormatId = formatId || String(itag);
+    // Key recovery single-flight maps by full representation identity (gen, layout, clen, drc,
+    // xtags, lmt, rev, initHash, indexHash) so concurrent recoveries NEVER share incompatible results.
+    const inflightKey = makeRecoveryInflightKey(videoId, cacheFormatId, failedTarget);
+    const failedIsDrc = Boolean(failedTarget.isDrc || cacheFormatId.includes("drc"));
+    const failedLmt = failedTarget.lmt && failedTarget.lmt !== "0" ? failedTarget.lmt : "";
+    const failedLayout = formatDashLayoutKey(failedTarget.dashRanges);
+    const baseStorageFormatId = computeRepresentationStorageFormatId(cacheFormatId, {
+      clen: failedTarget.clen,
+      layout: failedLayout,
+      rev: failedTarget.rev,
+      xtags: failedTarget.xtags,
+      initHash: failedTarget.dashRanges?.initHash,
+      indexHash: failedTarget.dashRanges?.indexHash,
+    });
+    const baseStoreKey = this.ephemeralStore.makeKey(videoId, baseStorageFormatId);
+    const legacyStoreKey = this.ephemeralStore.makeKey(videoId, cacheFormatId);
+
+    const matchesDashRanges = (actual?: DashRangeIdentity | null): boolean => {
+      if (!failedTarget.dashRanges) return true;
+      if (
+        !actual ||
+        actual.init !== failedTarget.dashRanges.init ||
+        actual.index !== failedTarget.dashRanges.index
+      ) {
+        return false;
+      }
+      if (failedTarget.dashRanges.initHash && actual.initHash && actual.initHash !== failedTarget.dashRanges.initHash) {
+        return false;
+      }
+      if (failedTarget.dashRanges.indexHash && actual.indexHash && actual.indexHash !== failedTarget.dashRanges.indexHash) {
+        return false;
+      }
+      return true;
+    };
+
+    const matchesStrictHashes = (actual?: DashRangeIdentity | null): boolean => {
+      if (!matchesDashRanges(actual)) return false;
+      if (failedTarget.dashRanges?.initHash && actual?.initHash !== failedTarget.dashRanges.initHash) {
+        return false;
+      }
+      if (failedTarget.dashRanges?.indexHash && actual?.indexHash !== failedTarget.dashRanges.indexHash) {
+        return false;
+      }
+      return true;
+    };
+
+    const matchesRemoteIdentity = (candidate: StreamTargetRemote): boolean => {
+      if (failedTarget.clen > 0 && candidate.clen !== failedTarget.clen) {
+        return false;
+      }
+      if (failedLmt) {
+        const candLmt = candidate.lmt && candidate.lmt !== "0" ? candidate.lmt : "";
+        if (candLmt !== failedLmt) {
+          return false;
+        }
+      }
+      if (failedTarget.xtags && candidate.xtags !== failedTarget.xtags) {
+        return false;
+      }
+      if (failedTarget.rev && !failedTarget.rev.startsWith("h:") && candidate.rev !== failedTarget.rev) {
+        return false;
+      }
+      return matchesDashRanges(candidate.dashRanges);
+    };
+
+    const isRecoveredTargetCompatible = (t: StreamTarget): boolean => {
+      const exactSize = t.kind === "remote" ? t.clen : t.size;
+      if (failedTarget.clen > 0 && exactSize !== failedTarget.clen) return false;
+      if (failedTarget.rev && t.rev !== failedTarget.rev) return false;
+      if (failedTarget.xtags && t.xtags !== failedTarget.xtags) return false;
+      return matchesStrictHashes(t.dashRanges);
+    };
+
+    const doesActiveProgressiveMatch = (entry: ActiveProgressiveEntry): boolean => {
+      if (entry.videoId !== videoId || entry.logicalFormatId !== cacheFormatId) return false;
+      if (entry.handle.getStatus() === "failed") return false;
+      if (failedTarget.clen > 0 && entry.expectedSize !== failedTarget.clen) return false;
+      if (failedTarget.rev && entry.rev !== failedTarget.rev) return false;
+      if (failedTarget.xtags && entry.xtags !== failedTarget.xtags) return false;
+      return matchesStrictHashes(entry.dashRanges);
+    };
+
+    const findCompatibleActiveProgressive = (): ActiveProgressiveEntry | null => {
+      const direct = this.activeProgressive.get(baseStoreKey);
+      if (direct && doesActiveProgressiveMatch(direct)) return direct;
+      for (const entry of this.activeProgressive.values()) {
+        if (doesActiveProgressiveMatch(entry)) return entry;
+      }
+      return null;
+    };
+
+    const attachProgressiveBinding = (entry: ActiveProgressiveEntry): StreamTargetProgressive => {
+      const existingBinding = entry.bindings.find(
+        (b) => b.formatId === cacheFormatId && b.fallbackTarget === failedTarget,
+      );
+      if (existingBinding) {
+        const rec = this.cache.get(videoId);
+        if (rec && rec.targetsByFid.get(cacheFormatId) === failedTarget) {
+          rec.targetsByFid.set(cacheFormatId, existingBinding.progressiveTarget);
+          if (itag > 0 && rec.targetsByItag.get(itag) === failedTarget) {
+            rec.targetsByItag.set(itag, existingBinding.progressiveTarget);
+          }
+        }
+        return existingBinding.progressiveTarget;
+      }
+      const progressiveTarget = this.promoteToProgressiveTarget(
+        videoId,
+        cacheFormatId,
+        itag,
+        entry.handle,
+        entry.storeKey,
+        entry.dashRanges,
+        entry.rev ?? failedTarget.rev,
+        entry.xtags ?? failedTarget.xtags,
+        failedTarget,
+      );
+      entry.bindings.push({
+        formatId: cacheFormatId,
+        itag,
+        progressiveTarget,
+        fallbackTarget: failedTarget,
+      });
+      return progressiveTarget;
+    };
 
     const findByteCompatibleTarget = (rec: ResolvedVideoRecord): StreamTarget | null => {
       const exact = formatId ? rec.targetsByFid.get(formatId) : undefined;
       if (exact) {
-        if (exact.kind === "local") return exact;
-        if (failedTarget.clen === 0 || exact.clen === 0 || exact.clen === failedTarget.clen) {
+        if (exact.kind === "local" || exact.kind === "progressive") {
+          if (isRecoveredTargetCompatible(exact)) {
+            return exact;
+          }
+        } else if (matchesRemoteIdentity(exact)) {
           return exact;
         }
       }
-      // Fallback by itag ONLY when byte length matches so Shaka's byte offsets remain valid
-      if (itag > 0) {
-        const byItag = rec.targetsByItag.get(itag);
-        if (byItag && byItag.kind === "remote") {
-          if (failedTarget.clen > 0 && byItag.clen > 0 && byItag.clen === failedTarget.clen) {
-            return byItag;
+      // Fallback by (itag, isDrc, exact clen, exact DASH ranges, lmt, xtags) across all tracks
+      if (itag > 0 && failedTarget.clen > 0) {
+        for (const candidate of rec.targetsByFid.values()) {
+          if (
+            candidate.kind === "remote" &&
+            candidate.itag === itag &&
+            Boolean(candidate.isDrc) === failedIsDrc &&
+            matchesRemoteIdentity(candidate)
+          ) {
+            return candidate;
           }
         }
       }
       return null;
     };
 
-    const promise = (async (): Promise<StreamTarget | null> => {
-      this.metrics.midPlaybackRecoveries++;
-      this.logger.warn("Mid-playback upstream failure; attempting silent recovery", {
-        videoId,
-        formatId,
-        itag,
-        currentTier: failedTarget.tier,
-      });
-
-      const currentRec = this.cache.get(videoId);
-      const ageMs = currentRec ? Date.now() - currentRec.resolvedAt : Infinity;
-
-      // Step 1: If Tier 1 and entry was cached for > 20s (or came from fast InnerTube), try yt-dlp Tier 1 refresh once
-      if (failedTarget.tier === 1 && (ageMs > 20_000 || currentRec?.resolvedBy === "innertube")) {
-        try {
-          const fresh = await this.singleFlightRefresh(videoId, 1, () =>
-            this.resolveVideo(videoId, origin, {
-              forceRefresh: true,
-              minTier: 1,
-              skipFastInnertube: true,
-            }),
-          );
-          const nextTarget = findByteCompatibleTarget(fresh);
-          if (nextTarget && (nextTarget.kind === "local" || nextTarget.url !== failedTarget.url)) {
-            this.logger.info("Mid-playback recovery succeeded via Tier 1 yt-dlp refresh", { videoId, formatId });
-            return nextTarget;
-          }
-        } catch (err) {
-          this.logger.warn("Tier 1 refresh failed during mid-playback recovery", {
-            videoId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
+    /**
+     * When `failedTarget` already has verified SHA-256 `initHash`/`indexHash` digests
+     * (from initial probe or Shaka's first 206 fetch), NEVER copy them blindly onto a
+     * candidate remote URL: verify the candidate's actual init/index bytes over IPv4 first!
+     */
+    const verifyRemoteCandidateDigests = async (
+      candidate: StreamTargetRemote,
+    ): Promise<{ verified: true; dashRanges?: DashRangeIdentity } | { verified: false }> => {
+      const expectedInitHash = failedTarget.dashRanges?.initHash;
+      const expectedIndexHash = failedTarget.dashRanges?.indexHash;
+      if (!expectedInitHash && !expectedIndexHash) {
+        return { verified: true, dashRanges: candidate.dashRanges };
+      }
+      if (
+        expectedInitHash &&
+        candidate.dashRanges?.initHash &&
+        candidate.dashRanges.initHash !== expectedInitHash
+      ) {
+        return { verified: false };
+      }
+      if (
+        expectedIndexHash &&
+        candidate.dashRanges?.indexHash &&
+        candidate.dashRanges.indexHash !== expectedIndexHash
+      ) {
+        return { verified: false };
       }
 
-      // Step 2: Escalate silently to Tier 2 (Firefox cookies) if configured and not already Tier 2
-      if (failedTarget.tier < 2 && this.config.playback.authFallback.enabled) {
-        try {
-          const tier2Rec = await this.singleFlightRefresh(videoId, 2, () =>
-            this.resolveVideo(videoId, origin, { forceRefresh: true, minTier: 2 }),
-          );
-          const nextTarget = findByteCompatibleTarget(tier2Rec);
-          if (nextTarget) {
-            this.logger.info("Mid-playback recovery escalated to Tier 2", { videoId, formatId });
-            return nextTarget;
-          }
-        } catch (err) {
-          this.logger.warn("Tier 2 escalation failed during mid-playback recovery", {
-            videoId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
+      const needInitVerify = Boolean(expectedInitHash && !candidate.dashRanges?.initHash);
+      const needIndexVerify = Boolean(expectedIndexHash && !candidate.dashRanges?.indexHash);
+      if (!needInitVerify && !needIndexVerify) {
+        return { verified: true, dashRanges: candidate.dashRanges };
       }
 
-      // Step 3: Escalate silently to Tier 3 (download exact formatId into ephemeral disk buffer)
-      if (this.config.playback.ephemeralBuffer.enabled) {
-        const selector = formatId || String(itag);
-        const existingLocal = this.ephemeralStore.get(videoId, selector);
-        if (existingLocal) {
-          return this.promoteToLocalTarget(videoId, selector, itag, existingLocal.filePath, existingLocal.mimeType);
+      const baseRanges = candidate.dashRanges ?? failedTarget.dashRanges;
+      if (!baseRanges) return { verified: false };
+      const initB = parseRangeBounds(baseRanges.init);
+      const indexB = parseRangeBounds(baseRanges.index);
+      if ((needInitVerify && !initB) || (needIndexVerify && !indexB)) {
+        return { verified: false };
+      }
+
+      try {
+        const verified = await verifyRemoteDashRangeDigests(
+          candidate.url,
+          {
+            ...(needInitVerify && initB ? { initRange: initB, initHash: expectedInitHash } : {}),
+            ...(needIndexVerify && indexB ? { indexRange: indexB, indexHash: expectedIndexHash } : {}),
+            expectedTotal: failedTarget.clen > 0 ? failedTarget.clen : undefined,
+          },
+          this.fetchRaw,
+          candidate.httpHeaders,
+        );
+        if (!verified) {
+          return { verified: false };
         }
+        const finalInitHash = candidate.dashRanges?.initHash ?? verified.initHash;
+        const finalIndexHash = candidate.dashRanges?.indexHash ?? verified.indexHash;
+        return {
+          verified: true,
+          dashRanges: {
+            init: baseRanges.init,
+            index: baseRanges.index,
+            ...(finalInitHash ? { initHash: finalInitHash } : {}),
+            ...(finalIndexHash ? { indexHash: finalIndexHash } : {}),
+          },
+        };
+      } catch {
+        return { verified: false };
+      }
+    };
 
-        return await this.tier3Semaphore.run(async () => {
-          const recheck = this.ephemeralStore.get(videoId, selector);
-          if (recheck) {
-            return this.promoteToLocalTarget(videoId, selector, itag, recheck.filePath, recheck.mimeType);
+    const buildRecoveredRemoteTarget = (
+      candidate: StreamTargetRemote,
+      verifiedDashRanges: DashRangeIdentity | undefined,
+    ): StreamTargetRemote => {
+      const mergedLmt = candidate.lmt && candidate.lmt !== "0" ? candidate.lmt : "0";
+      const verifiedInitHash = verifiedDashRanges?.initHash || "";
+      const verifiedIndexHash = verifiedDashRanges?.indexHash || "";
+      // Preserve an existing hash-derived rev (`h:...`) after verifying all known init/index digests
+      // (including when the issued rev came from initHash alone before indexHash was learned mid-playback).
+      const matchesIssuedHashRev =
+        Boolean(failedTarget.rev?.startsWith("h:")) &&
+        Boolean(verifiedDashRanges) &&
+        matchesStrictHashes(verifiedDashRanges) &&
+        (computeRepresentationRev({ dashRanges: verifiedDashRanges }) === failedTarget.rev ||
+          (verifiedInitHash.length > 0 &&
+            computeRepresentationRev({
+              dashRanges: {
+                init: verifiedDashRanges!.init,
+                index: verifiedDashRanges!.index,
+                initHash: verifiedInitHash,
+              },
+            }) === failedTarget.rev) ||
+          (verifiedIndexHash.length > 0 &&
+            computeRepresentationRev({
+              dashRanges: {
+                init: verifiedDashRanges!.init,
+                index: verifiedDashRanges!.index,
+                indexHash: verifiedIndexHash,
+              },
+            }) === failedTarget.rev));
+      const mergedRev = matchesIssuedHashRev
+        ? failedTarget.rev!
+        : computeRepresentationRev({
+            lmt: mergedLmt,
+            dashRanges: verifiedDashRanges,
+          });
+      return {
+        ...candidate,
+        formatId: cacheFormatId,
+        clen: candidate.clen || failedTarget.clen,
+        dashRanges: verifiedDashRanges,
+        lmt: mergedLmt,
+        rev: mergedRev,
+        xtags: candidate.xtags ?? null,
+        ytDlpFormatId: candidate.ytDlpFormatId ?? failedTarget.ytDlpFormatId,
+        isDrc: candidate.isDrc ?? failedIsDrc,
+      };
+    };
+
+    const publishRecoveredRemoteTarget = (
+      merged: StreamTargetRemote,
+      freshRec: ResolvedVideoRecord,
+    ): void => {
+      // Publish ONLY after compatibility verification AND only if live cache still owns `failedTarget`
+      const liveRec = this.cache.get(videoId);
+      if (liveRec && liveRec.targetsByFid.get(cacheFormatId) === failedTarget) {
+        liveRec.targetsByFid.set(cacheFormatId, merged);
+        if (
+          itag > 0 &&
+          (!liveRec.targetsByItag.has(itag) ||
+            liveRec.targetsByItag.get(itag) === failedTarget ||
+            (!merged.isDrc && liveRec.targetsByItag.get(itag)?.formatId === cacheFormatId))
+        ) {
+          liveRec.targetsByItag.set(itag, merged);
+        }
+        if (freshRec.expiresAt > liveRec.expiresAt) {
+          liveRec.expiresAt = freshRec.expiresAt;
+        }
+      }
+    };
+
+    const findAndReuseValidLocal = (): StreamTargetLocal | null => {
+      const candidates = this.ephemeralStore.findEntriesForVideo(videoId);
+      for (const entry of candidates) {
+        const matchesLogicalFid =
+          entry.meta?.formatId === cacheFormatId ||
+          (!entry.meta?.formatId && entry.key === legacyStoreKey) ||
+          entry.key === baseStoreKey;
+        if (!matchesLogicalFid) continue;
+        if (failedTarget.clen > 0 && entry.size !== failedTarget.clen) {
+          // Only discard if this exact immutable representation key is corrupt on disk
+          if (entry.key === baseStoreKey) {
+            this.ephemeralStore.deleteByKey(entry.key);
           }
+          continue;
+        }
+        if (failedTarget.rev && entry.meta?.rev !== failedTarget.rev) {
+          continue;
+        }
+        if (failedTarget.xtags && entry.meta?.xtags !== failedTarget.xtags) {
+          continue;
+        }
+        if (failedLayout && entry.meta?.layout && entry.meta.layout !== failedLayout) {
+          continue;
+        }
+        if (!doesLocalFileMatchDashRanges(entry.filePath, failedTarget.mimeType, failedTarget.dashRanges)) {
+          if (entry.key === baseStoreKey) {
+            this.ephemeralStore.deleteByKey(entry.key);
+          }
+          continue;
+        }
+        // Restore accurate MIME type (startup disk scan labels .webm audio as video/webm)
+        entry.mimeType = failedTarget.mimeType;
+        const verifiedRanges = attachVerifiedLocalHashes(entry.filePath, failedTarget.dashRanges);
+        const targetRev =
+          entry.meta?.rev ??
+          failedTarget.rev ??
+          computeRepresentationRev({ lmt: failedTarget.lmt, dashRanges: verifiedRanges });
+        return this.promoteToLocalTarget(
+          videoId,
+          cacheFormatId,
+          itag,
+          entry.filePath,
+          entry.key,
+          failedTarget.mimeType,
+          verifiedRanges,
+          targetRev,
+          entry.meta?.xtags ?? failedTarget.xtags ?? null,
+          failedTarget,
+        );
+      }
+      return null;
+    };
 
-          const ext = failedTarget.mimeType.includes("webm")
-            ? "webm"
-            : failedTarget.mimeType.startsWith("audio/")
-              ? "m4a"
-              : "mp4";
-          const outPath = this.ephemeralStore.getPathFor(videoId, selector, ext);
-          const pinKey = this.ephemeralStore.makeKey(videoId, selector);
-          this.ephemeralStore.pin(pinKey);
+    // Phase 1: Shared remote refresh (Steps 1a, 1b, 2) — independent of caller byte offset so
+    // a far-seek caller never blocks a concurrent byte-0 caller from starting Tier 3!
+    const runRemotePhase = async (): Promise<RemoteRecoveryOutcome> => {
+      const cooled = this.failedRemoteCooldownByKey.get(inflightKey);
+      if (cooled) {
+        if (Date.now() < cooled.expiresAt) {
+          return cooled.outcome;
+        }
+        this.failedRemoteCooldownByKey.delete(inflightKey);
+      }
 
+      const existingRemote = this.remoteRecoveryInflight.get(inflightKey);
+      if (existingRemote) return existingRemote;
+
+      const remotePromise = (async (): Promise<RemoteRecoveryOutcome> => {
+        this.metrics.midPlaybackRecoveries++;
+        this.logger.warn("Mid-playback upstream failure; attempting silent recovery", {
+          videoId,
+          formatId: cacheFormatId,
+          itag,
+          currentTier: failedTarget.tier,
+        });
+
+        const currentRec = this.cache.get(videoId);
+        const targetResolvedAt = failedTarget.resolvedAt || currentRec?.resolvedAt || 0;
+        const ageMs = targetResolvedAt > 0 ? Date.now() - targetResolvedAt : Infinity;
+        let verifiedYtDlpFormatId: string | undefined = failedTarget.ytDlpFormatId;
+        let ytDlpCheckedAndUnmatched = false;
+        let sawIncompatibleRefresh = false;
+        let attemptedRemoteStep = false;
+
+        const refreshGen = failedTarget.recordGen ?? 0;
+
+        // Step 1a: Fast InnerTube refresh if Tier 1 came from InnerTube and is >20s old
+        if (
+          failedTarget.tier === 1 &&
+          failedTarget.resolvedBy === "innertube" &&
+          ageMs > 20_000
+        ) {
+          attemptedRemoteStep = true;
           try {
-            const useAuth = failedTarget.tier === 2 && this.config.playback.authFallback.enabled;
-            try {
-              await this.ytDlp.downloadFormat(videoId, selector, outPath, { useAuth });
-            } catch (firstErr) {
-              if (!useAuth && this.config.playback.authFallback.enabled) {
-                await this.ytDlp.downloadFormat(videoId, selector, outPath, { useAuth: true });
-              } else {
-                throw firstErr;
-              }
-            }
-
-            const entry = this.ephemeralStore.register(videoId, selector, outPath, failedTarget.mimeType);
-            // Verify byte compatibility with Shaka's already-parsed segment index
-            if (failedTarget.clen > 0 && entry.size !== failedTarget.clen) {
-              this.logger.warn("Tier 3 downloaded size differs from original stream; forcing player reload", {
-                videoId,
-                formatId: selector,
-                expectedClen: failedTarget.clen,
-                actualSize: entry.size,
-              });
-              this.invalidateVideo(videoId);
-              return null;
-            }
-            const localTarget = this.promoteToLocalTarget(
+            const fresh = await this.singleFlightRefresh(
               videoId,
-              selector,
-              itag,
-              outPath,
-              failedTarget.mimeType,
+              1,
+              () =>
+                this.resolveVideo(videoId, origin, {
+                  forceRefresh: true,
+                  minTier: 1,
+                  maxTier: 1,
+                  skipFastInnertube: false,
+                  publishToCache: false,
+                }),
+              `innertube:g${refreshGen}`,
             );
-            this.metrics.tier3Hits++;
-            this.logger.info("Mid-playback recovery escalated to Tier 3 ephemeral buffer", {
-              videoId,
-              formatId: selector,
-            });
-            return localTarget;
+            const nextTarget = findByteCompatibleTarget(fresh);
+            if (nextTarget) {
+              if (nextTarget.kind !== "remote") {
+                return { target: nextTarget, verifiedYtDlpFormatId, ytDlpCheckedAndUnmatched, sawIncompatibleRefresh };
+              }
+              if (nextTarget.url !== failedTarget.url) {
+                const digestCheck = await verifyRemoteCandidateDigests(nextTarget);
+                if (digestCheck.verified) {
+                  const merged = buildRecoveredRemoteTarget(nextTarget, digestCheck.dashRanges);
+                  if (isRecoveredTargetCompatible(merged)) {
+                    publishRecoveredRemoteTarget(merged, fresh);
+                    this.logger.info("Mid-playback recovery succeeded via Tier 1 fast refresh", {
+                      videoId,
+                      formatId: cacheFormatId,
+                      resolvedBy: fresh.resolvedBy,
+                    });
+                    return {
+                      target: merged,
+                      verifiedYtDlpFormatId,
+                      ytDlpCheckedAndUnmatched,
+                      sawIncompatibleRefresh,
+                    };
+                  }
+                }
+                sawIncompatibleRefresh = true;
+              }
+            } else {
+              sawIncompatibleRefresh = true;
+            }
           } catch (err) {
-            this.logger.error("Tier 3 mid-playback buffer failed", {
+            this.logger.warn("Tier 1 fast refresh failed during mid-playback recovery", {
               videoId,
-              formatId: selector,
               error: err instanceof Error ? err.message : String(err),
             });
-            return null;
-          } finally {
-            this.ephemeralStore.unpin(pinKey);
           }
-        });
+        }
+
+        // Step 1b: yt-dlp Tier 1 refresh if cached >20s or originated from fast InnerTube
+        if (failedTarget.tier === 1 && (ageMs > 20_000 || failedTarget.resolvedBy === "innertube")) {
+          attemptedRemoteStep = true;
+          try {
+            const fresh = await this.singleFlightRefresh(
+              videoId,
+              1,
+              () =>
+                this.resolveVideo(videoId, origin, {
+                  forceRefresh: true,
+                  minTier: 1,
+                  maxTier: 1,
+                  skipFastInnertube: true,
+                  publishToCache: false,
+                }),
+              `ytdlp:g${refreshGen}`,
+            );
+            const nextTarget = findByteCompatibleTarget(fresh);
+            if (nextTarget) {
+              if (nextTarget.kind !== "remote") {
+                return { target: nextTarget, verifiedYtDlpFormatId, ytDlpCheckedAndUnmatched, sawIncompatibleRefresh };
+              }
+              if (nextTarget.ytDlpFormatId) {
+                verifiedYtDlpFormatId = nextTarget.ytDlpFormatId;
+              }
+              if (nextTarget.url !== failedTarget.url) {
+                const digestCheck = await verifyRemoteCandidateDigests(nextTarget);
+                if (digestCheck.verified) {
+                  const merged = buildRecoveredRemoteTarget(nextTarget, digestCheck.dashRanges);
+                  if (isRecoveredTargetCompatible(merged)) {
+                    publishRecoveredRemoteTarget(merged, fresh);
+                    this.logger.info("Mid-playback recovery succeeded via Tier 1 yt-dlp refresh", {
+                      videoId,
+                      formatId: cacheFormatId,
+                    });
+                    return {
+                      target: merged,
+                      verifiedYtDlpFormatId,
+                      ytDlpCheckedAndUnmatched,
+                      sawIncompatibleRefresh,
+                    };
+                  }
+                }
+                sawIncompatibleRefresh = true;
+              }
+            } else {
+              ytDlpCheckedAndUnmatched = true;
+              sawIncompatibleRefresh = true;
+            }
+          } catch (err) {
+            this.logger.warn("Tier 1 yt-dlp refresh failed during mid-playback recovery", {
+              videoId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        // Step 2: Escalate silently to Tier 2 (Firefox cookies), OR refresh an older Tier 2 URL once
+        if (
+          this.config.playback.authFallback.enabled &&
+          (failedTarget.tier < 2 || (failedTarget.tier === 2 && ageMs > 20_000))
+        ) {
+          attemptedRemoteStep = true;
+          const isTier2Refresh = failedTarget.tier === 2;
+          try {
+            const tier2Rec = await this.singleFlightRefresh(
+              videoId,
+              2,
+              () =>
+                this.resolveVideo(videoId, origin, {
+                  forceRefresh: true,
+                  minTier: 2,
+                  maxTier: 2,
+                  publishToCache: false,
+                }),
+              `${isTier2Refresh ? "refresh" : "escalate"}:g${refreshGen}`,
+            );
+            const nextTarget = findByteCompatibleTarget(tier2Rec);
+            if (nextTarget) {
+              if (nextTarget.kind !== "remote") {
+                return { target: nextTarget, verifiedYtDlpFormatId, ytDlpCheckedAndUnmatched, sawIncompatibleRefresh };
+              }
+              if (nextTarget.ytDlpFormatId) {
+                verifiedYtDlpFormatId = nextTarget.ytDlpFormatId;
+                ytDlpCheckedAndUnmatched = false;
+              }
+              if (!isTier2Refresh || nextTarget.url !== failedTarget.url) {
+                const digestCheck = await verifyRemoteCandidateDigests(nextTarget);
+                if (digestCheck.verified) {
+                  const merged = buildRecoveredRemoteTarget(nextTarget, digestCheck.dashRanges);
+                  if (isRecoveredTargetCompatible(merged)) {
+                    publishRecoveredRemoteTarget(merged, tier2Rec);
+                    this.logger.info(
+                      isTier2Refresh
+                        ? "Mid-playback recovery succeeded via Tier 2 refresh"
+                        : "Mid-playback recovery escalated to Tier 2",
+                      { videoId, formatId: cacheFormatId },
+                    );
+                    return {
+                      target: merged,
+                      verifiedYtDlpFormatId,
+                      ytDlpCheckedAndUnmatched,
+                      sawIncompatibleRefresh,
+                    };
+                  }
+                }
+                sawIncompatibleRefresh = true;
+              }
+            } else {
+              ytDlpCheckedAndUnmatched = true;
+              sawIncompatibleRefresh = true;
+            }
+          } catch (err) {
+            this.logger.warn(
+              isTier2Refresh
+                ? "Tier 2 refresh failed during mid-playback recovery"
+                : "Tier 2 escalation failed during mid-playback recovery",
+              {
+                videoId,
+                error: err instanceof Error ? err.message : String(err),
+              },
+            );
+          }
+        }
+
+        const negativeOutcome: RemoteRecoveryOutcome = {
+          target: null,
+          verifiedYtDlpFormatId,
+          ytDlpCheckedAndUnmatched,
+          sawIncompatibleRefresh,
+        };
+        if (attemptedRemoteStep) {
+          if (this.failedRemoteCooldownByKey.size >= 500) {
+            const oldestKey = this.failedRemoteCooldownByKey.keys().next().value;
+            if (oldestKey !== undefined) this.failedRemoteCooldownByKey.delete(oldestKey);
+          }
+          this.failedRemoteCooldownByKey.set(inflightKey, {
+            expiresAt: Date.now() + 30_000,
+            outcome: negativeOutcome,
+          });
+        }
+        return negativeOutcome;
+      })();
+
+      this.remoteRecoveryInflight.set(inflightKey, remotePromise);
+      try {
+        return await remotePromise;
+      } finally {
+        this.remoteRecoveryInflight.delete(inflightKey);
+      }
+    };
+
+    try {
+      const remoteOutcome = await runRemotePhase();
+      if (remoteOutcome.target) {
+        if (isRecoveredTargetCompatible(remoteOutcome.target)) {
+          return remoteOutcome.target;
+        }
+        remoteOutcome.sawIncompatibleRefresh = true;
       }
 
-      return null;
-    })();
+      // Phase 2: Step 3 Tier 3 ephemeral buffer — evaluate THIS caller's byte offset FIRST!
+      if (!this.config.playback.ephemeralBuffer.enabled || this.stopped) {
+        if (remoteOutcome.sawIncompatibleRefresh) {
+          this.markNeedsMetadataRefresh(videoId, cacheFormatId, failedTarget);
+        }
+        return null;
+      }
 
-    this.recoveryInflight.set(inflightKey, promise);
-    try {
-      return await promise;
+      const existingLocal = findAndReuseValidLocal();
+      if (existingLocal) {
+        return existingLocal;
+      }
+
+      const existingProgressive = findCompatibleActiveProgressive();
+      if (existingProgressive) {
+        return attachProgressiveBinding(existingProgressive);
+      }
+
+      // Evaluate seek-offset / suffix / unsatisfiable range guardrail per caller BEFORE Tier 3
+      const maxOffsetBytes =
+        options.maxSequentialOffsetBytes ?? MAX_MID_PLAYBACK_TIER3_OFFSET_BYTES;
+      const reqRange: RequestedRangeInfo =
+        options.requestedRange ??
+        (options.requestedRangeStart !== undefined
+          ? { kind: "offset", start: options.requestedRangeStart }
+          : { kind: "offset", start: 0 });
+      const skipForRange =
+        reqRange.kind === "unsatisfiable" ||
+        (reqRange.kind === "indeterminate_suffix" &&
+          !(failedTarget.clen > 0 && failedTarget.clen <= maxOffsetBytes)) ||
+        (reqRange.kind === "offset" && reqRange.start > maxOffsetBytes);
+      if (skipForRange) {
+        this.logger.warn(
+          "Skipping Tier 3 mid-playback buffer: requested byte range is disallowed or too far ahead for sequential download",
+          {
+            videoId,
+            formatId: cacheFormatId,
+            requestedRange: reqRange,
+            maxOffsetBytes,
+          },
+        );
+        if (remoteOutcome.sawIncompatibleRefresh) {
+          this.markNeedsMetadataRefresh(videoId, cacheFormatId, failedTarget);
+        }
+        return null;
+      }
+
+      const existingTier3 = this.tier3RecoveryInflight.get(inflightKey);
+      if (existingTier3) {
+        const shared = await existingTier3;
+        if (!shared || !isRecoveredTargetCompatible(shared)) return null;
+        // If another request for the same representation started a progressive handle, bind our slot too!
+        if (shared.kind === "progressive") {
+          const active = findCompatibleActiveProgressive();
+          if (active) return attachProgressiveBinding(active);
+        }
+        return shared;
+      }
+
+      const tier3Promise = this.trackDiskJob((async (): Promise<StreamTarget | null> => {
+        if (this.stopped) return null;
+
+        const recheckLocalPre = findAndReuseValidLocal();
+        if (recheckLocalPre) return recheckLocalPre;
+        const recheckProgPre = findCompatibleActiveProgressive();
+        if (recheckProgPre) return attachProgressiveBinding(recheckProgPre);
+
+        if (failedTarget.tier3CooldownUntil && Date.now() < failedTarget.tier3CooldownUntil) {
+          this.logger.debug("Skipping Tier 3 mid-playback buffer during cooldown", {
+            videoId,
+            formatId: cacheFormatId,
+          });
+          return null;
+        }
+
+        const maxCacheBytes = this.config.playback.ephemeralBuffer.maxCacheBytes;
+        const sizeEstimate = failedTarget.clen || failedTarget.approxSize || 0;
+        if (sizeEstimate > 0 && sizeEstimate > maxCacheBytes) {
+          this.logger.warn("Skipping Tier 3 mid-playback buffer: stream exceeds maxCacheBytes", {
+            videoId,
+            formatId: cacheFormatId,
+            sizeEstimate,
+            maxCacheBytes,
+          });
+          failedTarget.tier3CooldownUntil = Date.now() + 5 * 60_000;
+          return null;
+        }
+
+        // Verify the real yt-dlp format_id selector (never blindly pass synthetic InnerTube IDs)
+        let verifiedYtDlpFormatId = remoteOutcome.verifiedYtDlpFormatId;
+        if (!verifiedYtDlpFormatId) {
+          if (!remoteOutcome.ytDlpCheckedAndUnmatched) {
+            verifiedYtDlpFormatId =
+              (await this.resolveYtDlpFormatIdForTarget(videoId, failedTarget)) ?? undefined;
+          }
+          if (!verifiedYtDlpFormatId) {
+            this.logger.warn(
+              "Skipping Tier 3 mid-playback buffer: no byte-compatible yt-dlp format matched track",
+              { videoId, formatId: cacheFormatId, itag, clen: failedTarget.clen },
+            );
+            failedTarget.tier3CooldownUntil = Date.now() + 60_000;
+            return null;
+          }
+        }
+        const ytDlpSelector = verifiedYtDlpFormatId;
+
+        const ext = failedTarget.mimeType.includes("webm")
+          ? "webm"
+          : failedTarget.mimeType.startsWith("audio/")
+            ? "m4a"
+            : "mp4";
+
+        // Synchronously claim an exclusive destination path before any await so concurrent
+        // writers across different generations NEVER target the same path on disk.
+        const { storageFormatId, outPath, storeKey, releaseClaim } = this.claimUniqueDestination(
+          videoId,
+          baseStorageFormatId,
+          ext,
+        );
+        const reserveKey = `${storeKey}:w${++this.writerSeq}`;
+        let claimOwnedByBackground = false;
+
+        try {
+          // Compute how many initial bytes must be written AND verified before serving 206 progressive.
+          // We NEVER serve unverified bytes:
+          // - Non-DASH tracks carrying `rev`/`xtags` skip progressive so exact completed size is verified first.
+          // - DASH tracks whose index sits beyond MAX_DASH_HEADER_PROBE_BYTES (2 MiB) also use completed fallback.
+          let startupVerifyBytes = 1;
+          let canVerifyProgressively =
+            failedTarget.clen > 0 &&
+            typeof this.ytDlp.startProgressiveDownload === "function" &&
+            (Boolean(failedTarget.dashRanges) || (!failedTarget.rev && !failedTarget.xtags));
+          if (canVerifyProgressively && failedTarget.dashRanges) {
+            const initB = parseRangeBounds(failedTarget.dashRanges.init);
+            const indexB = parseRangeBounds(failedTarget.dashRanges.index);
+            if (!initB || !indexB) {
+              canVerifyProgressively = false;
+            } else {
+              const requiredBytes = Math.max(initB.end, indexB.end) + 1;
+              if (requiredBytes > MAX_DASH_HEADER_PROBE_BYTES || requiredBytes > failedTarget.clen) {
+                canVerifyProgressively = false;
+              } else {
+                startupVerifyBytes = requiredBytes;
+              }
+            }
+          }
+
+          // Progressive streaming path: ONLY when `clen` is strictly authoritative exact AND full
+          // init+index verification can complete within startupVerifyBytes BEFORE serving a single byte!
+          if (canVerifyProgressively) {
+            let releasePermit: () => void;
+            try {
+              releasePermit = await this.tier3Semaphore.acquirePermit(5_000);
+            } catch {
+              this.logger.warn("Skipping Tier 3 progressive buffer: concurrent Tier 3 slots busy", {
+                videoId,
+                formatId: cacheFormatId,
+              });
+              return null;
+            }
+            let permitOwnedByBackground = false;
+            let reservationActive = false;
+            this.ephemeralStore.pin(storeKey);
+
+            const cleanupCancelledProgressiveHandle = async (h: ProgressiveDownloadHandle, reason: string) => {
+              h.cancel(reason);
+              await withTimeoutNull(h.done.catch(() => {}), 500);
+              if (fs.existsSync(outPath) && !this.ephemeralStore.getByKey(storeKey)) {
+                try {
+                  fs.unlinkSync(outPath);
+                } catch {
+                  // Ignore
+                }
+              }
+            };
+
+            try {
+              if (this.stopped) return null;
+
+              const recheckLocal = findAndReuseValidLocal();
+              if (recheckLocal) {
+                return recheckLocal;
+              }
+              const recheckProgressive = findCompatibleActiveProgressive();
+              if (recheckProgressive) {
+                return attachProgressiveBinding(recheckProgressive);
+              }
+
+              if (!this.ephemeralStore.reserveBytes(reserveKey, failedTarget.clen)) {
+                this.logger.warn(
+                  "Skipping Tier 3 progressive buffer: insufficient shared ephemeral disk budget",
+                  {
+                    videoId,
+                    formatId: cacheFormatId,
+                    clen: failedTarget.clen,
+                    maxCacheBytes,
+                  },
+                );
+                return null;
+              }
+              reservationActive = true;
+
+              const startAttempt = async (useAuth: boolean): Promise<ProgressiveDownloadHandle> => {
+                if (this.stopped) throw new Error("Server shutting down");
+                const handle = await this.ytDlp.startProgressiveDownload!(
+                  videoId,
+                  ytDlpSelector,
+                  outPath,
+                  {
+                    useAuth,
+                    mimeType: failedTarget.mimeType,
+                    expectedSize: failedTarget.clen,
+                    maxBytes: maxCacheBytes,
+                    cacheFormatId: storageFormatId,
+                    onStagingBytes: (bytes) =>
+                      this.ephemeralStore.reserveBytes(reserveKey, Math.max(failedTarget.clen, bytes)),
+                  },
+                );
+                if (this.stopped) {
+                  await cleanupCancelledProgressiveHandle(handle, "Server shutting down");
+                  throw new Error("Server shutting down");
+                }
+                this.startingHandles.add(handle);
+                const startupWaitMs = Math.min(this.config.playback.ytDlpTimeoutMs, 20_000);
+                try {
+                  await handle.waitForBytes(startupVerifyBytes, undefined, startupWaitMs);
+                  if (this.stopped) {
+                    await cleanupCancelledProgressiveHandle(handle, "Server shutting down");
+                    throw new Error("Server shutting down");
+                  }
+                  if (
+                    failedTarget.dashRanges &&
+                    !doesLocalFileMatchDashRanges(
+                      handle.getReadablePath(),
+                      failedTarget.mimeType,
+                      failedTarget.dashRanges,
+                    )
+                  ) {
+                    const layoutErr = new Error(
+                      `Tier 3 progressive download DASH layout mismatched expected ${formatDashLayoutKey(failedTarget.dashRanges)}`,
+                    );
+                    layoutErr.name = "LayoutMismatchError";
+                    throw layoutErr;
+                  }
+                  return handle;
+                } catch (err) {
+                  await cleanupCancelledProgressiveHandle(handle, "Failed startup verification");
+                  throw err;
+                } finally {
+                  this.startingHandles.delete(handle);
+                }
+              };
+
+              const initialUseAuth =
+                failedTarget.tier === 2 && this.config.playback.authFallback.enabled;
+              let handle: ProgressiveDownloadHandle;
+              try {
+                handle = await startAttempt(initialUseAuth);
+              } catch (firstErr) {
+                const isLayoutErr =
+                  firstErr instanceof Error && firstErr.name === "LayoutMismatchError";
+                const isBudgetErr =
+                  firstErr instanceof Error && firstErr.name === "BudgetExceededError";
+                if (
+                  !this.stopped &&
+                  !isLayoutErr &&
+                  !isBudgetErr &&
+                  !initialUseAuth &&
+                  this.config.playback.authFallback.enabled
+                ) {
+                  handle = await startAttempt(true);
+                } else {
+                  throw firstErr;
+                }
+              }
+
+              if (this.stopped) {
+                await cleanupCancelledProgressiveHandle(handle, "Server shutting down");
+                return null;
+              }
+
+              const verifiedDashRanges = attachVerifiedLocalHashes(
+                handle.getReadablePath(),
+                failedTarget.dashRanges,
+              );
+              const targetRev =
+                failedTarget.rev ??
+                computeRepresentationRev({ lmt: failedTarget.lmt, dashRanges: verifiedDashRanges });
+              const targetXtags = failedTarget.xtags ?? null;
+              const activeEntry: ActiveProgressiveEntry = {
+                videoId,
+                logicalFormatId: cacheFormatId,
+                handle,
+                storeKey,
+                storageFormatId,
+                expectedSize: failedTarget.clen,
+                mimeType: failedTarget.mimeType,
+                dashRanges: verifiedDashRanges,
+                rev: targetRev,
+                xtags: targetXtags,
+                bindings: [],
+              };
+              this.activeProgressive.set(storeKey, activeEntry);
+              const progressiveTarget = attachProgressiveBinding(activeEntry);
+              this.metrics.tier3Hits++;
+              this.logger.info("Mid-playback recovery escalated to Tier 3 progressive stream", {
+                videoId,
+                formatId: cacheFormatId,
+                storageFormatId,
+                ytDlpSelector,
+                expectedSize: failedTarget.clen,
+              });
+
+              permitOwnedByBackground = true;
+              claimOwnedByBackground = true;
+              this.trackDiskJob(
+                handle.done
+                  .then(({ filePath }) => {
+                    if (this.stopped || this.ephemeralStore.isClosed()) {
+                      try {
+                        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                      } catch {
+                        // Ignore
+                      }
+                      return;
+                    }
+                    // Verify final file DASH ranges + hashes before registering/promoting
+                    if (
+                      verifiedDashRanges &&
+                      !doesLocalFileMatchDashRanges(filePath, failedTarget.mimeType, verifiedDashRanges)
+                    ) {
+                      try {
+                        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                      } catch {
+                        // Ignore
+                      }
+                      for (const binding of activeEntry.bindings) {
+                        this.invalidateVideoIfTargetMatches(
+                          videoId,
+                          binding.formatId,
+                          binding.progressiveTarget,
+                        );
+                      }
+                      return;
+                    }
+                    const entryMeta: EphemeralEntryMeta = {
+                      formatId: cacheFormatId,
+                      layout: formatDashLayoutKey(verifiedDashRanges),
+                      rev: targetRev,
+                      xtags: targetXtags,
+                      initHash: verifiedDashRanges?.initHash,
+                      indexHash: verifiedDashRanges?.indexHash,
+                    };
+                    // Release reservation immediately before register() so cleanup() never double-counts
+                    this.ephemeralStore.releaseReservation(reserveKey);
+                    this.ephemeralStore.register(
+                      videoId,
+                      storageFormatId,
+                      filePath,
+                      failedTarget.mimeType,
+                      entryMeta,
+                    );
+                    const rec = this.cache.get(videoId);
+                    if (rec) {
+                      for (const binding of activeEntry.bindings) {
+                        const cur = rec.targetsByFid.get(binding.formatId);
+                        if (cur === binding.progressiveTarget) {
+                          this.promoteToLocalTarget(
+                            videoId,
+                            binding.formatId,
+                            binding.itag,
+                            filePath,
+                            storeKey,
+                            failedTarget.mimeType,
+                            verifiedDashRanges,
+                            targetRev,
+                            targetXtags,
+                            cur,
+                          );
+                        }
+                      }
+                    }
+                  })
+                  .catch((err) => {
+                    const errMsg = err instanceof Error ? err.message : String(err);
+                    const isIdleCancel = err instanceof Error && err.name === "IdleCancelledError";
+                    this.logger.warn("Tier 3 progressive download terminated with error", {
+                      videoId,
+                      formatId: cacheFormatId,
+                      error: errMsg,
+                    });
+                    if (err instanceof Error && err.name === "SizeMismatchError") {
+                      for (const binding of activeEntry.bindings) {
+                        this.invalidateVideoIfTargetMatches(
+                          videoId,
+                          binding.formatId,
+                          binding.progressiveTarget,
+                        );
+                      }
+                      return;
+                    }
+                    const rec = this.cache.get(videoId);
+                    for (const binding of activeEntry.bindings) {
+                      binding.fallbackTarget.stale = false;
+                      if (!isIdleCancel) {
+                        binding.fallbackTarget.tier3CooldownUntil = Date.now() + 60_000;
+                      }
+                      const cur = rec?.targetsByFid.get(binding.formatId);
+                      if (rec && cur === binding.progressiveTarget) {
+                        rec.targetsByFid.set(binding.formatId, binding.fallbackTarget);
+                        if (binding.itag > 0 && rec.targetsByItag.get(binding.itag) === cur) {
+                          rec.targetsByItag.set(binding.itag, binding.fallbackTarget);
+                        }
+                      }
+                    }
+                  })
+                  .finally(() => {
+                    if (this.activeProgressive.get(storeKey) === activeEntry) {
+                      this.activeProgressive.delete(storeKey);
+                    }
+                    this.ephemeralStore.releaseReservation(reserveKey);
+                    this.ephemeralStore.unpin(storeKey);
+                    releaseClaim();
+                    releasePermit();
+                  }),
+              );
+
+              return progressiveTarget;
+            } catch (err) {
+              if (err instanceof Error && err.name === "LayoutMismatchError") {
+                this.markNeedsMetadataRefresh(videoId, cacheFormatId, failedTarget);
+              } else if (!this.stopped) {
+                failedTarget.tier3CooldownUntil = Date.now() + 60_000;
+              }
+              this.logger.error("Tier 3 progressive mid-playback startup failed", {
+                videoId,
+                formatId: cacheFormatId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+              return null;
+            } finally {
+              if (!permitOwnedByBackground) {
+                if (reservationActive) {
+                  this.ephemeralStore.releaseReservation(reserveKey);
+                }
+                this.ephemeralStore.unpin(storeKey);
+                releasePermit();
+              }
+            }
+          }
+
+          // Fallback non-progressive path (unknown exact clen, late-Cues WebM beyond startup window,
+          // non-DASH with rev/xtags, or runner without progressive support): verifies completed file before serving!
+          let fallbackPermit: () => void;
+          try {
+            fallbackPermit = await this.tier3Semaphore.acquirePermit(5_000);
+          } catch {
+            this.logger.warn("Skipping Tier 3 fallback buffer: concurrent Tier 3 slots busy", {
+              videoId,
+              formatId: cacheFormatId,
+            });
+            return null;
+          }
+          try {
+            if (this.stopped) return null;
+            const recheck = findAndReuseValidLocal();
+            if (recheck) {
+              return recheck;
+            }
+
+            const budgetBefore = this.ephemeralStore.getAvailableBudgetFor(reserveKey);
+            if (failedTarget.clen > 0) {
+              if (!this.ephemeralStore.reserveBytes(reserveKey, failedTarget.clen)) {
+                this.logger.warn(
+                  "Skipping Tier 3 fallback buffer: insufficient shared ephemeral disk budget",
+                  { videoId, formatId: cacheFormatId, clen: failedTarget.clen, maxCacheBytes },
+                );
+                return null;
+              }
+            } else if (budgetBefore <= 0) {
+              return null;
+            }
+
+            const downloadMaxBytes =
+              failedTarget.clen > 0
+                ? Math.min(maxCacheBytes, Math.max(failedTarget.clen, budgetBefore))
+                : Math.min(maxCacheBytes, budgetBefore);
+            const onStagingBytes = (bytes: number) =>
+              this.ephemeralStore.reserveBytes(reserveKey, Math.max(failedTarget.clen, bytes));
+
+            this.ephemeralStore.pin(storeKey);
+
+            // Non-DASH targets carrying rev/xtags cannot verify container hashes; require exact clen
+            // and never switch auth mode without re-verifying that auth mode serves the same metadata.
+            if (!failedTarget.dashRanges && (failedTarget.rev || failedTarget.xtags) && failedTarget.clen <= 0) {
+              return null;
+            }
+
+            try {
+              const useAuth = failedTarget.tier === 2 && this.config.playback.authFallback.enabled;
+              try {
+                await this.ytDlp.downloadFormat(videoId, ytDlpSelector, outPath, {
+                  useAuth,
+                  maxBytes: downloadMaxBytes,
+                  onStagingBytes,
+                });
+              } catch (firstErr) {
+                const isBudgetErr =
+                  firstErr instanceof Error && firstErr.name === "BudgetExceededError";
+                if (!this.stopped && !isBudgetErr && !useAuth && this.config.playback.authFallback.enabled) {
+                  let authSelector = ytDlpSelector;
+                  if (!failedTarget.dashRanges && (failedTarget.rev || failedTarget.xtags)) {
+                    const authInfo = await this.ytDlp.extractVideoInfo(videoId, { useAuth: true });
+                    const matchedAuthSel = findMatchingYtDlpFormatId(authInfo.formats || [], failedTarget);
+                    if (!matchedAuthSel) {
+                      throw firstErr;
+                    }
+                    authSelector = matchedAuthSel;
+                  }
+                  await this.ytDlp.downloadFormat(videoId, authSelector, outPath, {
+                    useAuth: true,
+                    maxBytes: downloadMaxBytes,
+                    onStagingBytes,
+                  });
+                } else {
+                  throw firstErr;
+                }
+              }
+
+              if (this.stopped || this.ephemeralStore.isClosed()) {
+                try {
+                  if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+                } catch {
+                  // Ignore
+                }
+                return null;
+              }
+
+              const downloadedSize = fs.statSync(outPath).size;
+              this.ephemeralStore.releaseReservation(reserveKey);
+              const allowedBytes = this.ephemeralStore.getAvailableBudgetFor(reserveKey);
+              if (downloadedSize > maxCacheBytes || downloadedSize > allowedBytes) {
+                this.logger.warn("Tier 3 downloaded file exceeded available cache budget; discarding", {
+                  videoId,
+                  formatId: cacheFormatId,
+                  actualSize: downloadedSize,
+                  maxCacheBytes,
+                  allowedBytes,
+                });
+                try {
+                  if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+                } catch {
+                  // Ignore
+                }
+                failedTarget.tier3CooldownUntil = Date.now() + 5 * 60_000;
+                return null;
+              }
+              // Verify byte length and DASH init/index compatibility BEFORE registering
+              if (
+                (failedTarget.clen > 0 && downloadedSize !== failedTarget.clen) ||
+                !doesLocalFileMatchDashRanges(outPath, failedTarget.mimeType, failedTarget.dashRanges)
+              ) {
+                this.logger.warn("Tier 3 downloaded stream differs from original layout/size; forcing reload", {
+                  videoId,
+                  formatId: cacheFormatId,
+                  expectedClen: failedTarget.clen,
+                  actualSize: downloadedSize,
+                  expectedLayout: formatDashLayoutKey(failedTarget.dashRanges),
+                });
+                try {
+                  if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+                } catch {
+                  // Ignore
+                }
+                this.markNeedsMetadataRefresh(videoId, cacheFormatId, failedTarget);
+                return null;
+              }
+              const verifiedRanges = attachVerifiedLocalHashes(outPath, failedTarget.dashRanges);
+              const targetRev =
+                failedTarget.rev ??
+                computeRepresentationRev({ lmt: failedTarget.lmt, dashRanges: verifiedRanges });
+              const targetXtags = failedTarget.xtags ?? null;
+              const entryMeta: EphemeralEntryMeta = {
+                formatId: cacheFormatId,
+                layout: formatDashLayoutKey(verifiedRanges),
+                rev: targetRev,
+                xtags: targetXtags,
+                initHash: verifiedRanges?.initHash,
+                indexHash: verifiedRanges?.indexHash,
+              };
+              this.ephemeralStore.register(
+                videoId,
+                storageFormatId,
+                outPath,
+                failedTarget.mimeType,
+                entryMeta,
+              );
+              const localTarget = this.promoteToLocalTarget(
+                videoId,
+                cacheFormatId,
+                itag,
+                outPath,
+                storeKey,
+                failedTarget.mimeType,
+                verifiedRanges,
+                targetRev,
+                targetXtags,
+                failedTarget,
+              );
+              this.metrics.tier3Hits++;
+              this.logger.info("Mid-playback recovery escalated to Tier 3 ephemeral buffer", {
+                videoId,
+                formatId: cacheFormatId,
+                storageFormatId,
+                ytDlpSelector,
+              });
+              return localTarget;
+            } catch (err) {
+              if (!this.stopped) {
+                failedTarget.tier3CooldownUntil = Date.now() + 60_000;
+              }
+              this.logger.error("Tier 3 mid-playback buffer failed", {
+                videoId,
+                formatId: cacheFormatId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+              return null;
+            } finally {
+              this.ephemeralStore.releaseReservation(reserveKey);
+              this.ephemeralStore.unpin(storeKey);
+            }
+          } finally {
+            fallbackPermit();
+          }
+        } finally {
+          if (!claimOwnedByBackground) {
+            releaseClaim();
+          }
+        }
+      })());
+
+      this.tier3RecoveryInflight.set(inflightKey, tier3Promise);
+      try {
+        const tier3Target = await tier3Promise;
+        if (!tier3Target && remoteOutcome.sawIncompatibleRefresh) {
+          this.markNeedsMetadataRefresh(videoId, cacheFormatId, failedTarget);
+        }
+        return tier3Target && isRecoveredTargetCompatible(tier3Target) ? tier3Target : null;
+      } finally {
+        this.tier3RecoveryInflight.delete(inflightKey);
+      }
     } finally {
-      this.recoveryInflight.delete(inflightKey);
+      // Always clear `stale` on the failed target so a failed/skipped recovery
+      // never traps subsequent requests in an infinite recovery loop.
+      failedTarget.stale = false;
     }
+  }
+
+  private async resolveYtDlpFormatIdForTarget(
+    videoId: string,
+    target: StreamTargetRemote,
+  ): Promise<string | null> {
+    const tryExtract = async (useAuth: boolean): Promise<string | null> => {
+      const ytInfo = await this.ytDlp.extractVideoInfo(videoId, { useAuth });
+      return findMatchingYtDlpFormatId(ytInfo.formats || [], target);
+    };
+    const initialUseAuth = target.tier === 2 && this.config.playback.authFallback.enabled;
+    try {
+      const matched = await tryExtract(initialUseAuth);
+      if (matched) return matched;
+    } catch {
+      // Fall through to auth attempt if permitted
+    }
+    if (!initialUseAuth && this.config.playback.authFallback.enabled) {
+      try {
+        return await tryExtract(true);
+      } catch {
+        return null;
+      }
+    }
+    return null;
   }
 
   getStoryboardVtt(videoId: string, height: number, origin: string): string {
@@ -502,8 +2393,9 @@ export class VideoResolver {
     videoId: string,
     tier: PlaybackTier,
     fn: () => Promise<ResolvedVideoRecord>,
+    variant = "default",
   ): Promise<ResolvedVideoRecord> {
-    const key = `${videoId}:t${tier}`;
+    const key = `${videoId}:t${tier}:${variant}`;
     const existing = this.videoRefreshInflight.get(key);
     if (existing) return existing;
     const p = fn().finally(() => {
@@ -513,12 +2405,60 @@ export class VideoResolver {
     return p;
   }
 
+  private promoteToProgressiveTarget(
+    videoId: string,
+    formatId: string,
+    itag: number,
+    source: ProgressiveStreamSource,
+    storeKey: string,
+    dashRanges?: DashRangeIdentity,
+    rev?: string | null,
+    xtags?: string | null,
+    expectedCurrent?: StreamTargetRemote,
+  ): StreamTargetProgressive {
+    const progressiveTarget: StreamTargetProgressive = {
+      kind: "progressive",
+      videoId,
+      formatId,
+      itag,
+      storeKey,
+      mimeType: source.mimeType,
+      size: source.expectedSize,
+      dashRanges,
+      rev: rev ?? null,
+      xtags: xtags ?? null,
+      fallbackRemote: expectedCurrent,
+      tier: 3,
+      source,
+    };
+    const rec = this.cache.get(videoId);
+    if (rec && (!expectedCurrent || rec.targetsByFid.get(formatId) === expectedCurrent)) {
+      rec.targetsByFid.set(formatId, progressiveTarget);
+      const isDrc = formatId.includes("drc");
+      if (
+        itag > 0 &&
+        (!rec.targetsByItag.has(itag) ||
+          rec.targetsByItag.get(itag) === expectedCurrent ||
+          rec.targetsByItag.get(itag)?.formatId === formatId ||
+          !isDrc)
+      ) {
+        rec.targetsByItag.set(itag, progressiveTarget);
+      }
+    }
+    return progressiveTarget;
+  }
+
   private promoteToLocalTarget(
     videoId: string,
     formatId: string,
     itag: number,
     filePath: string,
+    storeKey: string,
     mimeType: string,
+    dashRanges?: DashRangeIdentity,
+    rev?: string | null,
+    xtags?: string | null,
+    expectedCurrent?: StreamTarget,
   ): StreamTargetLocal {
     const size = fs.statSync(filePath).size;
     const localTarget: StreamTargetLocal = {
@@ -527,14 +2467,27 @@ export class VideoResolver {
       formatId,
       itag,
       filePath,
+      storeKey,
       mimeType,
       size,
+      dashRanges,
+      rev: rev ?? null,
+      xtags: xtags ?? null,
       tier: 3,
     };
     const rec = this.cache.get(videoId);
-    if (rec) {
+    if (rec && (!expectedCurrent || rec.targetsByFid.get(formatId) === expectedCurrent)) {
       rec.targetsByFid.set(formatId, localTarget);
-      if (itag > 0) rec.targetsByItag.set(itag, localTarget);
+      const isDrc = formatId.includes("drc");
+      if (
+        itag > 0 &&
+        (!rec.targetsByItag.has(itag) ||
+          rec.targetsByItag.get(itag) === expectedCurrent ||
+          rec.targetsByItag.get(itag)?.formatId === formatId ||
+          !isDrc)
+      ) {
+        rec.targetsByItag.set(itag, localTarget);
+      }
     }
     return localTarget;
   }
@@ -543,19 +2496,30 @@ export class VideoResolver {
     videoId: string,
     origin: string,
     minTier: PlaybackTier,
+    maxTier: PlaybackTier = 3,
     skipFastInnertube = false,
+    requireDashPair = false,
   ): Promise<ResolvedVideoRecord> {
     // Launch anonymous IPv4 InnerTube metadata lookup in parallel (non-fatal, capped to 6s)
     const hintsPromise = this.fetchInnertubeHints(videoId, origin);
 
     let lastError: unknown = null;
 
-    // ─── TIER 1a: Fast Anonymous IPv4 InnerTube (ANDROID_VR / IOS) ─────────────
+    const isRecordUsableForRequest = (record: ResolvedVideoRecord): boolean => {
+      if (requireDashPair) {
+        return hasCompleteDashPair(record.adaptiveFormats);
+      }
+      const hasVideoAdaptive = record.adaptiveFormats.some((f) => f.type.startsWith("video/"));
+      const hasMuxed = (record.payload.formatStreams as unknown[]).length > 0;
+      return hasVideoAdaptive || hasMuxed;
+    };
+
+    // ─── TIER 1a: Fast Anonymous IPv4 InnerTube (VISIONOS / ANDROID_VR / IOS) ──
     // Direct non-SABR 1080p/4K DASH streams with YouTube's exact init/index ranges in ~200ms!
-    if (minTier <= 1 && !skipFastInnertube) {
+    if (minTier <= 1 && maxTier >= 1 && !skipFastInnertube) {
       try {
         const fastRecord = await this.tryFastInnertubeDirect(videoId, origin, hintsPromise);
-        if (fastRecord && fastRecord.adaptiveFormats.length >= 2) {
+        if (fastRecord && hasCompleteDashPair(fastRecord.adaptiveFormats)) {
           this.metrics.tier1Hits++;
           return fastRecord;
         }
@@ -569,17 +2533,25 @@ export class VideoResolver {
     }
 
     // ─── TIER 1b: Anonymous IPv4 yt-dlp (-4 + Deno + optional bgutil POT) ──────
-    if (minTier <= 1) {
+    if (minTier <= 1 && maxTier >= 1) {
       try {
         const ytInfo = await this.ytDlp.extractVideoInfo(videoId, { useAuth: false });
         const hints = await hintsPromise;
         const record = await this.buildResolvedFromYtDlp(videoId, origin, ytInfo, hints, 1);
-        if (record.adaptiveFormats.length > 0 || (record.payload.formatStreams as unknown[]).length > 0) {
+        if (isRecordUsableForRequest(record)) {
           this.metrics.tier1Hits++;
           return record;
         }
-        lastError = new Error("Tier 1 returned no direct playable DASH/MP4 formats");
-        this.logger.warn("Tier 1 returned no direct playable formats; escalating", { videoId });
+        lastError = new Error(
+          requireDashPair
+            ? "Tier 1 returned incomplete DASH formats (missing video or audio)"
+            : "Tier 1 returned no direct playable video DASH/MP4 formats",
+        );
+        this.logger.warn("Tier 1 returned incomplete playable formats; escalating", {
+          videoId,
+          requireDashPair,
+          adaptiveCount: record.adaptiveFormats.length,
+        });
       } catch (err) {
         lastError = err;
         this.logger.warn("Tier 1 extraction failed", {
@@ -598,6 +2570,7 @@ export class VideoResolver {
 
     if (
       minTier <= 2 &&
+      maxTier >= 2 &&
       this.config.playback.authFallback.enabled &&
       !isPermanentUnavailable &&
       !isTransientTimeout
@@ -606,14 +2579,20 @@ export class VideoResolver {
         const ytInfo = await this.ytDlp.extractVideoInfo(videoId, { useAuth: true });
         const hints = await hintsPromise;
         const record = await this.buildResolvedFromYtDlp(videoId, origin, ytInfo, hints, 2);
-        if (record.adaptiveFormats.length > 0 || (record.payload.formatStreams as unknown[]).length > 0) {
+        if (isRecordUsableForRequest(record)) {
           this.metrics.tier2Hits++;
           this.logger.info("Tier 2 silent auth fallback succeeded", { videoId });
           return record;
         }
-        lastError = new Error("Tier 2 returned no direct playable DASH/MP4 formats");
-        this.logger.warn("Tier 2 returned no direct playable formats; escalating to Tier 3", {
+        lastError = new Error(
+          requireDashPair
+            ? "Tier 2 returned incomplete DASH formats (missing video or audio)"
+            : "Tier 2 returned no direct playable video DASH/MP4 formats",
+        );
+        this.logger.warn("Tier 2 returned incomplete playable formats; escalating to Tier 3", {
           videoId,
+          requireDashPair,
+          adaptiveCount: record.adaptiveFormats.length,
         });
       } catch (err) {
         lastError = err;
@@ -626,7 +2605,7 @@ export class VideoResolver {
     }
 
     // ─── TIER 3: Silent Ephemeral Buffer Fallback ──────────────────────────────
-    if (this.config.playback.ephemeralBuffer.enabled && !isPermanentUnavailable) {
+    if (maxTier >= 3 && this.config.playback.ephemeralBuffer.enabled && !isPermanentUnavailable && !this.stopped) {
       try {
         const hints = await hintsPromise;
         const record = await this.buildResolvedFromEphemeralBuffer(videoId, origin, hints);
@@ -665,10 +2644,10 @@ export class VideoResolver {
     // falling back to ANDROID_VR / IOS only if VISIONOS is unavailable.
     for (const clientName of ["VISIONOS", "ANDROID_VR", "IOS"] as const) {
       try {
-        const candidate: any = await Promise.race([
+        const candidate: any = await withTimeoutNull(
           client.getBasicInfo(videoId, { client: clientName }),
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
-        ]);
+          5000,
+        );
         if (!candidate) continue;
         if (candidate.playability_status?.status !== "OK") continue;
         const af: any[] = candidate.streaming_data?.adaptive_formats || [];
@@ -695,6 +2674,7 @@ export class VideoResolver {
     const targetsByFid = new Map<string, StreamTarget>();
     const targetsByItag = new Map<number, StreamTarget>();
     const adaptiveFormats: AdaptiveFormatOutput[] = [];
+    const recordGen = ++this.recordSeq;
     let earliestExpireSec = Math.floor(Date.now() / 1000) + 6 * 3600;
 
     const rawAdaptive: any[] = info.streaming_data?.adaptive_formats || [];
@@ -718,9 +2698,24 @@ export class VideoResolver {
       if (fmt.audio_track?.id) fidParts.push(String(fmt.audio_track.id));
       let formatId = fidParts.join("-");
       if (seenFids.has(formatId)) {
-        formatId = `${formatId}-${seenFids.size}`;
+        let suffix = seenFids.size;
+        while (seenFids.has(`${formatId}-${suffix}`)) {
+          suffix++;
+        }
+        formatId = `${formatId}-${suffix}`;
       }
       seenFids.add(formatId);
+
+      const isVideo = mimeType.startsWith("video/");
+      const baseContainer = mimeType.includes("webm") ? "webm" : "mp4";
+      const codecMatch = /codecs="([^"]+)"/.exec(mimeType);
+      const encoding = codecMatch ? codecMatch[1]! : "";
+      const initStr = `${fmt.init_range.start}-${fmt.init_range.end}`;
+      const indexStr = `${fmt.index_range.start}-${fmt.index_range.end}`;
+      const dashRanges: DashRangeIdentity = { init: initStr, index: indexStr };
+      const xtagsVal = meta.xtags || (typeof fmt.xtags === "string" ? fmt.xtags : null);
+      const lmtVal = String(fmt.last_modified_ms || meta.lmt || "0");
+      const revVal = computeRepresentationRev({ lmt: lmtVal, dashRanges });
 
       const proxyUrl = buildProxyPlaybackUrl({
         origin,
@@ -730,15 +2725,10 @@ export class VideoResolver {
         durSec: meta.durSec,
         expireSec: meta.expireSec,
         clen,
-        xtags: meta.xtags || (typeof fmt.xtags === "string" ? fmt.xtags : null),
+        layout: formatDashLayoutKey(dashRanges),
+        rev: revVal,
+        xtags: xtagsVal,
       });
-
-      const isVideo = mimeType.startsWith("video/");
-      const baseContainer = mimeType.includes("webm") ? "webm" : "mp4";
-      const codecMatch = /codecs="([^"]+)"/.exec(mimeType);
-      const encoding = codecMatch ? codecMatch[1]! : "";
-      const initStr = `${fmt.init_range.start}-${fmt.init_range.end}`;
-      const indexStr = `${fmt.index_range.start}-${fmt.index_range.end}`;
 
       const out: AdaptiveFormatOutput = {
         index: indexStr,
@@ -748,7 +2738,7 @@ export class VideoResolver {
         itag: String(itag),
         type: mimeType,
         clen: String(clen),
-        lmt: String(fmt.last_modified_ms || meta.lmt || "0"),
+        lmt: lmtVal,
         projectionType: String(fmt.projection_type || "RECTANGULAR"),
         container: baseContainer,
         encoding,
@@ -786,9 +2776,17 @@ export class VideoResolver {
         url: String(fmt.url),
         mimeType: mimeType.split(";")[0]!.trim(),
         clen,
+        dashRanges,
+        lmt: lmtVal,
+        rev: revVal,
+        xtags: xtagsVal,
         expireSec: meta.expireSec,
         httpHeaders: {},
         tier: 1,
+        resolvedBy: "innertube",
+        isDrc: Boolean(fmt.is_drc),
+        recordGen,
+        resolvedAt: Date.now(),
       };
       targetsByFid.set(formatId, target);
       if (!targetsByItag.has(itag) || !fmt.is_drc) {
@@ -805,6 +2803,9 @@ export class VideoResolver {
       const meta = extractUrlMeta(fmt.url, durationSec);
       const clen = Number(fmt.content_length) || meta.clen || 0;
       const formatId = String(itag);
+      const lmtVal = String(fmt.last_modified_ms || meta.lmt || "0");
+      const revVal = computeRepresentationRev({ lmt: lmtVal });
+      const xtagsVal = meta.xtags || (typeof fmt.xtags === "string" ? fmt.xtags : null);
 
       const proxyUrl = buildProxyPlaybackUrl({
         origin,
@@ -814,6 +2815,8 @@ export class VideoResolver {
         durSec: meta.durSec,
         expireSec: meta.expireSec,
         clen,
+        rev: revVal,
+        xtags: xtagsVal,
       });
 
       formatStreams.push({
@@ -838,9 +2841,16 @@ export class VideoResolver {
         url: String(fmt.url),
         mimeType: mimeType.split(";")[0]!.trim(),
         clen,
+        lmt: lmtVal,
+        rev: revVal,
+        xtags: xtagsVal,
         expireSec: meta.expireSec,
         httpHeaders: {},
         tier: 1,
+        resolvedBy: "innertube",
+        isDrc: Boolean(fmt.is_drc),
+        recordGen,
+        resolvedAt: Date.now(),
       };
       targetsByFid.set(formatId, target);
       targetsByItag.set(itag, target);
@@ -908,6 +2918,7 @@ export class VideoResolver {
       resolvedBy: "innertube",
       resolvedAt: Date.now(),
       expiresAt: earliestExpireSec * 1000,
+      recordGen,
       payload,
       adaptiveFormats,
       durationSec,
@@ -933,21 +2944,25 @@ export class VideoResolver {
       captions: [],
     };
 
+    let releaseHintsPermit: (() => void) | null = null;
+    try {
+      releaseHintsPermit = await this.hintsSemaphore.acquirePermit(2_000);
+    } catch {
+      return empty;
+    }
+
     try {
       const client = await this.innertubeProvider.getClient();
-      const info = await Promise.race([
-        client.getInfo(videoId),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 6000)),
-      ]);
+      const info = await withTimeoutNull(client.getInfo(videoId), 6000);
       if (!info) return empty;
 
       let streaming = (info as any).streaming_data;
       if ((!streaming || !Array.isArray(streaming.adaptive_formats) || streaming.adaptive_formats.length === 0) && typeof (client as any).getBasicInfo === "function") {
         try {
-          const basicAndroid: any = await Promise.race([
+          const basicAndroid: any = await withTimeoutNull(
             (client as any).getBasicInfo(videoId, { client: "ANDROID" }),
-            new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
-          ]);
+            3000,
+          );
           if (basicAndroid?.streaming_data?.adaptive_formats?.length) {
             streaming = basicAndroid.streaming_data;
           }
@@ -1082,6 +3097,8 @@ export class VideoResolver {
         videoId,
         error: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      releaseHintsPermit?.();
     }
 
     return empty;
@@ -1096,22 +3113,25 @@ export class VideoResolver {
   ): Promise<ResolvedVideoRecord> {
     const durationSec = Math.max(1, Math.round(ytInfo.duration || 0));
     const allFormats = ytInfo.formats || [];
-    const directDash = allFormats.filter(isDirectDashFormat);
-    const directMuxed = allFormats.filter(isDirectMuxedFormat);
+    const directDash = deduplicateYtDlpFormats(allFormats.filter(isDirectDashFormat));
+    const directMuxed = deduplicateYtDlpFormats(allFormats.filter(isDirectMuxedFormat));
 
     const targetsByFid = new Map<string, StreamTarget>();
     const targetsByItag = new Map<number, StreamTarget>();
     const adaptiveFormats: AdaptiveFormatOutput[] = [];
+    const recordGen = ++this.recordSeq;
     let earliestExpireSec = Math.floor(Date.now() / 1000) + 6 * 3600;
 
-    // Resolve DASH init/index ranges: prefer InnerTube hints, probe container header over IPv4 for missing formats
+    // Resolve DASH init/index ranges: prefer InnerTube hints, probe container header over IPv4
+    // for missing formats within a bounded overall probing budget (15s) to prevent tail stalls.
+    const probeDeadline = Date.now() + 15_000;
     const rangeTasks = directDash.map(async (fmt) => {
       const itag = parseNumericItag(fmt.format_id, fmt.url);
       const isDrc = fmt.format_id.includes("drc") || (fmt.format_note || "").includes("DRC");
       const mimeType = buildMimeTypeFromYtDlp(fmt);
 
       const fmtMeta = extractUrlMeta(fmt.url, durationSec);
-      const fmtClen = fmtMeta.clen || Number(fmt.filesize || fmt.filesize_approx || 0);
+      const fmtClen = fmtMeta.clen || Number(fmt.filesize || 0);
       const exactHint = hints.rangesByKey.get(makeRangeKey(itag, isDrc, fmt.language));
       const itagHint = hints.rangesByItag.get(itag);
       const hintMatchesLayout = (h: HintedRange | undefined): h is HintedRange => {
@@ -1125,14 +3145,22 @@ export class VideoResolver {
         (hintMatchesLayout(exactHint) ? exactHint : null) ||
         (!isDrc && !fmt.language && hintMatchesLayout(itagHint) ? itagHint : null);
 
-      if (!ranges && fmt.url) {
-        ranges = await this.probeSemaphore.run(async () => {
+      if (!ranges && fmt.url && Date.now() < probeDeadline) {
+        const remainingMs = probeDeadline - Date.now();
+        if (remainingMs > 500) {
           try {
-            return await probeRemoteDashRanges(fmt.url!, mimeType, this.fetchRaw, fmt.http_headers);
+            ranges = await this.probeSemaphore.run(async () => {
+              if (Date.now() >= probeDeadline) return null;
+              try {
+                return await probeRemoteDashRanges(fmt.url!, mimeType, this.fetchRaw, fmt.http_headers);
+              } catch {
+                return null;
+              }
+            }, remainingMs);
           } catch {
-            return null;
+            ranges = null;
           }
-        });
+        }
       }
 
       return { fmt, itag, mimeType, ranges };
@@ -1144,10 +3172,19 @@ export class VideoResolver {
       if (!fmt.url || !ranges) continue;
 
       const meta = extractUrlMeta(fmt.url, durationSec);
-      const clen = meta.clen || Number(fmt.filesize || fmt.filesize_approx || 0);
+      const exactClen = meta.clen || Number(fmt.filesize || 0);
+      const approxSize = exactClen || Number(fmt.filesize_approx || 0);
+      const dashRanges: DashRangeIdentity = {
+        init: ranges.init,
+        index: ranges.index,
+        ...(ranges.initHash ? { initHash: ranges.initHash } : {}),
+        ...(ranges.indexHash ? { indexHash: ranges.indexHash } : {}),
+      };
       if (meta.expireSec < earliestExpireSec) {
         earliestExpireSec = meta.expireSec;
       }
+
+      const revVal = computeRepresentationRev({ lmt: meta.lmt, dashRanges });
 
       const proxyUrl = buildProxyPlaybackUrl({
         origin,
@@ -1156,14 +3193,16 @@ export class VideoResolver {
         itag,
         durSec: meta.durSec,
         expireSec: meta.expireSec,
-        clen,
+        clen: exactClen,
+        layout: formatDashLayoutKey(dashRanges),
+        rev: revVal,
         xtags: meta.xtags,
       });
 
       const isVideo = mimeType.startsWith("video/");
       const bitrateBps = Math.max(
         1000,
-        Math.round((fmt.tbr || fmt.vbr || fmt.abr || (clen > 0 ? (clen * 8) / (durationSec * 1000) : 128)) * 1000),
+        Math.round((fmt.tbr || fmt.vbr || fmt.abr || (approxSize > 0 ? (approxSize * 8) / (durationSec * 1000) : 128)) * 1000),
       );
       const baseContainer = mimeType.includes("webm") ? "webm" : "mp4";
       const encoding = isVideo ? (fmt.vcodec || "") : (fmt.acodec || "");
@@ -1175,7 +3214,8 @@ export class VideoResolver {
         url: proxyUrl,
         itag: String(itag),
         type: mimeType,
-        clen: String(clen),
+        // Keep filesize_approx strictly out of authoritative clen ("0" when exact length is unknown)
+        clen: String(exactClen),
         lmt: meta.lmt,
         projectionType: hints.projectionByItag.get(itag) || "RECTANGULAR",
         container: baseContainer,
@@ -1208,10 +3248,20 @@ export class VideoResolver {
         itag,
         url: fmt.url,
         mimeType: mimeType.split(";")[0]!.trim(),
-        clen,
+        clen: exactClen,
+        approxSize: approxSize > 0 ? approxSize : undefined,
+        dashRanges,
+        lmt: meta.lmt,
+        rev: revVal,
+        xtags: meta.xtags,
         expireSec: meta.expireSec,
         httpHeaders: fmt.http_headers || {},
         tier,
+        resolvedBy: "ytdlp",
+        ytDlpFormatId: fmt.format_id,
+        isDrc: isYtDlpFormatDrc(fmt),
+        recordGen,
+        resolvedAt: Date.now(),
       };
       targetsByFid.set(fmt.format_id, target);
       if (itag > 0 && (!targetsByItag.has(itag) || !fmt.format_id.includes("drc"))) {
@@ -1226,7 +3276,9 @@ export class VideoResolver {
       const itag = parseNumericItag(fmt.format_id, fmt.url);
       const mimeType = buildMimeTypeFromYtDlp(fmt);
       const meta = extractUrlMeta(fmt.url, durationSec);
-      const clen = meta.clen || Number(fmt.filesize || fmt.filesize_approx || 0);
+      const exactClen = meta.clen || Number(fmt.filesize || 0);
+      const approxSize = exactClen || Number(fmt.filesize_approx || 0);
+      const revVal = computeRepresentationRev({ lmt: meta.lmt });
       const proxyUrl = buildProxyPlaybackUrl({
         origin,
         videoId,
@@ -1234,7 +3286,9 @@ export class VideoResolver {
         itag,
         durSec: meta.durSec,
         expireSec: meta.expireSec,
-        clen,
+        clen: exactClen,
+        rev: revVal,
+        xtags: meta.xtags,
       });
 
       const fps = Math.round(Number(fmt.fps) || 30);
@@ -1259,10 +3313,19 @@ export class VideoResolver {
         itag,
         url: fmt.url,
         mimeType: mimeType.split(";")[0]!.trim(),
-        clen,
+        clen: exactClen,
+        approxSize: approxSize > 0 ? approxSize : undefined,
+        lmt: meta.lmt,
+        rev: revVal,
+        xtags: meta.xtags,
         expireSec: meta.expireSec,
         httpHeaders: fmt.http_headers || {},
         tier,
+        resolvedBy: "ytdlp",
+        ytDlpFormatId: fmt.format_id,
+        isDrc: isYtDlpFormatDrc(fmt),
+        recordGen,
+        resolvedAt: Date.now(),
       };
       targetsByFid.set(fmt.format_id, target);
       if (itag > 0) targetsByItag.set(itag, target);
@@ -1300,6 +3363,7 @@ export class VideoResolver {
       resolvedBy: "ytdlp",
       resolvedAt: Date.now(),
       expiresAt: earliestExpireSec * 1000,
+      recordGen,
       payload,
       adaptiveFormats,
       durationSec,
@@ -1315,265 +3379,755 @@ export class VideoResolver {
     origin: string,
     hints: InnertubeMetaHints,
   ): Promise<ResolvedVideoRecord> {
-    const maxH = this.config.playback.ephemeralBuffer.maxFormatHeight;
-    const useAuth = this.config.playback.authFallback.enabled;
-
-    // Fetch metadata if possible (or fall back to basic metadata)
-    let ytInfo: YtDlpVideoInfo | null = null;
-    try {
-      ytInfo = await this.ytDlp.extractVideoInfo(videoId, { useAuth });
-    } catch {
-      try {
-        if (useAuth) ytInfo = await this.ytDlp.extractVideoInfo(videoId, { useAuth: false });
-      } catch {
-        ytInfo = null;
-      }
+    const inflightKey = `${videoId}|${origin}`;
+    const existingInflight = this.coldTier3Inflight.get(inflightKey);
+    if (existingInflight) {
+      return existingInflight;
     }
 
-    const durationSec = Math.max(1, Math.round(ytInfo?.duration || 60));
-    const expireSec = Math.floor(Date.now() / 1000) + this.config.playback.ephemeralBuffer.ttlSeconds;
+    const work = this.trackDiskJob((async (): Promise<ResolvedVideoRecord> => {
+      const maxH = this.config.playback.ephemeralBuffer.maxFormatHeight;
+      const useAuth = this.config.playback.authFallback.enabled;
 
-    const videoFid = "tier3-video";
-    const audioFid = "tier3-audio";
-    const videoPath = this.ephemeralStore.getPathFor(videoId, videoFid, "mp4");
-    const audioPath = this.ephemeralStore.getPathFor(videoId, audioFid, "m4a");
-
-    const videoPin = this.ephemeralStore.makeKey(videoId, videoFid);
-    const audioPin = this.ephemeralStore.makeKey(videoId, audioFid);
-
-    return await this.tier3Semaphore.run(async () => {
-      this.ephemeralStore.pin(videoPin);
-      this.ephemeralStore.pin(audioPin);
-
-      let downloadedVideo = false;
-      let downloadedAudio = false;
+      // Fetch metadata if possible and record which auth mode succeeded so downloads match selection
+      let ytInfo: YtDlpVideoInfo | null = null;
+      let ytInfoUsedAuth = false;
       try {
-        // Prefer MP4/M4A containers so ffmpeg -movflags +dash can always index them cleanly if needed
-        const videoSelector = `bestvideo[height<=${maxH}][ext=mp4]/bestvideo[height<=${maxH}]/bestvideo`;
-        const audioSelector = `bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio`;
-
-        if (!this.ephemeralStore.get(videoId, videoFid)) {
-          await this.downloadWithAuthFallback(videoId, videoSelector, videoPath);
-          downloadedVideo = true;
+        ytInfo = await this.ytDlp.extractVideoInfo(videoId, { useAuth });
+        ytInfoUsedAuth = useAuth;
+      } catch {
+        try {
+          if (useAuth) {
+            ytInfo = await this.ytDlp.extractVideoInfo(videoId, { useAuth: false });
+            ytInfoUsedAuth = false;
+          }
+        } catch {
+          ytInfo = null;
         }
-        const finalVideoPath = await this.ensureDashIndexedFile(videoPath, "video/mp4");
-        const videoEntry = this.ephemeralStore.register(videoId, videoFid, finalVideoPath, "video/mp4");
+      }
 
-        if (!this.ephemeralStore.get(videoId, audioFid)) {
-          await this.downloadWithAuthFallback(videoId, audioSelector, audioPath);
-          downloadedAudio = true;
-        }
-        const finalAudioPath = await this.ensureDashIndexedFile(audioPath, "audio/mp4");
-        const audioEntry = this.ephemeralStore.register(videoId, audioFid, finalAudioPath, "audio/mp4");
+      const durationSec = Math.max(1, Math.round(ytInfo?.duration || 60));
+      const expireSec = Math.floor(Date.now() / 1000) + this.config.playback.ephemeralBuffer.ttlSeconds;
 
-        const videoRanges = probeLocalFileDashRanges(finalVideoPath, "video/mp4");
-        const audioRanges = probeLocalFileDashRanges(finalAudioPath, "audio/mp4");
+      const maxCacheBytes = this.config.playback.ephemeralBuffer.maxCacheBytes;
+      const { video: matchedVideoFmt, audio: matchedAudioFmt } = selectColdTier3Formats(
+        ytInfo?.formats || [],
+        maxH,
+      );
 
-        if (!videoRanges || !audioRanges) {
-          throw new Error(
-            `Tier 3 downloaded tracks lack playable DASH index ranges (video=${Boolean(videoRanges)}, audio=${Boolean(audioRanges)})`,
-          );
-        }
+      // Extract upstream source identity (`sourceRev` / `xtags` / exact `sourceClen`) so stale
+      // or mismatched cached files are never reused under a new video revision.
+      const videoUrlMeta = matchedVideoFmt ? extractUrlMeta(matchedVideoFmt.url, durationSec) : null;
+      const audioUrlMeta = matchedAudioFmt ? extractUrlMeta(matchedAudioFmt.url, durationSec) : null;
+      const videoSourceRev = videoUrlMeta && videoUrlMeta.lmt !== "0" ? videoUrlMeta.lmt : null;
+      const audioSourceRev = audioUrlMeta && audioUrlMeta.lmt !== "0" ? audioUrlMeta.lmt : null;
+      const videoSourceXtags = videoUrlMeta?.xtags ?? null;
+      const audioSourceXtags = audioUrlMeta?.xtags ?? null;
+      const expectedVideoExactClen = matchedVideoFmt ? getYtDlpFormatExactClen(matchedVideoFmt) : 0;
+      const expectedAudioExactClen = matchedAudioFmt ? getYtDlpFormatExactClen(matchedAudioFmt) : 0;
 
-        const targetsByFid = new Map<string, StreamTarget>();
-        const targetsByItag = new Map<number, StreamTarget>();
-        const adaptiveFormats: AdaptiveFormatOutput[] = [];
+      // Key cold Tier 3 cache files by selected format_id so cached tracks are NEVER
+      // reused under a different codec/resolution/container representation.
+      const videoFid = matchedVideoFmt ? `tier3-v-${matchedVideoFmt.format_id}` : "tier3-video";
+      const audioFid = matchedAudioFmt ? `tier3-a-${matchedAudioFmt.format_id}` : "tier3-audio";
 
-        const matchedVideoFmt = (ytInfo?.formats || []).find(
-          (f) => f.ext === "mp4" && f.vcodec && f.vcodec !== "none" && (f.height || 0) <= maxH,
+      const expectedVideoBytes = matchedVideoFmt ? getYtDlpFormatApproxSize(matchedVideoFmt) : 0;
+      const expectedAudioBytes = matchedAudioFmt ? getYtDlpFormatApproxSize(matchedAudioFmt) : 0;
+      if (
+        expectedVideoBytes > 0 &&
+        expectedAudioBytes > 0 &&
+        expectedVideoBytes + expectedAudioBytes > maxCacheBytes
+      ) {
+        throw new Error(
+          `Tier 3 combined tracks exceed maxCacheBytes (${expectedVideoBytes + expectedAudioBytes} > ${maxCacheBytes})`,
         );
-        const matchedAudioFmt = (ytInfo?.formats || []).find(
-          (f) => (f.ext === "m4a" || f.ext === "mp4") && f.acodec && f.acodec !== "none" && (!f.vcodec || f.vcodec === "none"),
-        );
+      }
 
-        const vWidth = Number(matchedVideoFmt?.width || ytInfo?.width) || 1280;
-        const vHeight = Math.min(Number(matchedVideoFmt?.height || ytInfo?.height) || 720, maxH);
-        const vFps = Math.round(Number(matchedVideoFmt?.fps || ytInfo?.fps) || 30);
-        const vCodec = matchedVideoFmt?.vcodec || "avc1.640028";
-        const aCodec = matchedAudioFmt?.acodec || "mp4a.40.2";
+      const findReusableColdEntry = (
+        fid: string,
+        sourceRev: string | null,
+        xtags: string | null,
+        exactClen: number,
+        mimeType: string,
+      ): EphemeralFileEntry | null => {
+        const legacyKey = this.ephemeralStore.makeKey(videoId, fid);
+        for (const entry of this.ephemeralStore.findEntriesForVideo(videoId)) {
+          const matchesFid =
+            entry.meta?.formatId === fid || (!entry.meta?.formatId && entry.key === legacyKey);
+          if (!matchesFid) continue;
+          if (this.claimedDestinations.has(entry.filePath)) continue;
+          // Require strict bidirectional match on sourceRev & xtags so tagged entries never
+          // leak into untagged extractions and stale revisions are never reused.
+          if ((entry.meta?.sourceRev ?? null) !== (sourceRev ?? null)) continue;
+          if ((entry.meta?.xtags ?? null) !== (xtags ?? null)) continue;
+          if (exactClen > 0) {
+            const matchesClen =
+              entry.meta?.sourceClen !== undefined
+                ? entry.meta.sourceClen === exactClen
+                : entry.size === exactClen;
+            if (!matchesClen) continue;
+          }
+          // Verify cached file still has valid global DASH index; delete corrupt cache entries
+          if (!hasValidGlobalMp4Sidx(entry.filePath) || !probeLocalFileDashRanges(entry.filePath, mimeType)) {
+            this.ephemeralStore.deleteByKey(entry.key);
+            continue;
+          }
+          return entry;
+        }
+        return null;
+      };
 
-        const videoTarget: StreamTargetLocal = {
-          kind: "local",
-          videoId,
-          formatId: videoFid,
-          itag: 137,
-          filePath: finalVideoPath,
-          mimeType: "video/mp4",
-          size: videoEntry.size,
-          tier: 3,
+      const selectColdSlot = (
+        fid: string,
+        ext: string,
+        sourceRev: string | null,
+        xtags: string | null,
+        exactClen: number,
+        mimeType: string,
+      ) => {
+        const reusable = findReusableColdEntry(fid, sourceRev, xtags, exactClen, mimeType);
+        if (reusable) {
+          this.claimedDestinations.add(reusable.filePath);
+          let released = false;
+          const storeFormatId = path.basename(reusable.filePath, path.extname(reusable.filePath));
+          return {
+            wasCached: true,
+            existingEntry: reusable,
+            prevSize: reusable.size,
+            storageFormatId: storeFormatId,
+            outPath: reusable.filePath,
+            storeKey: reusable.key,
+            releaseClaim: () => {
+              if (released) return;
+              released = true;
+              this.claimedDestinations.delete(reusable.filePath);
+            },
+          };
+        }
+        // Always claim a strictly non-colliding path (checked against claims, retired paths,
+        // registered entries, AND existing files on disk) so surviving revisions are never overwritten.
+        const claimed = this.claimUniqueDestination(videoId, fid, ext, false);
+        return {
+          wasCached: false,
+          existingEntry: null as EphemeralFileEntry | null,
+          prevSize: 0,
+          ...claimed,
         };
-        targetsByFid.set(videoFid, videoTarget);
-        targetsByItag.set(137, videoTarget);
+      };
 
-        adaptiveFormats.push({
-          index: videoRanges.index,
-          init: videoRanges.init,
-          bitrate: String(Math.max(100_000, Math.round((videoEntry.size * 8) / durationSec))),
-          url: buildProxyPlaybackUrl({
-            origin,
+      return await this.coldTier3Semaphore.run(async () => {
+        if (this.stopped) {
+          throw new Error("Server shutting down");
+        }
+
+        const videoSlot = selectColdSlot(
+          videoFid,
+          "mp4",
+          videoSourceRev,
+          videoSourceXtags,
+          expectedVideoExactClen,
+          "video/mp4",
+        );
+        const audioSlot = selectColdSlot(
+          audioFid,
+          "m4a",
+          audioSourceRev,
+          audioSourceXtags,
+          expectedAudioExactClen,
+          "audio/mp4",
+        );
+
+        const videoStoreFormatId = videoSlot.storageFormatId;
+        const videoPath = videoSlot.outPath;
+        const videoStoreKey = videoSlot.storeKey;
+        const audioStoreFormatId = audioSlot.storageFormatId;
+        const audioPath = audioSlot.outPath;
+        const audioStoreKey = audioSlot.storeKey;
+        const videoReserveKey = `${videoStoreKey}:w${++this.writerSeq}`;
+        const audioReserveKey = `${audioStoreKey}:w${++this.writerSeq}`;
+
+        this.ephemeralStore.pin(videoStoreKey);
+        this.ephemeralStore.pin(audioStoreKey);
+
+        let downloadedVideo = false;
+        let downloadedAudio = false;
+        try {
+          // Download the exact selected format_id so advertised codec/resolution/fps match the file 1:1.
+          // When ytInfo is unavailable, strictly constrain selectors to MP4/M4A <= maxH (never bare bestvideo/bestaudio).
+          const videoSelector = matchedVideoFmt
+            ? matchedVideoFmt.format_id
+            : `bestvideo[height<=${maxH}][ext=mp4][vcodec^=avc1]/bestvideo[height<=${maxH}][ext=mp4]`;
+          const audioSelector = matchedAudioFmt
+            ? matchedAudioFmt.format_id
+            : `bestaudio[ext=m4a][acodec^=mp4a]/bestaudio[ext=mp4][acodec^=mp4a]/bestaudio[ext=m4a]/bestaudio[ext=mp4]`;
+
+          let videoSourceVerified = videoSlot.wasCached;
+          if (!videoSlot.wasCached) {
+            const videoBudget = this.ephemeralStore.getAvailableBudgetFor(videoReserveKey);
+            if (expectedVideoBytes > 0) {
+              if (!this.ephemeralStore.reserveBytes(videoReserveKey, expectedVideoBytes)) {
+                throw new Error(
+                  `Tier 3 video track exceeds available ephemeral disk budget (${expectedVideoBytes} > ${maxCacheBytes})`,
+                );
+              }
+            } else if (videoBudget <= 0) {
+              throw new Error("Insufficient ephemeral disk budget for Tier 3 video track");
+            }
+            const videoDl = await this.downloadWithAuthFallback(videoId, videoSelector, videoPath, {
+              preferAuth: ytInfoUsedAuth,
+              maxBytes: Math.min(maxCacheBytes, videoBudget),
+              onStagingBytes: (bytes) => this.ephemeralStore.reserveBytes(videoReserveKey, bytes),
+            });
+            downloadedVideo = true;
+            if (this.stopped) throw new Error("Server shutting down");
+            const actualRawVideoSize = fs.statSync(videoPath).size;
+            videoSourceVerified =
+              Boolean(matchedVideoFmt) &&
+              videoDl.usedAuth === ytInfoUsedAuth &&
+              (expectedVideoExactClen === 0 || actualRawVideoSize === expectedVideoExactClen);
+            if (!this.ephemeralStore.reserveBytes(videoReserveKey, actualRawVideoSize)) {
+              throw new Error(
+                `Tier 3 video track exceeds shared ephemeral disk budget (${actualRawVideoSize} > ${maxCacheBytes})`,
+              );
+            }
+          }
+          const finalVideoPath = await this.ensureDashIndexedFile(
+            videoPath,
+            "video/mp4",
+            videoReserveKey,
+            videoSlot.wasCached ? videoSlot.prevSize : 0,
+          );
+          if (this.stopped || this.ephemeralStore.isClosed()) {
+            throw new Error("Server shutting down");
+          }
+          const videoSize = fs.statSync(finalVideoPath).size;
+          this.ephemeralStore.releaseReservation(videoReserveKey);
+          const videoGrowth = videoSlot.wasCached ? Math.max(0, videoSize - videoSlot.prevSize) : videoSize;
+          if (videoSize > maxCacheBytes || videoGrowth > this.ephemeralStore.getAvailableBudgetFor(videoReserveKey)) {
+            throw new Error(
+              `Tier 3 video track exceeds maxCacheBytes (${videoSize} > ${maxCacheBytes})`,
+            );
+          }
+
+          // Validate, probe, and register the video track with its COMPLETE verified sidecar metadata
+          // BEFORE awaiting audio so a subsequent audio failure can NEVER wipe the video's playback identity!
+          const videoRanges = hasValidGlobalMp4Sidx(finalVideoPath)
+            ? probeLocalFileDashRanges(finalVideoPath, "video/mp4")
+            : null;
+          if (!videoRanges) {
+            if (videoSlot.wasCached) this.ephemeralStore.deleteByKey(videoStoreKey);
+            throw new Error("Tier 3 downloaded video track lacks valid global DASH index ranges");
+          }
+          const probedVideo = probeMp4TrackMetadata(finalVideoPath);
+          if (probedVideo?.height && probedVideo.height > maxH) {
+            if (videoSlot.wasCached) this.ephemeralStore.deleteByKey(videoStoreKey);
+            throw new Error(
+              `Tier 3 downloaded video height ${probedVideo.height}p exceeds maxFormatHeight ${maxH}p`,
+            );
+          }
+          if (probedVideo?.isAudio && !probedVideo.isVideo) {
+            if (videoSlot.wasCached) this.ephemeralStore.deleteByKey(videoStoreKey);
+            throw new Error("Tier 3 video download produced an audio-only track");
+          }
+          const videoDashRanges: DashRangeIdentity = attachVerifiedLocalHashes(finalVideoPath, {
+            init: videoRanges.init,
+            index: videoRanges.index,
+          })!;
+          const videoRev = computeRepresentationRev({ dashRanges: videoDashRanges });
+          const effectiveVideoSourceRev = videoSourceVerified ? videoSourceRev : null;
+          const effectiveVideoXtags = videoSourceVerified ? videoSourceXtags : null;
+          const effectiveVideoSourceClen =
+            videoSourceVerified && expectedVideoExactClen > 0 ? expectedVideoExactClen : undefined;
+          const videoEntry =
+            videoSlot.wasCached &&
+            videoSlot.existingEntry &&
+            videoSize === videoSlot.prevSize &&
+            videoSlot.existingEntry.meta?.layout === formatDashLayoutKey(videoDashRanges) &&
+            videoSlot.existingEntry.meta?.rev === videoRev &&
+            videoSlot.existingEntry.meta?.initHash === videoDashRanges.initHash &&
+            videoSlot.existingEntry.meta?.indexHash === videoDashRanges.indexHash
+              ? videoSlot.existingEntry
+              : this.ephemeralStore.register(videoId, videoStoreFormatId, finalVideoPath, "video/mp4", {
+                  formatId: videoFid,
+                  layout: formatDashLayoutKey(videoDashRanges),
+                  rev: videoRev,
+                  sourceRev: effectiveVideoSourceRev,
+                  ...(effectiveVideoSourceClen !== undefined ? { sourceClen: effectiveVideoSourceClen } : {}),
+                  xtags: effectiveVideoXtags,
+                  initHash: videoDashRanges.initHash,
+                  indexHash: videoDashRanges.indexHash,
+                });
+
+          let audioSourceVerified = audioSlot.wasCached;
+          if (!audioSlot.wasCached) {
+            const audioBudget = this.ephemeralStore.getAvailableBudgetFor(audioReserveKey);
+            if (expectedAudioBytes > 0) {
+              if (!this.ephemeralStore.reserveBytes(audioReserveKey, expectedAudioBytes)) {
+                throw new Error(
+                  `Tier 3 audio track exceeds available ephemeral disk budget (${expectedAudioBytes} > ${maxCacheBytes})`,
+                );
+              }
+            } else if (audioBudget <= 0) {
+              throw new Error("Insufficient ephemeral disk budget for Tier 3 audio track");
+            }
+            const audioDl = await this.downloadWithAuthFallback(videoId, audioSelector, audioPath, {
+              preferAuth: ytInfoUsedAuth,
+              maxBytes: Math.min(maxCacheBytes, audioBudget),
+              onStagingBytes: (bytes) => this.ephemeralStore.reserveBytes(audioReserveKey, bytes),
+            });
+            downloadedAudio = true;
+            if (this.stopped) throw new Error("Server shutting down");
+            const actualRawAudioSize = fs.statSync(audioPath).size;
+            audioSourceVerified =
+              Boolean(matchedAudioFmt) &&
+              audioDl.usedAuth === ytInfoUsedAuth &&
+              (expectedAudioExactClen === 0 || actualRawAudioSize === expectedAudioExactClen);
+            if (!this.ephemeralStore.reserveBytes(audioReserveKey, actualRawAudioSize)) {
+              throw new Error(
+                `Tier 3 audio track exceeds shared ephemeral disk budget (${actualRawAudioSize} > ${maxCacheBytes})`,
+              );
+            }
+          }
+          const finalAudioPath = await this.ensureDashIndexedFile(
+            audioPath,
+            "audio/mp4",
+            audioReserveKey,
+            audioSlot.wasCached ? audioSlot.prevSize : 0,
+          );
+          if (this.stopped || this.ephemeralStore.isClosed()) {
+            throw new Error("Server shutting down");
+          }
+          const audioSize = fs.statSync(finalAudioPath).size;
+          this.ephemeralStore.releaseReservation(audioReserveKey);
+          const audioGrowth = audioSlot.wasCached ? Math.max(0, audioSize - audioSlot.prevSize) : audioSize;
+          if (
+            videoEntry.size + audioSize > maxCacheBytes ||
+            audioGrowth > this.ephemeralStore.getAvailableBudgetFor(audioReserveKey)
+          ) {
+            throw new Error(
+              `Tier 3 combined tracks exceed maxCacheBytes (${videoEntry.size + audioSize} > ${maxCacheBytes})`,
+            );
+          }
+
+          const audioRanges = hasValidGlobalMp4Sidx(finalAudioPath)
+            ? probeLocalFileDashRanges(finalAudioPath, "audio/mp4")
+            : null;
+          if (!audioRanges) {
+            if (audioSlot.wasCached) this.ephemeralStore.deleteByKey(audioStoreKey);
+            throw new Error("Tier 3 downloaded audio track lacks valid global DASH index ranges");
+          }
+          const probedAudio = probeMp4TrackMetadata(finalAudioPath);
+          if (probedAudio?.isVideo && !probedAudio.isAudio) {
+            if (audioSlot.wasCached) this.ephemeralStore.deleteByKey(audioStoreKey);
+            throw new Error("Tier 3 audio download produced a video-only track");
+          }
+          const audioDashRanges: DashRangeIdentity = attachVerifiedLocalHashes(finalAudioPath, {
+            init: audioRanges.init,
+            index: audioRanges.index,
+          })!;
+          const audioRev = computeRepresentationRev({ dashRanges: audioDashRanges });
+          const effectiveAudioSourceRev = audioSourceVerified ? audioSourceRev : null;
+          const effectiveAudioXtags = audioSourceVerified ? audioSourceXtags : null;
+          const effectiveAudioSourceClen =
+            audioSourceVerified && expectedAudioExactClen > 0 ? expectedAudioExactClen : undefined;
+          const audioEntry =
+            audioSlot.wasCached &&
+            audioSlot.existingEntry &&
+            audioSize === audioSlot.prevSize &&
+            audioSlot.existingEntry.meta?.layout === formatDashLayoutKey(audioDashRanges) &&
+            audioSlot.existingEntry.meta?.rev === audioRev &&
+            audioSlot.existingEntry.meta?.initHash === audioDashRanges.initHash &&
+            audioSlot.existingEntry.meta?.indexHash === audioDashRanges.indexHash
+              ? audioSlot.existingEntry
+              : this.ephemeralStore.register(videoId, audioStoreFormatId, finalAudioPath, "audio/mp4", {
+                  formatId: audioFid,
+                  layout: formatDashLayoutKey(audioDashRanges),
+                  rev: audioRev,
+                  sourceRev: effectiveAudioSourceRev,
+                  ...(effectiveAudioSourceClen !== undefined ? { sourceClen: effectiveAudioSourceClen } : {}),
+                  xtags: effectiveAudioXtags,
+                  initHash: audioDashRanges.initHash,
+                  indexHash: audioDashRanges.indexHash,
+                });
+
+          const resolvedDurationSec = Math.max(
+            1,
+            Math.round(
+              probedVideo?.durationSec ||
+                probedAudio?.durationSec ||
+                ytInfo?.duration ||
+                hints.durationSec ||
+                durationSec,
+            ),
+          );
+
+          const recordGen = ++this.recordSeq;
+          const targetsByFid = new Map<string, StreamTarget>();
+          const targetsByItag = new Map<number, StreamTarget>();
+          const adaptiveFormats: AdaptiveFormatOutput[] = [];
+
+          const vItag = matchedVideoFmt
+            ? parseNumericItag(matchedVideoFmt.format_id, matchedVideoFmt.url) || 137
+            : 137;
+          const aItag = matchedAudioFmt
+            ? parseNumericItag(matchedAudioFmt.format_id, matchedAudioFmt.url) || 140
+            : 140;
+
+          const vWidth = Number(probedVideo?.width || matchedVideoFmt?.width || ytInfo?.width) || 1280;
+          const vHeight = Math.min(
+            Number(probedVideo?.height || matchedVideoFmt?.height || ytInfo?.height) || 720,
+            maxH,
+          );
+          const vFps = Math.round(Number(matchedVideoFmt?.fps || ytInfo?.fps) || 30);
+          const vCodec = probedVideo?.codec || matchedVideoFmt?.vcodec || "avc1.640028";
+          const aCodec = probedAudio?.codec || matchedAudioFmt?.acodec || "mp4a.40.2";
+
+          const videoTarget: StreamTargetLocal = {
+            kind: "local",
             videoId,
             formatId: videoFid,
-            itag: 137,
-            durSec: durationSec,
-            expireSec,
-            clen: videoEntry.size,
-          }),
-          itag: "137",
-          type: `video/mp4; codecs="${vCodec}"`,
-          clen: String(videoEntry.size),
-          lmt: "0",
-          projectionType: "RECTANGULAR",
-          container: "mp4",
-          encoding: vCodec,
-          size: `${vWidth}x${vHeight}`,
-          fps: vFps,
-          resolution: `${vHeight}p`,
-          qualityLabel: vFps > 30 ? `${vHeight}p${vFps}` : `${vHeight}p`,
-        });
+            itag: vItag,
+            filePath: finalVideoPath,
+            storeKey: videoStoreKey,
+            mimeType: "video/mp4",
+            size: videoEntry.size,
+            dashRanges: videoDashRanges,
+            rev: videoRev,
+            xtags: effectiveVideoXtags,
+            tier: 3,
+          };
+          targetsByFid.set(videoFid, videoTarget);
+          targetsByItag.set(vItag, videoTarget);
 
-        const audioTarget: StreamTargetLocal = {
-          kind: "local",
-          videoId,
-          formatId: audioFid,
-          itag: 140,
-          filePath: finalAudioPath,
-          mimeType: "audio/mp4",
-          size: audioEntry.size,
-          tier: 3,
-        };
-        targetsByFid.set(audioFid, audioTarget);
-        targetsByItag.set(140, audioTarget);
+          adaptiveFormats.push({
+            index: videoRanges.index,
+            init: videoRanges.init,
+            bitrate: String(Math.max(100_000, Math.round((videoEntry.size * 8) / resolvedDurationSec))),
+            url: buildProxyPlaybackUrl({
+              origin,
+              videoId,
+              formatId: videoFid,
+              itag: vItag,
+              durSec: resolvedDurationSec,
+              expireSec,
+              clen: videoEntry.size,
+              layout: formatDashLayoutKey(videoDashRanges),
+              rev: videoRev,
+              xtags: effectiveVideoXtags,
+            }),
+            itag: String(vItag),
+            type: `video/mp4; codecs="${vCodec}"`,
+            clen: String(videoEntry.size),
+            lmt: effectiveVideoSourceRev || "0",
+            projectionType: "RECTANGULAR",
+            container: "mp4",
+            encoding: vCodec,
+            size: `${vWidth}x${vHeight}`,
+            fps: vFps,
+            resolution: `${vHeight}p`,
+            qualityLabel: vFps > 30 ? `${vHeight}p${vFps}` : `${vHeight}p`,
+          });
 
-        adaptiveFormats.push({
-          index: audioRanges.index,
-          init: audioRanges.init,
-          bitrate: String(Math.max(32_000, Math.round((audioEntry.size * 8) / durationSec))),
-          url: buildProxyPlaybackUrl({
-            origin,
+          const audioTarget: StreamTargetLocal = {
+            kind: "local",
             videoId,
             formatId: audioFid,
-            itag: 140,
-            durSec: durationSec,
-            expireSec,
-            clen: audioEntry.size,
-          }),
-          itag: "140",
-          type: `audio/mp4; codecs="${aCodec}"`,
-          clen: String(audioEntry.size),
-          lmt: "0",
-          projectionType: "RECTANGULAR",
-          container: "mp4",
-          encoding: aCodec,
-          audioQuality: "AUDIO_QUALITY_MEDIUM",
-          audioSampleRate: String(matchedAudioFmt?.asr || 44100),
-          audioChannels: Number(matchedAudioFmt?.audio_channels) || 2,
-        });
+            itag: aItag,
+            filePath: finalAudioPath,
+            storeKey: audioStoreKey,
+            mimeType: "audio/mp4",
+            size: audioEntry.size,
+            dashRanges: audioDashRanges,
+            rev: audioRev,
+            xtags: effectiveAudioXtags,
+            tier: 3,
+          };
+          targetsByFid.set(audioFid, audioTarget);
+          targetsByItag.set(aItag, audioTarget);
 
-        const captions = ytInfo ? this.collectCaptions(ytInfo, hints) : hints.captions;
-        const payload = this.assembleInvidiousVideoPayload({
-          videoId,
-          origin,
-          title: ytInfo?.title || videoId,
-          description: ytInfo?.description || "",
-          durationSec,
-          author: ytInfo?.channel || ytInfo?.uploader || "",
-          authorId: ytInfo?.channel_id || "",
-          viewCount: Number(ytInfo?.view_count) || 0,
-          likeCount: Number(ytInfo?.like_count) || 0,
-          published: parseUploadDateToUnixSec(ytInfo?.upload_date, ytInfo?.timestamp),
-          subCountText:
-            hints.subCountText ||
-            (ytInfo?.channel_follower_count ? formatCompactCount(ytInfo.channel_follower_count) : ""),
-          genre: ytInfo?.categories?.[0] || hints.genre || "",
-          isFamilyFriendly: (ytInfo?.age_limit ?? 0) < 18 && hints.isFamilyFriendly,
-          isListed: ytInfo?.availability !== "unlisted",
-          hints,
-          adaptiveFormats,
-          formatStreams: [],
-          captions,
-        });
+          adaptiveFormats.push({
+            index: audioRanges.index,
+            init: audioRanges.init,
+            bitrate: String(Math.max(32_000, Math.round((audioEntry.size * 8) / resolvedDurationSec))),
+            url: buildProxyPlaybackUrl({
+              origin,
+              videoId,
+              formatId: audioFid,
+              itag: aItag,
+              durSec: resolvedDurationSec,
+              expireSec,
+              clen: audioEntry.size,
+              layout: formatDashLayoutKey(audioDashRanges),
+              rev: audioRev,
+              xtags: effectiveAudioXtags,
+            }),
+            itag: String(aItag),
+            type: `audio/mp4; codecs="${aCodec}"`,
+            clen: String(audioEntry.size),
+            lmt: effectiveAudioSourceRev || "0",
+            projectionType: "RECTANGULAR",
+            container: "mp4",
+            encoding: aCodec,
+            audioQuality: "AUDIO_QUALITY_MEDIUM",
+            audioSampleRate: String(matchedAudioFmt?.asr || 44100),
+            audioChannels: Number(matchedAudioFmt?.audio_channels) || 2,
+          });
 
-        return {
-          videoId,
-          tier: 3,
-          resolvedBy: "ephemeral",
-          resolvedAt: Date.now(),
-          expiresAt: expireSec * 1000,
-          payload,
-          adaptiveFormats,
-          durationSec,
-          targetsByFid,
-          targetsByItag,
-          captions,
-          storyboards: hints.storyboards,
-        };
-      } catch (err) {
-        // Clean up untracked files if one download failed mid-way
-        if (downloadedVideo && !this.ephemeralStore.get(videoId, videoFid) && fs.existsSync(videoPath)) {
-          try { fs.unlinkSync(videoPath); } catch { /* ignore */ }
+          const captions = ytInfo ? this.collectCaptions(ytInfo, hints) : hints.captions;
+          const payload = this.assembleInvidiousVideoPayload({
+            videoId,
+            origin,
+            title: ytInfo?.title || videoId,
+            description: ytInfo?.description || "",
+            durationSec: resolvedDurationSec,
+            author: ytInfo?.channel || ytInfo?.uploader || "",
+            authorId: ytInfo?.channel_id || "",
+            viewCount: Number(ytInfo?.view_count) || 0,
+            likeCount: Number(ytInfo?.like_count) || 0,
+            published: parseUploadDateToUnixSec(ytInfo?.upload_date, ytInfo?.timestamp),
+            subCountText:
+              hints.subCountText ||
+              (ytInfo?.channel_follower_count ? formatCompactCount(ytInfo.channel_follower_count) : ""),
+            genre: ytInfo?.categories?.[0] || hints.genre || "",
+            isFamilyFriendly: (ytInfo?.age_limit ?? 0) < 18 && hints.isFamilyFriendly,
+            isListed: ytInfo?.availability !== "unlisted",
+            hints,
+            adaptiveFormats,
+            formatStreams: [],
+            captions,
+          });
+
+          return {
+            videoId,
+            tier: 3,
+            resolvedBy: "ephemeral",
+            resolvedAt: Date.now(),
+            expiresAt: expireSec * 1000,
+            recordGen,
+            payload,
+            adaptiveFormats,
+            durationSec: resolvedDurationSec,
+            targetsByFid,
+            targetsByItag,
+            captions,
+            storyboards: hints.storyboards,
+          };
+        } catch (err) {
+          // Clean up untracked files if one download failed mid-way
+          if (downloadedVideo && !this.ephemeralStore.getByKey(videoStoreKey) && fs.existsSync(videoPath)) {
+            try { fs.unlinkSync(videoPath); } catch { /* ignore */ }
+          }
+          if (downloadedAudio && !this.ephemeralStore.getByKey(audioStoreKey) && fs.existsSync(audioPath)) {
+            try { fs.unlinkSync(audioPath); } catch { /* ignore */ }
+          }
+          throw err;
+        } finally {
+          this.ephemeralStore.releaseReservation(videoReserveKey);
+          this.ephemeralStore.releaseReservation(audioReserveKey);
+          this.ephemeralStore.unpin(videoStoreKey);
+          this.ephemeralStore.unpin(audioStoreKey);
+          videoSlot.releaseClaim();
+          audioSlot.releaseClaim();
         }
-        if (downloadedAudio && !this.ephemeralStore.get(videoId, audioFid) && fs.existsSync(audioPath)) {
-          try { fs.unlinkSync(audioPath); } catch { /* ignore */ }
-        }
-        throw err;
-      } finally {
-        this.ephemeralStore.unpin(videoPin);
-        this.ephemeralStore.unpin(audioPin);
+      });
+    })());
+
+    this.coldTier3Inflight.set(inflightKey, work);
+    try {
+      return await work;
+    } finally {
+      if (this.coldTier3Inflight.get(inflightKey) === work) {
+        this.coldTier3Inflight.delete(inflightKey);
       }
-    });
+    }
   }
 
   private async downloadWithAuthFallback(
     videoId: string,
     selector: string,
     outputPath: string,
-  ): Promise<void> {
+    limits?: { preferAuth?: boolean; maxBytes?: number; onStagingBytes?: (bytes: number) => boolean },
+  ): Promise<{ usedAuth: boolean }> {
+    if (this.stopped) throw new Error("Server shutting down");
+    const firstAuth = Boolean(limits?.preferAuth && this.config.playback.authFallback.enabled);
     try {
-      await this.ytDlp.downloadFormat(videoId, selector, outputPath, { useAuth: false });
+      await this.ytDlp.downloadFormat(videoId, selector, outputPath, {
+        useAuth: firstAuth,
+        maxBytes: limits?.maxBytes,
+        onStagingBytes: limits?.onStagingBytes,
+      });
+      return { usedAuth: firstAuth };
     } catch (err) {
-      if (this.config.playback.authFallback.enabled) {
-        await this.ytDlp.downloadFormat(videoId, selector, outputPath, { useAuth: true });
+      const isBudgetErr = err instanceof Error && err.name === "BudgetExceededError";
+      const secondAuth = !firstAuth;
+      const canFallback = !this.stopped && !isBudgetErr && (!secondAuth || this.config.playback.authFallback.enabled);
+      if (canFallback) {
+        await this.ytDlp.downloadFormat(videoId, selector, outputPath, {
+          useAuth: secondAuth,
+          maxBytes: limits?.maxBytes,
+          onStagingBytes: limits?.onStagingBytes,
+        });
+        return { usedAuth: secondAuth };
       } else {
         throw err;
       }
     }
   }
 
-  private async ensureDashIndexedFile(filePath: string, mimeType: string): Promise<string> {
-    if (probeLocalFileDashRanges(filePath, mimeType)) {
+  private async ensureDashIndexedFile(
+    filePath: string,
+    mimeType: string,
+    reserveKey?: string,
+    alreadyRegisteredSize = 0,
+  ): Promise<string> {
+    if (mimeType.includes("webm")) {
+      return filePath;
+    }
+    // For MP4/M4A, require a SINGLE global sidx covering all fragments (not per-fragment sidx)
+    if (hasValidGlobalMp4Sidx(filePath) && probeLocalFileDashRanges(filePath, mimeType)) {
       return filePath;
     }
     const ffmpeg = this.config.binaries.ffmpeg;
-    if (!ffmpeg) return filePath;
+    if (!ffmpeg || this.stopped) return filePath;
 
-    const remuxPath = `${filePath}.dash.mp4`;
-    const proc = Bun.spawn(
-      [
-        ffmpeg,
-        "-y",
-        "-i",
-        filePath,
-        "-c",
-        "copy",
-        "-movflags",
-        "+dash+frag_keyframe+empty_moov+default_base_moof",
-        "-f",
-        "mp4",
-        remuxPath,
-      ],
-      { stdout: "ignore", stderr: "pipe" },
-    );
-    const code = await proc.exited;
-    if (code === 0 && fs.existsSync(remuxPath) && probeLocalFileDashRanges(remuxPath, "video/mp4")) {
-      fs.renameSync(remuxPath, filePath);
-      return filePath;
+    const inputSize = fs.statSync(filePath).size;
+    const remuxReserveKey = reserveKey ? `${reserveKey}:remux` : null;
+    const inputDelta = Math.max(0, inputSize - alreadyRegisteredSize);
+    if (reserveKey && inputDelta > 0) {
+      // Ensure any uncounted input size is accounted for while remux output coexists on disk
+      if (!this.ephemeralStore.reserveBytes(reserveKey, inputDelta)) {
+        throw new Error(`Insufficient ephemeral disk budget for remux input ${filePath}`);
+      }
     }
+    if (remuxReserveKey) {
+      if (!this.ephemeralStore.reserveBytes(remuxReserveKey, inputSize)) {
+        throw new Error(`Insufficient ephemeral disk budget to remux ${filePath}`);
+      }
+    }
+
+    const parentDir = path.dirname(filePath);
+    const remuxStageDir = path.join(parentDir, `.stage-${process.pid}-${Date.now()}-remux-${++this.remuxSeq}`);
+    fs.mkdirSync(remuxStageDir, { recursive: true });
+    registerActiveStagingDir(remuxStageDir);
+    const remuxPath = path.join(remuxStageDir, "remux.dash.mp4");
+
+    let code = -1;
+    let timedOut = false;
+    let budgetExceeded = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let sizePollTimer: ReturnType<typeof setInterval> | null = null;
+    let trackedRemux: { killSync: () => void; exited: Promise<unknown> } | null = null;
+
+    const cleanupRemuxStage = () => {
+      unregisterActiveStagingDir(remuxStageDir);
+      try {
+        fs.rmSync(remuxStageDir, { recursive: true, force: true });
+      } catch {
+        // Ignore
+      }
+    };
+
     try {
-      if (fs.existsSync(remuxPath)) fs.unlinkSync(remuxPath);
-    } catch {
-      // Ignore
+      if (this.stopped) {
+        throw new Error("Server shutting down");
+      }
+      const proc = spawnProcessGroup(
+        [
+          ffmpeg,
+          "-y",
+          "-i",
+          filePath,
+          "-c",
+          "copy",
+          "-movflags",
+          "+dash+global_sidx+frag_keyframe+empty_moov+default_base_moof",
+          "-f",
+          "mp4",
+          remuxPath,
+        ],
+        { stdout: "ignore", stderr: "pipe" },
+      );
+
+      trackedRemux = {
+        killSync: () => {
+          proc.killGroupSync();
+          cleanupRemuxStage();
+        },
+        exited: proc.exited.catch(() => {}),
+      };
+      this.activeRemuxProcs.add(trackedRemux);
+
+      // Scale remux budget modestly with input size (60s floor, 180s cap)
+      const remuxTimeoutMs = Math.min(
+        180_000,
+        Math.max(60_000, Math.ceil(inputSize / (10 * 1024 * 1024)) * 1000),
+      );
+      timer = setTimeout(() => {
+        timedOut = true;
+        proc.killGroupSync();
+      }, remuxTimeoutMs);
+      timer.unref?.();
+
+      if (remuxReserveKey) {
+        let highWater = inputSize;
+        sizePollTimer = setInterval(() => {
+          try {
+            const st = fs.statSync(remuxPath);
+            if (st.size > highWater) {
+              highWater = st.size;
+              if (!this.ephemeralStore.reserveBytes(remuxReserveKey, st.size)) {
+                budgetExceeded = true;
+                proc.killGroupSync();
+              }
+            }
+          } catch {
+            // File not yet created
+          }
+        }, 100);
+        sizePollTimer.unref?.();
+      }
+
+      code = await proc.exited;
+      proc.killGroupSync();
+      await withTimeoutNull(proc.stderrPromise, timedOut || budgetExceeded ? 100 : 500);
+
+      if (budgetExceeded) {
+        const budgetErr = new Error(`Remux output exceeded shared ephemeral disk budget for ${filePath}`);
+        budgetErr.name = "BudgetExceededError";
+        throw budgetErr;
+      }
+
+      if (
+        !this.stopped &&
+        !timedOut &&
+        code === 0 &&
+        fs.existsSync(remuxPath)
+      ) {
+        const finalRemuxSize = fs.statSync(remuxPath).size;
+        if (remuxReserveKey && !this.ephemeralStore.reserveBytes(remuxReserveKey, finalRemuxSize)) {
+          const budgetErr = new Error(
+            `Remux final output (${finalRemuxSize} bytes) exceeded shared ephemeral disk budget`,
+          );
+          budgetErr.name = "BudgetExceededError";
+          throw budgetErr;
+        }
+        if (hasValidGlobalMp4Sidx(remuxPath) && probeLocalFileDashRanges(remuxPath, "video/mp4")) {
+          fs.renameSync(remuxPath, filePath);
+          return filePath;
+        }
+      }
+      return filePath;
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (sizePollTimer) clearInterval(sizePollTimer);
+      if (trackedRemux) {
+        this.activeRemuxProcs.delete(trackedRemux);
+      }
+      cleanupRemuxStage();
+      if (remuxReserveKey) {
+        this.ephemeralStore.releaseReservation(remuxReserveKey);
+      }
     }
-    return filePath;
   }
 
   private collectCaptions(ytInfo: YtDlpVideoInfo, hints: InnertubeMetaHints): CaptionTrackRef[] {

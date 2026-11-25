@@ -40,11 +40,19 @@ Environment overrides:
 const config = loadConfig();
 const running = startServer(config);
 
-function shutdown(signal: string): void {
+let shuttingDown = false;
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
   running.app.logger.info("Shutting down", { signal });
   running.stop();
+  await running.awaitShutdown(1500).catch(() => {});
   process.exit(0);
 }
 
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => {
+  void shutdown("SIGINT");
+});
+process.on("SIGTERM", () => {
+  void shutdown("SIGTERM");
+});

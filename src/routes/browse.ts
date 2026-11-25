@@ -4,6 +4,7 @@ import { TtlLruCache } from "../cache/memory-cache.ts";
 import type { AnonymousInnertubeProvider } from "../innertube/client.ts";
 import { ContinuationStore } from "../innertube/continuation-store.ts";
 import {
+  descriptionToHtml,
   mapChannelHeaderAndMeta,
   mapCommentThreadToInvidious,
   mapSearchResultNode,
@@ -15,9 +16,30 @@ import {
   textOf,
 } from "../innertube/mappers.ts";
 
+const MAX_SEARCH_PAGES = 25;
+const MAX_SEARCH_QUERY_LEN = 500;
+const MAX_PLAYLIST_OFFSET = 5000;
+const MAX_CONSECUTIVE_EMPTY_PLAYLIST_PAGES = 3;
+const SUPPORTED_CHANNEL_TABS = new Set([
+  "home",
+  "videos",
+  "latest",
+  "streams",
+  "live",
+  "shorts",
+  "playlists",
+  "releases",
+  "podcasts",
+  "courses",
+  "community",
+  "posts",
+  "search",
+]);
+
 interface CachedSearchSession {
   pages: Array<Array<Record<string, unknown>>>;
   lastResult: any;
+  inflightContinuation?: Promise<void>;
 }
 
 interface CachedPlaylistSession {
@@ -36,17 +58,23 @@ interface CachedPlaylistSession {
   };
   videos: Array<Record<string, unknown>>;
   lastFeed: any;
+  exhausted?: boolean;
+  consecutiveEmptyPages?: number;
+  inflightContinuation?: Promise<void>;
 }
 
 interface ChannelTabContinuation {
   kind: "videos" | "playlists";
   channelId: string;
+  channelParam: string;
+  tab: string;
   channelAuthor: string;
   feed: any;
 }
 
 interface CommentContinuation {
   kind: "comments" | "replies" | "replies_page";
+  videoId: string;
   source: any;
 }
 
@@ -79,6 +107,8 @@ function mapSearchFilters(url: URL): Record<string, string> {
 export class BrowseRoutes {
   private readonly searchSessions = new TtlLruCache<string, CachedSearchSession>(100, 10 * 60 * 1000);
   private readonly playlistSessions = new TtlLruCache<string, CachedPlaylistSession>(100, 10 * 60 * 1000);
+  private readonly searchInitInflight = new Map<string, Promise<CachedSearchSession>>();
+  private readonly playlistInitInflight = new Map<string, Promise<CachedPlaylistSession>>();
   private readonly channelContinuations = new ContinuationStore<ChannelTabContinuation>(300, 15 * 60 * 1000);
   private readonly commentContinuations = new ContinuationStore<CommentContinuation>(500, 15 * 60 * 1000);
 
@@ -86,6 +116,89 @@ export class BrowseRoutes {
     private readonly innertube: AnonymousInnertubeProvider,
     private readonly logger: Logger = noopLogger,
   ) {}
+
+  private async tryAwaitRefresh<T>(refreshPromise: Promise<T> | undefined): Promise<T | null> {
+    if (!refreshPromise) return null;
+    try {
+      return await refreshPromise;
+    } catch {
+      return null;
+    }
+  }
+
+  private async getOrInitSearchSession(
+    sessionKey: string,
+    forceRefresh: boolean,
+    initFn: () => Promise<CachedSearchSession>,
+  ): Promise<CachedSearchSession> {
+    // Always join an active refresh first so overlapping page 1 + page 2 requests stay
+    // on the same result generation rather than mixing stale and fresh sessions.
+    // If an optional refresh fails while a healthy warm session exists, non-refresh
+    // callers keep serving the warm session instead of failing with 500.
+    const inflight = this.searchInitInflight.get(sessionKey);
+    if (inflight) {
+      if (!forceRefresh) {
+        const existing = this.searchSessions.get(sessionKey);
+        if (existing) {
+          const refreshed = await this.tryAwaitRefresh(inflight);
+          return refreshed ?? existing;
+        }
+      }
+      return inflight;
+    }
+    if (!forceRefresh) {
+      const existing = this.searchSessions.get(sessionKey);
+      if (existing) return existing;
+    }
+
+    const promise = initFn()
+      .then((session) => {
+        this.searchSessions.set(sessionKey, session);
+        return session;
+      })
+      .finally(() => {
+        if (this.searchInitInflight.get(sessionKey) === promise) {
+          this.searchInitInflight.delete(sessionKey);
+        }
+      });
+    this.searchInitInflight.set(sessionKey, promise);
+    return promise;
+  }
+
+  private async getOrInitPlaylistSession(
+    playlistId: string,
+    forceRefresh: boolean,
+    initFn: () => Promise<CachedPlaylistSession>,
+  ): Promise<CachedPlaylistSession> {
+    const inflight = this.playlistInitInflight.get(playlistId);
+    if (inflight) {
+      if (!forceRefresh) {
+        const existing = this.playlistSessions.get(playlistId);
+        if (existing) {
+          const refreshed = await this.tryAwaitRefresh(inflight);
+          return refreshed ?? existing;
+        }
+      }
+      return inflight;
+    }
+    if (!forceRefresh) {
+      const existing = this.playlistSessions.get(playlistId);
+      if (existing) return existing;
+    }
+
+    const promise = initFn()
+      .then((session) => {
+        this.playlistSessions.set(playlistId, session);
+        return session;
+      })
+      .finally(() => {
+        if (this.playlistInitInflight.get(playlistId) === promise) {
+          this.playlistInitInflight.delete(playlistId);
+        }
+      });
+    this.playlistInitInflight.set(playlistId, promise);
+    return promise;
+  }
 
   /**
    * GET /api/v1/search?q=...&page=1&sort_by=...&date=...&duration=...&type=...
@@ -95,33 +208,131 @@ export class BrowseRoutes {
     if (!q) {
       return Response.json([]);
     }
-    const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+    if (q.length > MAX_SEARCH_QUERY_LEN) {
+      return Response.json({ error: "Search query too long" }, { status: 400 });
+    }
+    const page = Math.max(1, Math.floor(Number(url.searchParams.get("page") || 1) || 1));
+    if (page > MAX_SEARCH_PAGES) {
+      return Response.json([]);
+    }
     const filters = mapSearchFilters(url);
     const sessionKey = JSON.stringify({ q, filters });
 
     try {
       const client = await this.innertube.getClient();
-      let session = this.searchSessions.get(sessionKey);
-
-      if (!session || page === 1) {
+      let session = await this.getOrInitSearchSession(sessionKey, page === 1, async () => {
         const res: any = await client.search(q, filters as any);
         const mapped = (res.results || [])
           .map((n: unknown) => mapSearchResultNode(n, origin))
           .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
-        session = { pages: [mapped], lastResult: res };
-        this.searchSessions.set(sessionKey, session);
-      }
+        return { pages: [mapped], lastResult: res };
+      });
 
-      while (session.pages.length < page) {
-        if (!session.lastResult?.has_continuation) {
-          return Response.json([]);
+      const MAX_GEN_HOPS = 3;
+      for (let hops = 0; ; ) {
+        let switchedGeneration = false;
+        while (session.pages.length < page) {
+          const activeRefresh = this.searchInitInflight.get(sessionKey);
+          if (activeRefresh && hops < MAX_GEN_HOPS) {
+            const refreshed = await this.tryAwaitRefresh(activeRefresh);
+            if (refreshed) {
+              session = refreshed;
+              hops++;
+              switchedGeneration = true;
+              break;
+            }
+          }
+          const currentCached = this.searchSessions.get(sessionKey);
+          if (currentCached && currentCached !== session && hops < MAX_GEN_HOPS) {
+            session = currentCached;
+            hops++;
+            switchedGeneration = true;
+            break;
+          }
+          if (session.inflightContinuation) {
+            try {
+              await session.inflightContinuation;
+            } catch (contErr) {
+              if (hops < MAX_GEN_HOPS) {
+                const refreshed = await this.tryAwaitRefresh(this.searchInitInflight.get(sessionKey));
+                if (refreshed) {
+                  session = refreshed;
+                  hops++;
+                  switchedGeneration = true;
+                  break;
+                }
+                const newerCached = this.searchSessions.get(sessionKey);
+                if (newerCached && newerCached !== session) {
+                  session = newerCached;
+                  hops++;
+                  switchedGeneration = true;
+                  break;
+                }
+              }
+              throw contErr;
+            }
+            continue;
+          }
+          if (!session.lastResult?.has_continuation) {
+            break;
+          }
+          const activeSession = session;
+          const step = (async () => {
+            const next: any = await activeSession.lastResult.getContinuation();
+            const mapped = (next.results || [])
+              .map((n: unknown) => mapSearchResultNode(n, origin))
+              .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
+            activeSession.pages.push(mapped);
+            activeSession.lastResult = next;
+          })();
+          activeSession.inflightContinuation = step;
+          try {
+            await step;
+          } catch (contErr) {
+            if (hops < MAX_GEN_HOPS) {
+              const refreshed = await this.tryAwaitRefresh(this.searchInitInflight.get(sessionKey));
+              if (refreshed) {
+                session = refreshed;
+                hops++;
+                switchedGeneration = true;
+                break;
+              }
+              const newerCached = this.searchSessions.get(sessionKey);
+              if (newerCached && newerCached !== session) {
+                session = newerCached;
+                hops++;
+                switchedGeneration = true;
+                break;
+              }
+            }
+            throw contErr;
+          } finally {
+            if (activeSession.inflightContinuation === step) {
+              activeSession.inflightContinuation = undefined;
+            }
+          }
         }
-        const next: any = await session.lastResult.getContinuation();
-        const mapped = (next.results || [])
-          .map((n: unknown) => mapSearchResultNode(n, origin))
-          .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
-        session.pages.push(mapped);
-        session.lastResult = next;
+        if (switchedGeneration) continue;
+        // Re-check after completing continuations in case page=1 started/installed a newer generation;
+        // if an optional refresh fails, keep serving our already-filled healthy warm session.
+        if (hops < MAX_GEN_HOPS) {
+          const trailingRefresh = this.searchInitInflight.get(sessionKey);
+          if (trailingRefresh) {
+            const refreshed = await this.tryAwaitRefresh(trailingRefresh);
+            if (refreshed) {
+              session = refreshed;
+              hops++;
+              continue;
+            }
+          }
+          const latestCached = this.searchSessions.get(sessionKey);
+          if (latestCached && latestCached !== session) {
+            session = latestCached;
+            hops++;
+            continue;
+          }
+        }
+        break;
       }
 
       return Response.json(session.pages[page - 1] || []);
@@ -145,6 +356,9 @@ export class BrowseRoutes {
     const q = (url.searchParams.get("q") || "").trim();
     if (!q) {
       return Response.json({ query: "", suggestions: [] });
+    }
+    if (q.length > MAX_SEARCH_QUERY_LEN) {
+      return Response.json({ error: "Search query too long" }, { status: 400 });
     }
     try {
       const client = await this.innertube.getClient();
@@ -262,16 +476,26 @@ export class BrowseRoutes {
     url: URL,
     origin: string,
   ): Promise<Response> {
+    if (!SUPPORTED_CHANNEL_TABS.has(tab)) {
+      return Response.json({ error: `Unsupported channel tab: ${tab}` }, { status: 404 });
+    }
+
     const continuationToken = url.searchParams.get("continuation") || "";
     const sortBy = (url.searchParams.get("sort_by") || "newest").toLowerCase();
+    const isPlaylistTab =
+      tab === "playlists" || tab === "releases" || tab === "podcasts" || tab === "courses";
 
     try {
-      // Handle continuation pagination first
+      // Handle continuation pagination first (strictly bound to channel + tab)
       if (continuationToken) {
         const state = this.channelContinuations.get(continuationToken);
-        if (!state) {
+        const matchesOwner =
+          Boolean(state) &&
+          state!.tab === tab &&
+          (state!.channelId === channelIdOrHandle || state!.channelParam === channelIdOrHandle);
+        if (!state || !matchesOwner) {
           return Response.json(
-            tab === "playlists" || tab === "releases" || tab === "podcasts" || tab === "courses"
+            isPlaylistTab
               ? { playlists: [], continuation: null }
               : tab === "community" || tab === "posts"
                 ? { comments: [], continuation: null }
@@ -283,6 +507,8 @@ export class BrowseRoutes {
           ? this.channelContinuations.put({
               kind: state.kind,
               channelId: state.channelId,
+              channelParam: state.channelParam,
+              tab: state.tab,
               channelAuthor: state.channelAuthor,
               feed: nextFeed,
             })
@@ -311,56 +537,149 @@ export class BrowseRoutes {
         return Response.json({ videos: items, continuation: nextToken });
       }
 
+      if (tab === "community" || tab === "posts") {
+        return Response.json({ comments: [], continuation: null });
+      }
+
       const client = await this.innertube.getClient();
       const resolvedId = await this.normalizeChannelId(client, channelIdOrHandle);
       const channel: any = await client.getChannel(resolvedId);
       const channelAuthor = textOf(channel.metadata?.title || channel.header?.author?.name || "");
       const channelId = String(channel.metadata?.external_id || resolvedId);
 
-      if (tab === "community" || tab === "posts") {
-        return Response.json({ comments: [], continuation: null });
-      }
-
       if (tab === "search") {
         const q = (url.searchParams.get("q") || "").trim();
         if (!q) return Response.json([]);
-        const page = Math.max(1, Number(url.searchParams.get("page") || 1) || 1);
+        if (q.length > MAX_SEARCH_QUERY_LEN) {
+          return Response.json({ error: "Search query too long" }, { status: 400 });
+        }
+        const page = Math.max(1, Math.floor(Number(url.searchParams.get("page") || 1) || 1));
+        if (page > MAX_SEARCH_PAGES) {
+          return Response.json([]);
+        }
         const sessionKey = `chsearch:${channelId}:${q}`;
-        let session = this.searchSessions.get(sessionKey);
-
-        if (!session || page === 1) {
+        let session = await this.getOrInitSearchSession(sessionKey, page === 1, async () => {
           const searchFeed: any = await channel.search(q);
           const items = (searchFeed.videos || searchFeed.posts || [])
             .map((n: unknown) =>
               mapYoutubeiVideoNode(n, origin, { author: channelAuthor, authorId: channelId }),
             )
             .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
-          session = { pages: [items], lastResult: searchFeed };
-          this.searchSessions.set(sessionKey, session);
-        }
+          return { pages: [items], lastResult: searchFeed };
+        });
 
-        while (session.pages.length < page) {
-          if (!session.lastResult?.has_continuation) {
-            return Response.json([]);
+        const MAX_GEN_HOPS = 3;
+        for (let hops = 0; ; ) {
+          let switchedGeneration = false;
+          while (session.pages.length < page) {
+            const activeRefresh = this.searchInitInflight.get(sessionKey);
+            if (activeRefresh && hops < MAX_GEN_HOPS) {
+              const refreshed = await this.tryAwaitRefresh(activeRefresh);
+              if (refreshed) {
+                session = refreshed;
+                hops++;
+                switchedGeneration = true;
+                break;
+              }
+            }
+            const currentCached = this.searchSessions.get(sessionKey);
+            if (currentCached && currentCached !== session && hops < MAX_GEN_HOPS) {
+              session = currentCached;
+              hops++;
+              switchedGeneration = true;
+              break;
+            }
+            if (session.inflightContinuation) {
+              try {
+                await session.inflightContinuation;
+              } catch (contErr) {
+                if (hops < MAX_GEN_HOPS) {
+                  const refreshed = await this.tryAwaitRefresh(this.searchInitInflight.get(sessionKey));
+                  if (refreshed) {
+                    session = refreshed;
+                    hops++;
+                    switchedGeneration = true;
+                    break;
+                  }
+                  const newerCached = this.searchSessions.get(sessionKey);
+                  if (newerCached && newerCached !== session) {
+                    session = newerCached;
+                    hops++;
+                    switchedGeneration = true;
+                    break;
+                  }
+                }
+                throw contErr;
+              }
+              continue;
+            }
+            if (!session.lastResult?.has_continuation) {
+              break;
+            }
+            const activeSession = session;
+            const step = (async () => {
+              const next: any = await activeSession.lastResult.getContinuation();
+              const more = (next.videos || next.posts || [])
+                .map((n: unknown) =>
+                  mapYoutubeiVideoNode(n, origin, { author: channelAuthor, authorId: channelId }),
+                )
+                .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
+              activeSession.pages.push(more);
+              activeSession.lastResult = next;
+            })();
+            activeSession.inflightContinuation = step;
+            try {
+              await step;
+            } catch (contErr) {
+              if (hops < MAX_GEN_HOPS) {
+                const refreshed = await this.tryAwaitRefresh(this.searchInitInflight.get(sessionKey));
+                if (refreshed) {
+                  session = refreshed;
+                  hops++;
+                  switchedGeneration = true;
+                  break;
+                }
+                const newerCached = this.searchSessions.get(sessionKey);
+                if (newerCached && newerCached !== session) {
+                  session = newerCached;
+                  hops++;
+                  switchedGeneration = true;
+                  break;
+                }
+              }
+              throw contErr;
+            } finally {
+              if (activeSession.inflightContinuation === step) {
+                activeSession.inflightContinuation = undefined;
+              }
+            }
           }
-          const next: any = await session.lastResult.getContinuation();
-          const more = (next.videos || next.posts || [])
-            .map((n: unknown) =>
-              mapYoutubeiVideoNode(n, origin, { author: channelAuthor, authorId: channelId }),
-            )
-            .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
-          session.pages.push(more);
-          session.lastResult = next;
+          if (switchedGeneration) continue;
+          if (hops < MAX_GEN_HOPS) {
+            const trailingRefresh = this.searchInitInflight.get(sessionKey);
+            if (trailingRefresh) {
+              const refreshed = await this.tryAwaitRefresh(trailingRefresh);
+              if (refreshed) {
+                session = refreshed;
+                hops++;
+                continue;
+              }
+            }
+            const latestCached = this.searchSessions.get(sessionKey);
+            if (latestCached && latestCached !== session) {
+              session = latestCached;
+              hops++;
+              continue;
+            }
+          }
+          break;
         }
 
         return Response.json(session.pages[page - 1] || []);
       }
 
-      const isPlaylistTab =
-        tab === "playlists" || tab === "releases" || tab === "podcasts" || tab === "courses";
-
       let feed: any;
-      if (tab === "videos" || tab === "latest") {
+      if (tab === "home" || tab === "videos" || tab === "latest") {
         feed = await channel.getVideos();
       } else if (tab === "streams" || tab === "live") {
         feed = await channel.getLiveStreams();
@@ -372,10 +691,8 @@ export class BrowseRoutes {
         feed = await channel.getReleases();
       } else if (tab === "podcasts") {
         feed = await channel.getPodcasts();
-      } else if (tab === "courses") {
-        feed = await channel.getCourses();
       } else {
-        feed = await channel.getVideos();
+        feed = await channel.getCourses();
       }
 
       // Apply sort filter if requested (newest / popular / oldest)
@@ -393,6 +710,8 @@ export class BrowseRoutes {
         ? this.channelContinuations.put({
             kind: isPlaylistTab ? "playlists" : "videos",
             channelId,
+            channelParam: channelIdOrHandle,
+            tab,
             channelAuthor,
             feed,
           })
@@ -438,10 +757,10 @@ export class BrowseRoutes {
     const sortBy = (url.searchParams.get("sort_by") || "top").toLowerCase();
 
     try {
-      // Handle pagination or reply thread expansion
+      // Handle pagination or reply thread expansion (strictly bound to videoId)
       if (continuationToken) {
         const state = this.commentContinuations.get(continuationToken);
-        if (!state) {
+        if (!state || state.videoId !== videoId) {
           return Response.json({ comments: [], continuation: null });
         }
 
@@ -455,19 +774,19 @@ export class BrowseRoutes {
             .map((r: unknown) => mapCommentThreadToInvidious(r as Record<string, any>, origin))
             .filter((x): x is NonNullable<typeof x> => x !== null);
           const nextToken = repliesObj?.has_continuation
-            ? this.commentContinuations.put({ kind: "replies_page", source: repliesObj })
+            ? this.commentContinuations.put({ kind: "replies_page", videoId, source: repliesObj })
             : null;
           return Response.json({ comments, continuation: nextToken });
         }
 
         const nextPage: any = await state.source.getContinuation();
-        return Response.json(this.serializeCommentsPage(nextPage, origin));
+        return Response.json(this.serializeCommentsPage(nextPage, origin, videoId));
       }
 
       const client = await this.innertube.getClient();
       const sortMode = sortBy === "new" ? "NEWEST_FIRST" : "TOP_COMMENTS";
       const page: any = await client.getComments(videoId, sortMode);
-      return Response.json(this.serializeCommentsPage(page, origin));
+      return Response.json(this.serializeCommentsPage(page, origin, videoId));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.logger.warn("Comments fetch failed", { videoId, error: msg });
@@ -483,15 +802,13 @@ export class BrowseRoutes {
    */
   async handlePlaylist(playlistId: string, url: URL, origin: string): Promise<Response> {
     // FreeTube calls xq(id, t=0) with params: { index: t + 50 }
-    const requestedIndex = Math.max(0, Number(url.searchParams.get("index") || 50) || 50);
+    const requestedIndex = Math.max(0, Math.floor(Number(url.searchParams.get("index") || 50) || 50));
     const startOffset = Math.max(0, requestedIndex - 50);
     const pageSize = 100;
 
     try {
       const client = await this.innertube.getClient();
-      let session = this.playlistSessions.get(playlistId);
-
-      if (!session || startOffset === 0) {
+      let session = await this.getOrInitPlaylistSession(playlistId, startOffset === 0, async () => {
         const pl: any = await client.getPlaylist(playlistId);
         const info = pl.info || {};
         const authorName = textOf(info.author?.name || "");
@@ -501,8 +818,9 @@ export class BrowseRoutes {
         const initialVideos = (pl.items || [])
           .map((v: unknown) => mapYoutubeiVideoNode(v, origin, { author: authorName, authorId }))
           .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
+        const descText = textOf(info.description);
 
-        session = {
+        return {
           meta: {
             title: textOf(info.title) || playlistId,
             playlistId,
@@ -510,8 +828,8 @@ export class BrowseRoutes {
             authorId,
             authorUrl: authorId ? `/channel/${authorId}` : "",
             authorThumbnails: normalizeAuthorThumbnails(info.author?.thumbnails, origin),
-            description: textOf(info.description),
-            descriptionHtml: textOf(info.description),
+            description: descText,
+            descriptionHtml: descriptionToHtml(descText),
             videoCount: Math.max(totalCount, initialVideos.length),
             viewCount: parseCompactNumber(info.views),
             updated: parseRelativeTimeToUnixSec(info.last_updated),
@@ -519,26 +837,136 @@ export class BrowseRoutes {
           videos: initialVideos,
           lastFeed: pl,
         };
-        this.playlistSessions.set(playlistId, session);
+      });
+
+      if (startOffset > MAX_PLAYLIST_OFFSET) {
+        return Response.json({
+          ...session.meta,
+          videoCount: Math.max(session.meta.videoCount, session.videos.length),
+          videos: [],
+        });
       }
 
-      // Fetch continuations if caller asked past currently buffered items
-      while (
-        session.videos.length < startOffset + pageSize &&
-        session.lastFeed?.has_continuation
-      ) {
-        const next: any = await session.lastFeed.getContinuation();
-        const more = (next.items || [])
-          .map((v: unknown) =>
-            mapYoutubeiVideoNode(v, origin, {
-              author: session!.meta.author,
-              authorId: session!.meta.authorId,
-            }),
-          )
-          .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
-        if (more.length === 0) break;
-        session.videos.push(...more);
-        session.lastFeed = next;
+      // Fetch continuations if caller asked past currently buffered items (serialized per session)
+      const targetLen = Math.min(startOffset + pageSize, MAX_PLAYLIST_OFFSET + pageSize);
+      const MAX_GEN_HOPS = 3;
+      for (let hops = 0; ; ) {
+        let switchedGeneration = false;
+        while (
+          session.videos.length < targetLen &&
+          !session.exhausted &&
+          (session.inflightContinuation || session.lastFeed?.has_continuation)
+        ) {
+          const activeRefresh = this.playlistInitInflight.get(playlistId);
+          if (activeRefresh && hops < MAX_GEN_HOPS) {
+            const refreshed = await this.tryAwaitRefresh(activeRefresh);
+            if (refreshed) {
+              session = refreshed;
+              hops++;
+              switchedGeneration = true;
+              break;
+            }
+          }
+          const currentCached = this.playlistSessions.get(playlistId);
+          if (currentCached && currentCached !== session && hops < MAX_GEN_HOPS) {
+            session = currentCached;
+            hops++;
+            switchedGeneration = true;
+            break;
+          }
+          if (session.inflightContinuation) {
+            try {
+              await session.inflightContinuation;
+            } catch (contErr) {
+              if (hops < MAX_GEN_HOPS) {
+                const refreshed = await this.tryAwaitRefresh(this.playlistInitInflight.get(playlistId));
+                if (refreshed) {
+                  session = refreshed;
+                  hops++;
+                  switchedGeneration = true;
+                  break;
+                }
+                const newerCached = this.playlistSessions.get(playlistId);
+                if (newerCached && newerCached !== session) {
+                  session = newerCached;
+                  hops++;
+                  switchedGeneration = true;
+                  break;
+                }
+              }
+              throw contErr;
+            }
+            continue;
+          }
+          const activeSession = session;
+          const step = (async () => {
+            const next: any = await activeSession.lastFeed.getContinuation();
+            const more = (next.items || [])
+              .map((v: unknown) =>
+                mapYoutubeiVideoNode(v, origin, {
+                  author: activeSession.meta.author,
+                  authorId: activeSession.meta.authorId,
+                }),
+              )
+              .filter((x: unknown): x is NonNullable<typeof x> => x !== null);
+            activeSession.lastFeed = next;
+            if (more.length === 0) {
+              const emptyCount = (activeSession.consecutiveEmptyPages ?? 0) + 1;
+              activeSession.consecutiveEmptyPages = emptyCount;
+              if (!next?.has_continuation || emptyCount >= MAX_CONSECUTIVE_EMPTY_PLAYLIST_PAGES) {
+                activeSession.exhausted = true;
+              }
+              return;
+            }
+            activeSession.consecutiveEmptyPages = 0;
+            activeSession.videos.push(...more);
+          })();
+          activeSession.inflightContinuation = step;
+          try {
+            await step;
+          } catch (contErr) {
+            if (hops < MAX_GEN_HOPS) {
+              const refreshed = await this.tryAwaitRefresh(this.playlistInitInflight.get(playlistId));
+              if (refreshed) {
+                session = refreshed;
+                hops++;
+                switchedGeneration = true;
+                break;
+              }
+              const newerCached = this.playlistSessions.get(playlistId);
+              if (newerCached && newerCached !== session) {
+                session = newerCached;
+                hops++;
+                switchedGeneration = true;
+                break;
+              }
+            }
+            throw contErr;
+          } finally {
+            if (activeSession.inflightContinuation === step) {
+              activeSession.inflightContinuation = undefined;
+            }
+          }
+        }
+        if (switchedGeneration) continue;
+        if (hops < MAX_GEN_HOPS) {
+          const trailingRefresh = this.playlistInitInflight.get(playlistId);
+          if (trailingRefresh) {
+            const refreshed = await this.tryAwaitRefresh(trailingRefresh);
+            if (refreshed) {
+              session = refreshed;
+              hops++;
+              continue;
+            }
+          }
+          const latestCached = this.playlistSessions.get(playlistId);
+          if (latestCached && latestCached !== session) {
+            session = latestCached;
+            hops++;
+            continue;
+          }
+        }
+        break;
       }
 
       const slice = session.videos.slice(startOffset, startOffset + pageSize);
@@ -554,7 +982,7 @@ export class BrowseRoutes {
     }
   }
 
-  private serializeCommentsPage(page: any, origin: string) {
+  private serializeCommentsPage(page: any, origin: string, videoId: string) {
     const threads: any[] = page?.contents || [];
     const comments = [];
 
@@ -563,6 +991,7 @@ export class BrowseRoutes {
       if (thread?.has_replies) {
         replyToken = this.commentContinuations.put({
           kind: "replies",
+          videoId,
           source: thread,
         });
       }
@@ -571,12 +1000,12 @@ export class BrowseRoutes {
     }
 
     const nextToken = page?.has_continuation
-      ? this.commentContinuations.put({ kind: "comments", source: page })
+      ? this.commentContinuations.put({ kind: "comments", videoId, source: page })
       : null;
 
     return {
       commentCount: parseCompactNumber(page?.header?.count),
-      videoId: "",
+      videoId,
       comments,
       continuation: nextToken,
     };
