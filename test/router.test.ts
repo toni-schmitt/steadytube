@@ -337,6 +337,49 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
     }
   });
 
+  test("RSS playlist 404 starts the channel feed FreeTube falls back to", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-rss-fallback-"));
+    try {
+      const upstream: string[] = [];
+      const mockFetch = async (input: string | URL | Request) => {
+        const params = new URL(input.toString()).searchParams;
+        upstream.push(params.get("playlist_id") ?? `channel:${params.get("channel_id")}`);
+        await new Promise((r) => setTimeout(r, 15));
+        return params.has("playlist_id")
+          ? new Response("Not Found", { status: 404 })
+          : new Response("<feed/>", { status: 200 });
+      };
+      const app = createApp(makeTestConfig(tmpDir), {
+        logger: noopLogger,
+        fetchFn: mockFetch,
+        fetchRawFn: mockFetch,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo() { throw new Error("unused"); },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+      });
+      const suffix = "3gFi4JOZbdF0xvwTZKs9hA";
+
+      const playlist = await app.fetch(new Request(`http://127.0.0.1:8787/feed/playlist/UULF${suffix}`));
+      expect(playlist.status).toBe(404);
+      expect(upstream).toEqual([`UULF${suffix}`, `channel:UC${suffix}`]);
+
+      const channel = await app.fetch(new Request(`http://127.0.0.1:8787/feed/channel/UC${suffix}`));
+      expect(channel.status).toBe(200);
+      expect(upstream.length).toBe(2);
+
+      // Not a channel playlist: no fallback guess.
+      await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/PLabcdefghijklmnop"));
+      expect(upstream.slice(2)).toEqual(["PLabcdefghijklmnop"]);
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   test("silently escalates Tier 1 -> Tier 2 on immediate bot-check and serves DASH + Range 206", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-tier2-"));
     try {

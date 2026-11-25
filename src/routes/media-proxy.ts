@@ -89,6 +89,9 @@ const FEED_REFRESH_GAP_MS = 60_000;
 // Feeds no refresh has asked for in this long (e.g. unsubscribed channels) stop being prefetched.
 const FEED_REMEMBER_MS = 30 * 24 * 60 * 60 * 1000;
 const FEED_REMEMBER_MAX = 2000;
+// A channel's own playlists: "UU" (all uploads) or "UU" + two letters (UULF videos, UUSH shorts,
+// UULV live, ...) followed by the 22 characters that follow "UC" in its channel id.
+const CHANNEL_PLAYLIST_ID = /^UU(?:[A-Z]{2})?([A-Za-z0-9_-]{22})$/;
 
 type FeedKind = "playlist" | "channel";
 
@@ -337,9 +340,11 @@ export class MediaProxyRoutes {
    * Prefetches run on at most `maxConcurrentUpstream` workers, so they hold at most that many
    * feed-semaphore slots. Calling loadFeed for every feed of a 300-channel refresh at once would
    * overflow the semaphore's bounded queue and turn FreeTube's own requests into 503 "proxy busy".
+   * `first` jumps the queue, for a feed FreeTube is about to ask for.
    */
-  private queuePrefetch(kind: FeedKind, id: string): void {
-    this.prefetchQueue.push({ kind, id });
+  private queuePrefetch(kind: FeedKind, id: string, first = false): void {
+    if (first) this.prefetchQueue.unshift({ kind, id });
+    else this.prefetchQueue.push({ kind, id });
     if (this.prefetchWorkers >= this.config.rss.maxConcurrentUpstream) return;
     this.prefetchWorkers++;
     void (async () => {
@@ -424,6 +429,10 @@ export class MediaProxyRoutes {
               };
             }
             if (lastStatus === 404) {
+              // FreeTube falls back to the channel feed when a channel's UU… playlist 404s; start it now
+              // so it is ready when FreeTube asks, instead of costing another upstream round trip then.
+              const channelSuffix = kind === "playlist" ? CHANNEL_PLAYLIST_ID.exec(id)?.[1] : undefined;
+              if (channelSuffix) this.queuePrefetch("channel", `UC${channelSuffix}`, true);
               return {
                 value: { status: 404, contentType: "text/plain; charset=utf-8", body: "Not Found" },
                 ttlMs: this.config.rss.negativeCacheTtlSec * 1000,
