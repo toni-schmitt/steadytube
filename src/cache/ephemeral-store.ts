@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { dlopen, FFIType } from "bun:ffi";
 import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
 
@@ -57,6 +58,45 @@ export interface ProgressiveStreamSource {
 
 const MAX_PROGRESSIVE_SEEK_AHEAD_BYTES = 64 * 1024 * 1024; // 64 MiB
 const LOCK_FILENAME = ".steadytube.lock";
+const FLOCK_FILENAME = ".steadytube.flock";
+const LOCK_EX_NB = 2 | 4; // POSIX LOCK_EX | LOCK_NB on macOS and Linux
+const KNOWN_WEBM_AUDIO_ITAG_RE = /^(?:171|172|249|250|251|338|380|600)(?:\D|$)/;
+
+type FlockFn = (fd: number, operation: number) => number;
+let cachedFlockFn: FlockFn | null | undefined;
+
+function getOsFlockFn(): FlockFn | null {
+  if (cachedFlockFn !== undefined) return cachedFlockFn;
+  const candidates =
+    process.platform === "darwin"
+      ? ["libSystem.B.dylib"]
+      : process.platform === "linux"
+        ? ["libc.so.6", "libc.so"]
+        : [];
+  for (const libName of candidates) {
+    try {
+      const lib = dlopen(libName, {
+        flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+      });
+      cachedFlockFn = (fd: number, op: number) => lib.symbols.flock(fd, op);
+      return cachedFlockFn;
+    } catch {
+      // Try next candidate
+    }
+  }
+  cachedFlockFn = null;
+  return null;
+}
+
+function tryOsFlockExNb(fd: number): boolean | null {
+  const fn = getOsFlockFn();
+  if (!fn) return null;
+  try {
+    return fn(fd, LOCK_EX_NB) === 0;
+  } catch {
+    return null;
+  }
+}
 
 // Process-local tracking so a second store instance in the same process never deletes
 // live staging directories or active temp artifacts.
@@ -229,6 +269,7 @@ export class EphemeralStore {
   private readonly reservedBytesByKey = new Map<string, number>();
   private readonly lockToken = Symbol("ephemeral-store-lock");
   private readonly lockId = `${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
+  private lockFd: number | null = null;
   private ownsCleanupLock = false;
   private initialized = false;
   private closed = false;
@@ -304,43 +345,12 @@ export class EphemeralStore {
     }
 
     const lockPath = path.join(this.resolvedBaseDir, LOCK_FILENAME);
-    const reclaimDir = `${lockPath}.reclaim`;
+    const flockPath = path.join(this.resolvedBaseDir, FLOCK_FILENAME);
     const tmpPath = `${lockPath}.tmp-${this.lockId}`;
     const payload = JSON.stringify({ pid: process.pid, lockId: this.lockId, ts: Date.now() });
 
-    const isLockFileStale = (): boolean => {
-      try {
-        const raw = fs.readFileSync(lockPath, "utf8");
-        const parsed = JSON.parse(raw) as { pid?: number; lockId?: string };
-        if (typeof parsed.pid === "number" && parsed.pid > 0) {
-          if (parsed.pid !== process.pid && isPidAlive(parsed.pid)) {
-            return false;
-          }
-          if (parsed.pid === process.pid && activeStoreLocks.has(this.resolvedBaseDir)) {
-            return false;
-          }
-          return true;
-        }
-      } catch {
-        // Fall through to mtime age check below
-      }
-      // Corrupt, partial, or missing-pid lock file: only treat as stale if aged >2s so we never
-      // displace a freshly-created legacy lockfile mid-write.
-      try {
-        const st = fs.statSync(lockPath);
-        return Date.now() - st.mtimeMs > 2000;
-      } catch {
-        return false;
-      }
-    };
-
-    const claimOwnership = (): boolean => {
-      try {
-        const verified = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { lockId?: string };
-        if (verified.lockId !== this.lockId) return false;
-      } catch {
-        return false;
-      }
+    const finalizeOwnership = (heldFd: number | null): boolean => {
+      this.lockFd = heldFd;
       activeStoreLocks.set(this.resolvedBaseDir, this.lockToken);
       this.ownsCleanupLock = true;
       // Standby takeover after startup: rebuild disk inventory under the newly acquired lock
@@ -354,75 +364,130 @@ export class EphemeralStore {
       return true;
     };
 
+    // Primary path (macOS & Linux): kernel-enforced exclusive flock on a never-unlinked inode.
+    // The OS guarantees mutual exclusion across processes and releases instantly on crash/exit,
+    // eliminating stale-lock reclaim races and timer-based guard theft.
+    let openedFlockFd: number | null = null;
     try {
-      // Write full JSON payload into a private temp file FIRST so `lockPath` NEVER appears
-      // empty to contenders; `linkSync` atomically publishes the complete file or fails EEXIST.
+      openedFlockFd = fs.openSync(flockPath, "a+");
+      const osLocked = tryOsFlockExNb(openedFlockFd);
+      if (osLocked === false) {
+        fs.closeSync(openedFlockFd);
+        return false;
+      }
+      if (osLocked === true) {
+        try {
+          const tmpFd = fs.openSync(tmpPath, "wx");
+          try {
+            fs.writeFileSync(tmpFd, payload);
+          } finally {
+            fs.closeSync(tmpFd);
+          }
+          fs.renameSync(tmpPath, lockPath);
+        } catch {
+          try {
+            if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+          } catch {
+            // Ignore
+          }
+          try {
+            fs.closeSync(openedFlockFd);
+          } catch {
+            // Ignore
+          }
+          return false;
+        }
+        return finalizeOwnership(openedFlockFd);
+      }
+      // OS flock unavailable on this platform; close and fall back to serialized guard directory
+      fs.closeSync(openedFlockFd);
+      openedFlockFd = null;
+    } catch {
+      if (openedFlockFd !== null) {
+        try {
+          fs.closeSync(openedFlockFd);
+        } catch {
+          // Ignore
+        }
+      }
+      return false;
+    }
+
+    // Fallback path (non-macOS/Linux): serialize BOTH publication and stale reclamation through
+    // one shared guard directory with PID-checked owner metadata.
+    const guardDir = `${lockPath}.guard`;
+    const guardOwnerPath = path.join(guardDir, "owner");
+
+    const isLockFileStale = (): boolean => {
+      try {
+        const raw = fs.readFileSync(lockPath, "utf8");
+        const parsed = JSON.parse(raw) as { pid?: number; lockId?: string };
+        if (typeof parsed.pid === "number" && parsed.pid > 0) {
+          if (parsed.pid !== process.pid && isPidAlive(parsed.pid)) return false;
+          if (parsed.pid === process.pid && activeStoreLocks.has(this.resolvedBaseDir)) return false;
+          return true;
+        }
+      } catch {
+        // Fall through to age check
+      }
+      try {
+        return Date.now() - fs.statSync(lockPath).mtimeMs > 2000;
+      } catch {
+        return false;
+      }
+    };
+
+    const isGuardDirStale = (): boolean => {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(guardOwnerPath, "utf8")) as { pid?: number };
+        if (typeof parsed.pid === "number" && parsed.pid > 0) {
+          return parsed.pid !== process.pid && !isPidAlive(parsed.pid);
+        }
+      } catch {
+        // Owner file missing/unwritten yet: only stale if guard dir aged >5s
+        try {
+          return Date.now() - fs.statSync(guardDir).mtimeMs > 5000;
+        } catch {
+          return false;
+        }
+      }
+      return false;
+    };
+
+    let holdsGuard = false;
+    try {
+      try {
+        fs.mkdirSync(guardDir);
+        holdsGuard = true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "EEXIST" && isGuardDirStale()) {
+          try {
+            if (fs.existsSync(guardOwnerPath)) fs.unlinkSync(guardOwnerPath);
+            fs.rmdirSync(guardDir);
+            fs.mkdirSync(guardDir);
+            holdsGuard = true;
+          } catch {
+            return false;
+          }
+        }
+      }
+      if (!holdsGuard) return false;
+      fs.writeFileSync(guardOwnerPath, payload);
+
+      if (fs.existsSync(lockPath)) {
+        if (!isLockFileStale()) return false;
+        fs.unlinkSync(lockPath);
+      }
       const fd = fs.openSync(tmpPath, "wx");
       try {
         fs.writeFileSync(fd, payload);
       } finally {
         fs.closeSync(fd);
       }
-
-      try {
-        fs.linkSync(tmpPath, lockPath);
-        return claimOwnership();
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") {
-          return false;
-        }
-      }
-
-      if (!isLockFileStale()) {
-        return false;
-      }
-
-      // Serialize stale-lock reclaim via atomic `mkdirSync(reclaimDir)` so two contenders
-      // can NEVER race on unlinking and replacing a newly-published live owner's lock.
-      let holdsReclaim = false;
-      try {
-        fs.mkdirSync(reclaimDir);
-        holdsReclaim = true;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException)?.code === "EEXIST") {
-          // Clean up an abandoned reclaim dir left behind by a crashed reclaimer (>10s old)
-          try {
-            const st = fs.statSync(reclaimDir);
-            if (Date.now() - st.mtimeMs > 10_000) {
-              fs.rmdirSync(reclaimDir);
-              fs.mkdirSync(reclaimDir);
-              holdsReclaim = true;
-            }
-          } catch {
-            return false;
-          }
-        }
-      }
-      if (!holdsReclaim) return false;
-
-      try {
-        // Re-check staleness INSIDE the serialized reclaim guard before unlinking
-        if (fs.existsSync(lockPath) && !isLockFileStale()) {
-          return false;
-        }
-        try {
-          if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
-        } catch {
-          return false;
-        }
-        try {
-          fs.linkSync(tmpPath, lockPath);
-        } catch {
-          return false;
-        }
-        return claimOwnership();
-      } finally {
-        try {
-          fs.rmdirSync(reclaimDir);
-        } catch {
-          // Ignore
-        }
-      }
+      fs.linkSync(tmpPath, lockPath);
+      const verified = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { lockId?: string };
+      if (verified.lockId !== this.lockId) return false;
+      return finalizeOwnership(null);
     } catch {
       return false;
     } finally {
@@ -431,27 +496,44 @@ export class EphemeralStore {
       } catch {
         // Ignore
       }
+      if (holdsGuard) {
+        try {
+          if (fs.existsSync(guardOwnerPath)) fs.unlinkSync(guardOwnerPath);
+          fs.rmdirSync(guardDir);
+        } catch {
+          // Ignore
+        }
+      }
     }
   }
 
   private releaseCleanupLock(): void {
-    if (!this.ownsCleanupLock) return;
+    if (!this.ownsCleanupLock && this.lockFd === null) return;
     this.ownsCleanupLock = false;
-    if (activeStoreLocks.get(this.resolvedBaseDir) === this.lockToken) {
-      activeStoreLocks.delete(this.resolvedBaseDir);
-    }
     const lockPath = path.join(this.resolvedBaseDir, LOCK_FILENAME);
     try {
       if (fs.existsSync(lockPath)) {
         const raw = fs.readFileSync(lockPath, "utf8");
         const parsed = JSON.parse(raw) as { lockId?: string };
-        // Only remove the lockfile if it still belongs to THIS store instance
+        // Remove owner metadata BEFORE releasing the kernel flock
         if (parsed.lockId === this.lockId) {
           fs.unlinkSync(lockPath);
         }
       }
     } catch {
       // Ignore
+    }
+    if (this.lockFd !== null) {
+      const fd = this.lockFd;
+      this.lockFd = null;
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore
+      }
+    }
+    if (activeStoreLocks.get(this.resolvedBaseDir) === this.lockToken) {
+      activeStoreLocks.delete(this.resolvedBaseDir);
     }
   }
 
@@ -577,7 +659,8 @@ export class EphemeralStore {
     // Evict expired/LRU unpinned completed entries to make room for reserved writers
     this.cleanup(otherReserved + needed);
 
-    let registeredBytes = retiredBytes;
+    // Recompute retained bytes AFTER cleanup() so any failed unlinks remain charged against quota
+    let registeredBytes = this.getRetiredBytes();
     for (const entry of this.entries.values()) {
       if (entry.key !== key) {
         registeredBytes += entry.size;
@@ -1344,12 +1427,32 @@ export class EphemeralStore {
               if (ownerPid !== null && ownerPid !== process.pid && isPidAlive(ownerPid)) {
                 continue;
               }
-              unlinkWithMetaSidecar(filePath);
+              if (!unlinkWithMetaSidecar(filePath)) {
+                const resolved = path.resolve(filePath);
+                this.failedUnlinkEntries.set(resolved, {
+                  key: this.makeKey(dirent.name, f.name.replace(/\.[^.]+$/, "")),
+                  filePath: resolved,
+                  size: stat.size,
+                  mimeType: "application/octet-stream",
+                  createdAt: stat.birthtimeMs || stat.mtimeMs,
+                  lastAccessedAt: stat.atimeMs || stat.mtimeMs,
+                });
+              }
               continue;
             }
             if (now - stat.mtimeMs >= this.ttlMs) {
               if (canCleanStaging) {
-                unlinkWithMetaSidecar(filePath);
+                if (!unlinkWithMetaSidecar(filePath)) {
+                  const resolved = path.resolve(filePath);
+                  this.failedUnlinkEntries.set(resolved, {
+                    key: this.makeKey(dirent.name, f.name.replace(/\.[^.]+$/, "")),
+                    filePath: resolved,
+                    size: stat.size,
+                    mimeType: "application/octet-stream",
+                    createdAt: stat.birthtimeMs || stat.mtimeMs,
+                    lastAccessedAt: stat.atimeMs || stat.mtimeMs,
+                  });
+                }
               }
               continue;
             }
@@ -1358,12 +1461,15 @@ export class EphemeralStore {
             if (this.retiredPaths.has(path.resolve(filePath))) {
               continue;
             }
+            const meta = readMetaSidecar(filePath);
+            const logicalFid = meta?.formatId || formatId;
             const inferredMime = f.name.endsWith(".webm")
-              ? "video/webm"
+              ? KNOWN_WEBM_AUDIO_ITAG_RE.test(logicalFid) || logicalFid.startsWith("tier3-a-")
+                ? "audio/webm"
+                : "video/webm"
               : f.name.endsWith(".m4a")
                 ? "audio/mp4"
                 : "video/mp4";
-            const meta = readMetaSidecar(filePath);
             const mimeType = meta?.mimeType || inferredMime;
             if (!preservePinnedExisting || !this.entries.has(key)) {
               this.entries.set(key, {

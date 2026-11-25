@@ -1337,7 +1337,58 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
       const p2ErrHopJson = (await p2ErrHopRes.json()) as any[];
       expect(p2ErrHopJson[0].videoId).toBe("gen2_page2");
 
+      // Round 6 Mistral Nit 1: Invalid video ID on /api/v1/comments/:id returns 400
+      const badCommentId = await appR5Browse.fetch(
+        new Request("http://127.0.0.1:8787/api/v1/comments/bad!id"),
+      );
+      expect(badCommentId.status).toBe(400);
+
       appR5Browse.stop();
+
+      // Round 6 #15: A failing concurrent page-1 refresh MUST NOT turn a healthy warm page-2 request into 500!
+      let failRefreshStarted!: () => void;
+      const failRefreshStartedP = new Promise<void>((r) => { failRefreshStarted = r; });
+      let rejectRefreshNow!: (err: Error) => void;
+      let searchCalls15 = 0;
+      const appR6Browse = createApp(makeTestConfig(path.join(tmpDir, "r6-browse"), false), {
+        logger: noopLogger,
+        innertube: {
+          async getClient() {
+            return {
+              async search() {
+                searchCalls15++;
+                if (searchCalls15 === 2) {
+                  failRefreshStarted();
+                  await new Promise<void>((_, reject) => { rejectRefreshNow = reject; });
+                }
+                return {
+                  results: [makeVid("warm_gen1_p1", "Warm G1 P1")],
+                  has_continuation: true,
+                  async getContinuation() {
+                    return {
+                      results: [makeVid("warm_gen1_p2", "Warm G1 P2")],
+                      has_continuation: false,
+                    };
+                  },
+                };
+              },
+            };
+          },
+          reset() {},
+        } as unknown as AnonymousInnertubeProvider,
+      });
+      const warm1 = await appR6Browse.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=steady&page=1"));
+      expect(warm1.status).toBe(200);
+      const failingRefreshReq = appR6Browse.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=steady&page=1"));
+      await failRefreshStartedP;
+      const warmPage2Req = appR6Browse.fetch(new Request("http://127.0.0.1:8787/api/v1/search?q=steady&page=2"));
+      await new Promise((r) => setTimeout(r, 15));
+      rejectRefreshNow(new Error("transient upstream 503"));
+      const [refreshRes, page2Res] = await Promise.all([failingRefreshReq, warmPage2Req]);
+      expect(refreshRes.status).toBe(500);
+      expect(page2Res.status).toBe(200);
+      expect(((await page2Res.json()) as any[])[0].videoId).toBe("warm_gen1_p2");
+      appR6Browse.stop();
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

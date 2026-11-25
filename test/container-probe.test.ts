@@ -700,8 +700,78 @@ describe("container-probe", () => {
       expect(noEsdsMeta).not.toBeNull();
       expect(noEsdsMeta!.codec).toBeUndefined();
       expect(noEsdsMeta!.durationSec).toBe(12.5);
+
+      // Round 6 #17: Zero-length 0x05 DecSpecificInfo followed by trailing bytes MUST NOT read past dsiEnd
+      const zeroDsi = new Uint8Array([0x05, 0x00, 0x10, 0x00]); // dsiLen=0, trailing 0x10 (AOT=2) outside dsi!
+      const dcZero = concatBytes(new Uint8Array([0x04, 13 + 2, 0x40]), new Uint8Array(12), zeroDsi);
+      const esZero = concatBytes(new Uint8Array([0x03, 3 + dcZero.byteLength, 0x00, 0x01, 0x00]), dcZero);
+      const zeroDsiPath = path.join(tmpDir, "zero-dsi.m4a");
+      fs.writeFileSync(zeroDsiPath, makeAudioMp4(makeContainerBox("esds", new Uint8Array(4), esZero)));
+      expect(probeMp4TrackMetadata(zeroDsiPath)!.codec).toBeUndefined();
+
+      // Round 6 #17: Escape AOT=31 without extension byte MUST return undefined (NEVER mp4a.40.31!)
+      const truncEscapeDsi = new Uint8Array([0x05, 0x01, 0xf8]); // 5 top bits = 31, only 1 byte in dsi
+      const dcEsc = concatBytes(new Uint8Array([0x04, 13 + truncEscapeDsi.byteLength, 0x40]), new Uint8Array(12), truncEscapeDsi);
+      const esEsc = concatBytes(new Uint8Array([0x03, 3 + dcEsc.byteLength, 0x00, 0x01, 0x00]), dcEsc);
+      const truncEscPath = path.join(tmpDir, "trunc-esc.m4a");
+      fs.writeFileSync(truncEscPath, makeAudioMp4(makeContainerBox("esds", new Uint8Array(4), esEsc)));
+      expect(probeMp4TrackMetadata(truncEscPath)!.codec).toBeUndefined();
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  test("Round 6 #10/#13: probeRemoteDashRanges enforces 16 KiB upper bound, total bounds, and strips inherited range headers", async () => {
+    const mp4Prefix = concatBytes(makeMp4Box("ftyp", 20), makeMp4Box("moov", 200), makeMp4Box("sidx", 60));
+    const oversizeBody = new Uint8Array(20001);
+    oversizeBody.set(mp4Prefix, 0);
+
+    // 1) Reject 206 whose Content-Range ends past requested 0-16383
+    const overProbe = await probeRemoteDashRanges(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+      "video/mp4",
+      async () =>
+        new Response(oversizeBody, {
+          status: 206,
+          headers: { "Content-Range": "bytes 0-20000/50000" },
+        }),
+    );
+    expect(overProbe).toBeNull();
+
+    // 2) Reject parsed sidx whose declared indexEnd exceeds numeric Content-Range total
+    const hugeSidxPrefix = concatBytes(makeMp4Box("ftyp", 20), makeMp4Box("moov", 200), makeMp4Box("sidx", 600));
+    // Serve only the first 260 bytes (sidx header is present, declared sidx end = 819 >= total 300!)
+    const partialSlice = hugeSidxPrefix.subarray(0, 260);
+    const oobSidxProbe = await probeRemoteDashRanges(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+      "video/mp4",
+      async () =>
+        new Response(partialSlice, {
+          status: 206,
+          headers: { "Content-Range": "bytes 0-259/300" },
+        }),
+    );
+    expect(oobSidxProbe).toBeNull();
+
+    // 3) Inherited lowercase range / if-range in extraHeaders are stripped before setting canonical Range
+    let seenHeaders: Record<string, string> = {};
+    const sanitized = await probeRemoteDashRanges(
+      "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+      "video/mp4",
+      async (_u, init) => {
+        seenHeaders = (init?.headers as Record<string, string>) || {};
+        return new Response(mp4Prefix, {
+          status: 206,
+          headers: { "Content-Range": `bytes 0-${mp4Prefix.byteLength - 1}/2000` },
+        });
+      },
+      { range: "bytes=999-1000", "if-range": '"stale"', "User-Agent": "TestUA" },
+    );
+    expect(sanitized).not.toBeNull();
+    expect(seenHeaders["range"]).toBeUndefined();
+    expect(seenHeaders["if-range"]).toBeUndefined();
+    expect(seenHeaders["Range"]).toBe("bytes=0-16383");
+    expect(seenHeaders["Accept-Encoding"]).toBe("identity");
+    expect(seenHeaders["User-Agent"]).toBe("TestUA");
   });
 });

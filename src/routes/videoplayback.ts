@@ -24,6 +24,7 @@ import { ipv4FetchRaw, type FetchLike } from "../net/ipv4-fetch.ts";
 
 const ALLOWED_GOOGLEVIDEO_HOST = /^[a-z0-9-]+\.googlevideo\.com$/i;
 const MAX_RECOVERY_ATTEMPTS = 4;
+const KNOWN_WEBM_AUDIO_ITAGS = new Set([171, 172, 249, 250, 251, 338, 380, 600]);
 
 function isRecoverableStatus(status: number): boolean {
   return status === 403 || status === 404 || status === 410 || status === 429 || status >= 500;
@@ -178,9 +179,18 @@ function validateUpstreamSegmentResponse(
   }
 
   if (res.status === 416) {
-    const parsed = parseContentRangeHeader(res.headers.get("content-range"));
-    if (expectedTotal > 0 && parsed && "unsatisfiableTotal" in parsed && parsed.unsatisfiableTotal !== expectedTotal) {
-      return { ok: false, reason: "layout_mismatch" };
+    if (outboundRange === null) {
+      return { ok: false, reason: "recoverable_protocol" };
+    }
+    const rawCr = res.headers.get("content-range");
+    if (rawCr !== null) {
+      const parsed = parseContentRangeHeader(rawCr);
+      if (!parsed || !("unsatisfiableTotal" in parsed)) {
+        return { ok: false, reason: "recoverable_protocol" };
+      }
+      if (expectedTotal > 0 && parsed.unsatisfiableTotal !== expectedTotal) {
+        return { ok: false, reason: "layout_mismatch" };
+      }
     }
     return { ok: true, expectedBodyBytes: 0 };
   }
@@ -238,6 +248,8 @@ function tapStreamHash(
 }
 
 function classifyRequestedRange(req: Request, totalSize: number): RequestedRangeInfo {
+  // HEAD never forwards Range upstream (RFC 9110 §14.2), so classify identically to unranged HEAD
+  if (req.method === "HEAD") return { kind: "offset", start: 0 };
   if (req.headers.get("if-range")) return { kind: "offset", start: 0 };
   const range = req.headers.get("range");
   if (!range || !range.trim()) return { kind: "offset", start: 0 };
@@ -531,6 +543,14 @@ export class VideoPlaybackRoute {
                 if (probedLayout !== urlLayout) continue;
               }
             }
+            // Recover accurate audio/webm MIME for legacy pre-sidecar WebM audio files
+            if (
+              !diskEntry.meta?.mimeType &&
+              diskEntry.filePath.endsWith(".webm") &&
+              KNOWN_WEBM_AUDIO_ITAGS.has(itag)
+            ) {
+              diskEntry.mimeType = "audio/webm";
+            }
             return this.ephemeralStore.serveFile(diskEntry, req);
           }
         }
@@ -697,13 +717,23 @@ export class VideoPlaybackRoute {
           return this.serveLocalTargetOr503(preRecovered, req);
         }
         if (preRecovered.kind === "progressive") {
-          return await this.ephemeralStore.serveProgressive(
+          const progRes = await this.ephemeralStore.serveProgressive(
             preRecovered.source,
             req,
             this.config.playback.streamStallTimeoutMs,
           );
+          if (
+            progRes.status !== 503 ||
+            req.signal.aborted ||
+            preRecovered.source.getStatus() !== "failed" ||
+            !preRecovered.fallbackRemote
+          ) {
+            return progRes;
+          }
+          current = preRecovered.fallbackRemote;
+        } else {
+          current = preRecovered;
         }
-        current = preRecovered;
       }
     }
 
@@ -811,11 +841,21 @@ export class VideoPlaybackRoute {
         return this.serveLocalTargetOr503(recovered, req);
       }
       if (recovered.kind === "progressive") {
-        return await this.ephemeralStore.serveProgressive(
+        const progRes = await this.ephemeralStore.serveProgressive(
           recovered.source,
           req,
           this.config.playback.streamStallTimeoutMs,
         );
+        if (
+          progRes.status !== 503 ||
+          req.signal.aborted ||
+          recovered.source.getStatus() !== "failed" ||
+          !recovered.fallbackRemote
+        ) {
+          return progRes;
+        }
+        current = recovered.fallbackRemote;
+        continue;
       }
       current = recovered;
     }
@@ -841,12 +881,14 @@ export class VideoPlaybackRoute {
     target: StreamTargetRemote,
     outboundRange: string | null,
   ): Promise<Response> {
-    const headers: Record<string, string> = {
-      ...target.httpHeaders,
-      "Accept-Encoding": "identity",
-    };
+    const headers = new Headers(target.httpHeaders);
+    // Strip any extractor-provided Range/If-Range (case-insensitive) so only our
+    // validated single outboundRange (or none for HEAD/If-Range) is forwarded.
+    headers.delete("range");
+    headers.delete("if-range");
+    headers.set("Accept-Encoding", "identity");
     if (outboundRange) {
-      headers["Range"] = outboundRange;
+      headers.set("Range", outboundRange);
     }
     return await this.fetchRaw(target.url, {
       method: req.method,
@@ -948,11 +990,11 @@ export class VideoPlaybackRoute {
     tier: number,
   ): Promise<Response> {
     const outboundRange = getEffectiveOutboundRange(req);
-    const headers: Record<string, string> = {
-      ...extraHeaders,
-      "Accept-Encoding": "identity",
-    };
-    if (outboundRange) headers["Range"] = outboundRange;
+    const headers = new Headers(extraHeaders);
+    headers.delete("range");
+    headers.delete("if-range");
+    headers.set("Accept-Encoding", "identity");
+    if (outboundRange) headers.set("Range", outboundRange);
 
     try {
       const upstream = await this.fetchRaw(upstreamUrl, {

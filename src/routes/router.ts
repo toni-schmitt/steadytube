@@ -2,6 +2,7 @@ import type { Logger } from "../logger.ts";
 import { noopLogger } from "../logger.ts";
 import type { EphemeralStore } from "../cache/ephemeral-store.ts";
 import type { VideoResolver } from "../media/video-resolver.ts";
+import { VALID_VIDEO_ID_RE } from "../media/ytdlp.ts";
 import type { BrowseRoutes } from "./browse.ts";
 import type { MediaProxyRoutes } from "./media-proxy.ts";
 import { handleStats } from "./stats.ts";
@@ -254,6 +255,9 @@ async function dispatch(
   if (commentsMatch) {
     const id = safeDecodeParam(commentsMatch[1]!);
     if (id === null) return Response.json({ error: "Malformed path parameter" }, { status: 400 });
+    if (!VALID_VIDEO_ID_RE.test(id)) {
+      return Response.json({ error: "Invalid video id" }, { status: 400 });
+    }
     return await deps.browseRoutes.handleComments(id, url, origin);
   }
 

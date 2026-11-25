@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import net from "node:net";
 import zlib from "node:zlib";
 import {
   clearIpv4DnsCache,
@@ -235,5 +236,23 @@ describe("ipv4-fetch", () => {
     const res205 = await ipv4Fetch(`${baseUrl}/reset-205`);
     expect(res205.status).toBe(205);
     expect(await res205.text()).toBe("");
+
+    // 7) Round 6 #14: HTTP 101 Switching Protocols upgrade rejects cleanly instead of hanging or throwing RangeError
+    const upgradeServer = net.createServer((socket) => {
+      socket.once("data", () => {
+        socket.write(
+          "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        );
+      });
+    });
+    await new Promise<void>((resolve) => upgradeServer.listen(0, "127.0.0.1", resolve));
+    try {
+      const addr = upgradeServer.address() as net.AddressInfo;
+      await expect(
+        ipv4Fetch(`http://127.0.0.1:${addr.port}/upgrade`, { timeoutMs: 2000 }),
+      ).rejects.toThrow(/101|upgrade/i);
+    } finally {
+      upgradeServer.close();
+    }
   });
 });

@@ -117,6 +117,15 @@ export class BrowseRoutes {
     private readonly logger: Logger = noopLogger,
   ) {}
 
+  private async tryAwaitRefresh<T>(refreshPromise: Promise<T> | undefined): Promise<T | null> {
+    if (!refreshPromise) return null;
+    try {
+      return await refreshPromise;
+    } catch {
+      return null;
+    }
+  }
+
   private async getOrInitSearchSession(
     sessionKey: string,
     forceRefresh: boolean,
@@ -124,8 +133,19 @@ export class BrowseRoutes {
   ): Promise<CachedSearchSession> {
     // Always join an active refresh first so overlapping page 1 + page 2 requests stay
     // on the same result generation rather than mixing stale and fresh sessions.
+    // If an optional refresh fails while a healthy warm session exists, non-refresh
+    // callers keep serving the warm session instead of failing with 500.
     const inflight = this.searchInitInflight.get(sessionKey);
-    if (inflight) return inflight;
+    if (inflight) {
+      if (!forceRefresh) {
+        const existing = this.searchSessions.get(sessionKey);
+        if (existing) {
+          const refreshed = await this.tryAwaitRefresh(inflight);
+          return refreshed ?? existing;
+        }
+      }
+      return inflight;
+    }
     if (!forceRefresh) {
       const existing = this.searchSessions.get(sessionKey);
       if (existing) return existing;
@@ -151,7 +171,16 @@ export class BrowseRoutes {
     initFn: () => Promise<CachedPlaylistSession>,
   ): Promise<CachedPlaylistSession> {
     const inflight = this.playlistInitInflight.get(playlistId);
-    if (inflight) return inflight;
+    if (inflight) {
+      if (!forceRefresh) {
+        const existing = this.playlistSessions.get(playlistId);
+        if (existing) {
+          const refreshed = await this.tryAwaitRefresh(inflight);
+          return refreshed ?? existing;
+        }
+      }
+      return inflight;
+    }
     if (!forceRefresh) {
       const existing = this.playlistSessions.get(playlistId);
       if (existing) return existing;
@@ -205,10 +234,13 @@ export class BrowseRoutes {
         while (session.pages.length < page) {
           const activeRefresh = this.searchInitInflight.get(sessionKey);
           if (activeRefresh && hops < MAX_GEN_HOPS) {
-            session = await activeRefresh;
-            hops++;
-            switchedGeneration = true;
-            break;
+            const refreshed = await this.tryAwaitRefresh(activeRefresh);
+            if (refreshed) {
+              session = refreshed;
+              hops++;
+              switchedGeneration = true;
+              break;
+            }
           }
           const currentCached = this.searchSessions.get(sessionKey);
           if (currentCached && currentCached !== session && hops < MAX_GEN_HOPS) {
@@ -222,9 +254,9 @@ export class BrowseRoutes {
               await session.inflightContinuation;
             } catch (contErr) {
               if (hops < MAX_GEN_HOPS) {
-                const newerRefresh = this.searchInitInflight.get(sessionKey);
-                if (newerRefresh) {
-                  session = await newerRefresh;
+                const refreshed = await this.tryAwaitRefresh(this.searchInitInflight.get(sessionKey));
+                if (refreshed) {
+                  session = refreshed;
                   hops++;
                   switchedGeneration = true;
                   break;
@@ -258,9 +290,9 @@ export class BrowseRoutes {
             await step;
           } catch (contErr) {
             if (hops < MAX_GEN_HOPS) {
-              const newerRefresh = this.searchInitInflight.get(sessionKey);
-              if (newerRefresh) {
-                session = await newerRefresh;
+              const refreshed = await this.tryAwaitRefresh(this.searchInitInflight.get(sessionKey));
+              if (refreshed) {
+                session = refreshed;
                 hops++;
                 switchedGeneration = true;
                 break;
@@ -282,13 +314,16 @@ export class BrowseRoutes {
         }
         if (switchedGeneration) continue;
         // Re-check after completing continuations in case page=1 started/installed a newer generation;
-        // only hop while hops < MAX_GEN_HOPS so every switched generation is filled before returning.
+        // if an optional refresh fails, keep serving our already-filled healthy warm session.
         if (hops < MAX_GEN_HOPS) {
           const trailingRefresh = this.searchInitInflight.get(sessionKey);
           if (trailingRefresh) {
-            session = await trailingRefresh;
-            hops++;
-            continue;
+            const refreshed = await this.tryAwaitRefresh(trailingRefresh);
+            if (refreshed) {
+              session = refreshed;
+              hops++;
+              continue;
+            }
           }
           const latestCached = this.searchSessions.get(sessionKey);
           if (latestCached && latestCached !== session) {
@@ -539,10 +574,13 @@ export class BrowseRoutes {
           while (session.pages.length < page) {
             const activeRefresh = this.searchInitInflight.get(sessionKey);
             if (activeRefresh && hops < MAX_GEN_HOPS) {
-              session = await activeRefresh;
-              hops++;
-              switchedGeneration = true;
-              break;
+              const refreshed = await this.tryAwaitRefresh(activeRefresh);
+              if (refreshed) {
+                session = refreshed;
+                hops++;
+                switchedGeneration = true;
+                break;
+              }
             }
             const currentCached = this.searchSessions.get(sessionKey);
             if (currentCached && currentCached !== session && hops < MAX_GEN_HOPS) {
@@ -556,9 +594,9 @@ export class BrowseRoutes {
                 await session.inflightContinuation;
               } catch (contErr) {
                 if (hops < MAX_GEN_HOPS) {
-                  const newerRefresh = this.searchInitInflight.get(sessionKey);
-                  if (newerRefresh) {
-                    session = await newerRefresh;
+                  const refreshed = await this.tryAwaitRefresh(this.searchInitInflight.get(sessionKey));
+                  if (refreshed) {
+                    session = refreshed;
                     hops++;
                     switchedGeneration = true;
                     break;
@@ -594,9 +632,9 @@ export class BrowseRoutes {
               await step;
             } catch (contErr) {
               if (hops < MAX_GEN_HOPS) {
-                const newerRefresh = this.searchInitInflight.get(sessionKey);
-                if (newerRefresh) {
-                  session = await newerRefresh;
+                const refreshed = await this.tryAwaitRefresh(this.searchInitInflight.get(sessionKey));
+                if (refreshed) {
+                  session = refreshed;
                   hops++;
                   switchedGeneration = true;
                   break;
@@ -620,9 +658,12 @@ export class BrowseRoutes {
           if (hops < MAX_GEN_HOPS) {
             const trailingRefresh = this.searchInitInflight.get(sessionKey);
             if (trailingRefresh) {
-              session = await trailingRefresh;
-              hops++;
-              continue;
+              const refreshed = await this.tryAwaitRefresh(trailingRefresh);
+              if (refreshed) {
+                session = refreshed;
+                hops++;
+                continue;
+              }
             }
             const latestCached = this.searchSessions.get(sessionKey);
             if (latestCached && latestCached !== session) {
@@ -818,10 +859,13 @@ export class BrowseRoutes {
         ) {
           const activeRefresh = this.playlistInitInflight.get(playlistId);
           if (activeRefresh && hops < MAX_GEN_HOPS) {
-            session = await activeRefresh;
-            hops++;
-            switchedGeneration = true;
-            break;
+            const refreshed = await this.tryAwaitRefresh(activeRefresh);
+            if (refreshed) {
+              session = refreshed;
+              hops++;
+              switchedGeneration = true;
+              break;
+            }
           }
           const currentCached = this.playlistSessions.get(playlistId);
           if (currentCached && currentCached !== session && hops < MAX_GEN_HOPS) {
@@ -835,9 +879,9 @@ export class BrowseRoutes {
               await session.inflightContinuation;
             } catch (contErr) {
               if (hops < MAX_GEN_HOPS) {
-                const newerRefresh = this.playlistInitInflight.get(playlistId);
-                if (newerRefresh) {
-                  session = await newerRefresh;
+                const refreshed = await this.tryAwaitRefresh(this.playlistInitInflight.get(playlistId));
+                if (refreshed) {
+                  session = refreshed;
                   hops++;
                   switchedGeneration = true;
                   break;
@@ -882,9 +926,9 @@ export class BrowseRoutes {
             await step;
           } catch (contErr) {
             if (hops < MAX_GEN_HOPS) {
-              const newerRefresh = this.playlistInitInflight.get(playlistId);
-              if (newerRefresh) {
-                session = await newerRefresh;
+              const refreshed = await this.tryAwaitRefresh(this.playlistInitInflight.get(playlistId));
+              if (refreshed) {
+                session = refreshed;
                 hops++;
                 switchedGeneration = true;
                 break;
@@ -908,9 +952,12 @@ export class BrowseRoutes {
         if (hops < MAX_GEN_HOPS) {
           const trailingRefresh = this.playlistInitInflight.get(playlistId);
           if (trailingRefresh) {
-            session = await trailingRefresh;
-            hops++;
-            continue;
+            const refreshed = await this.tryAwaitRefresh(trailingRefresh);
+            if (refreshed) {
+              session = refreshed;
+              hops++;
+              continue;
+            }
           }
           const latestCached = this.playlistSessions.get(playlistId);
           if (latestCached && latestCached !== session) {

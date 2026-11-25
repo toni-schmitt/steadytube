@@ -774,4 +774,89 @@ describe("EphemeralStore & HTTP Range parsing", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test("Round 6 #1/#3/#16: OS flock blocks lock theft, failed eviction/startup unlinks stay budgeted, and legacy audio WebM infers audio/webm", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-r6-store-"));
+    try {
+      // #1: While store1 holds OS flock, even deleting/forging .steadytube.lock with a dead PID
+      // MUST NOT allow store2 to steal exclusive ownership!
+      const lockDir = path.join(tmpDir, "lock-flock");
+      const store1 = new EphemeralStore(lockDir, 10_000, 60_000);
+      expect(store1.hasExclusiveLock()).toBe(true);
+      const lockPath = path.join(lockDir, ".steadytube.lock");
+      fs.writeFileSync(lockPath, JSON.stringify({ pid: 99999999, lockId: "forged-dead", ts: 1 }));
+      const store2 = new EphemeralStore(lockDir, 10_000, 60_000);
+      expect(store2.hasExclusiveLock()).toBe(false);
+      store2.close();
+      store1.close();
+      // Once store1 closes its flock FD, store3 acquires immediately
+      const store3 = new EphemeralStore(lockDir, 10_000, 60_000);
+      expect(store3.hasExclusiveLock()).toBe(true);
+      store3.close();
+
+      // #3a: reserveBytes() re-reads retired bytes AFTER cleanup() fails to unlink an unpinned entry
+      const evictDir = path.join(tmpDir, "evict-fail");
+      const storeEvict = new EphemeralStore(evictDir, 2000, 60_000);
+      const stuckPath = storeEvict.getPathFor("vidStuck", "137", "mp4");
+      fs.writeFileSync(stuckPath, new Uint8Array(1200).fill(7));
+      storeEvict.register("vidStuck", "137", stuckPath, "video/mp4");
+      const stuckParent = path.dirname(stuckPath);
+      fs.chmodSync(stuckParent, 0o555);
+      try {
+        // Need 1000 bytes (1200 + 1000 > 2000) -> triggers eviction inside reserveBytes() -> unlink fails!
+        // MUST return false instead of ignoring newly added failedUnlinkEntries!
+        expect(storeEvict.reserveBytes("vidOther:137", 1000)).toBe(false);
+        expect(storeEvict.getStats().totalBytes).toBe(1200);
+      } finally {
+        fs.chmodSync(stuckParent, 0o755);
+      }
+      storeEvict.cleanup();
+      expect(storeEvict.reserveBytes("vidOther:137", 1000)).toBe(true);
+      storeEvict.releaseReservation("vidOther:137");
+      storeEvict.close();
+
+      // #3b: Failed startup unlink of an expired file stays accounted in totalBytes & blocks over-budget reserveBytes
+      const startupDir = path.join(tmpDir, "startup-unlink-fail");
+      const expiredVidDir = path.join(startupDir, "vidExpired");
+      fs.mkdirSync(expiredVidDir, { recursive: true });
+      const expiredPath = path.join(expiredVidDir, "137.mp4");
+      fs.writeFileSync(expiredPath, new Uint8Array(1200).fill(4));
+      const oldTime = new Date(Date.now() - 3600_000);
+      fs.utimesSync(expiredPath, oldTime, oldTime);
+      fs.chmodSync(expiredVidDir, 0o555);
+      let storeStartup: EphemeralStore | null = null;
+      try {
+        storeStartup = new EphemeralStore(startupDir, 2000, 60_000);
+        expect(storeStartup.getStats().totalBytes).toBe(1200);
+        expect(storeStartup.reserveBytes("vidNew:137", 1000)).toBe(false);
+      } finally {
+        fs.chmodSync(expiredVidDir, 0o755);
+      }
+      const postClean = storeStartup!.cleanup();
+      expect(postClean.removedCount).toBe(1);
+      expect(postClean.freedBytes).toBe(1200);
+      expect(storeStartup!.getStats().totalBytes).toBe(0);
+      storeStartup!.close();
+
+      // #16: Legacy .webm files without sidecar mimeType infer audio/webm for audio itags / tier3-a-*
+      const mimeDir = path.join(tmpDir, "legacy-webm-mime");
+      const vDir = path.join(mimeDir, "vidLegacy");
+      fs.mkdirSync(vDir, { recursive: true });
+      const audio251 = path.join(vDir, "251.webm");
+      fs.writeFileSync(audio251, new Uint8Array(100));
+      fs.writeFileSync(`${audio251}.meta.json`, JSON.stringify({ formatId: "251" }));
+      const audioTier3 = path.join(vDir, "tier3-a-251.webm");
+      fs.writeFileSync(audioTier3, new Uint8Array(100));
+      const video248 = path.join(vDir, "248.webm");
+      fs.writeFileSync(video248, new Uint8Array(100));
+
+      const storeMime = new EphemeralStore(mimeDir, 50_000, 60_000);
+      expect(storeMime.get("vidLegacy", "251")?.mimeType).toBe("audio/webm");
+      expect(storeMime.get("vidLegacy", "tier3-a-251")?.mimeType).toBe("audio/webm");
+      expect(storeMime.get("vidLegacy", "248")?.mimeType).toBe("video/webm");
+      storeMime.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

@@ -480,41 +480,45 @@ function parseSampleEntryCodec(buf: Uint8Array, view: DataView, stsdBodyStart: n
       (entryStart + 52 < entry.end ? findChildBox(buf, view, entryStart + 52, entry.end, "esds") : null);
     if (esds && esds.bodyStart + 8 <= esds.end) {
       let pos = esds.bodyStart + 4; // skip FullBox version(1) + flags(3)
-      const limit = esds.end;
+      let limit = esds.end;
       if (pos < limit && buf[pos] === 0x03) {
         const esLen = readDescLen(pos + 1, limit);
-        if (esLen) {
-          pos = esLen.next;
-          if (pos + 3 <= limit) {
-            const flags = buf[pos + 2]!;
-            pos += 3; // ES_ID(2) + flags(1)
-            if (flags & 0x80) pos += 2;
-            if (flags & 0x40 && pos < limit) pos += 1 + buf[pos]!;
-            if (flags & 0x20) pos += 2;
-          }
+        if (!esLen || esLen.next + esLen.len > limit) return undefined;
+        pos = esLen.next;
+        limit = esLen.next + esLen.len;
+        if (pos + 3 > limit) return undefined;
+        const flags = buf[pos + 2]!;
+        pos += 3; // ES_ID(2) + flags(1)
+        if (flags & 0x80) pos += 2;
+        if (flags & 0x40) {
+          if (pos >= limit) return undefined;
+          pos += 1 + buf[pos]!;
         }
+        if (flags & 0x20) pos += 2;
+        if (pos > limit) return undefined;
       }
       if (pos < limit && buf[pos] === 0x04) {
         const dcLen = readDescLen(pos + 1, limit);
-        if (dcLen && dcLen.next + 13 <= limit) {
-          const objectTypeIndication = buf[dcLen.next]!;
-          pos = dcLen.next + 13;
-          if (objectTypeIndication === 0x40) {
-            if (pos < limit && buf[pos] === 0x05) {
-              const dsiLen = readDescLen(pos + 1, limit);
-              if (dsiLen && dsiLen.next < limit) {
-                let aot = (buf[dsiLen.next]! >> 3) & 0x1f;
-                if (aot === 31 && dsiLen.next + 1 < limit) {
-                  aot = 32 + (((buf[dsiLen.next]! & 0x07) << 3) | ((buf[dsiLen.next + 1]! >> 5) & 0x07));
-                }
-                if (aot > 0) return `mp4a.40.${aot}`;
-              }
+        if (!dcLen || dcLen.len < 13 || dcLen.next + dcLen.len > limit) return undefined;
+        const dcEnd = dcLen.next + dcLen.len;
+        const objectTypeIndication = buf[dcLen.next]!;
+        pos = dcLen.next + 13;
+        if (objectTypeIndication === 0x40) {
+          if (pos < dcEnd && buf[pos] === 0x05) {
+            const dsiLen = readDescLen(pos + 1, dcEnd);
+            if (!dsiLen || dsiLen.len < 1 || dsiLen.next + dsiLen.len > dcEnd) return undefined;
+            const dsiEnd = dsiLen.next + dsiLen.len;
+            let aot = (buf[dsiLen.next]! >> 3) & 0x1f;
+            if (aot === 31) {
+              if (dsiLen.next + 1 >= dsiEnd) return undefined;
+              aot = 32 + (((buf[dsiLen.next]! & 0x07) << 3) | ((buf[dsiLen.next + 1]! >> 5) & 0x07));
             }
-            return undefined;
+            if (aot > 0) return `mp4a.40.${aot}`;
           }
-          if (objectTypeIndication > 0) {
-            return `mp4a.${hex2(objectTypeIndication)}`;
-          }
+          return undefined;
+        }
+        if (objectTypeIndication > 0) {
+          return `mp4a.${hex2(objectTypeIndication)}`;
         }
       }
     }
@@ -1022,6 +1026,29 @@ function parseStrictPartialContentRange(
   return { start, end, total };
 }
 
+function buildProbeHeaders(
+  extraHeaders: Record<string, string> | undefined,
+  rangeValue: string,
+): Record<string, string> {
+  const deduped = new Map<string, [string, string]>();
+  if (extraHeaders) {
+    for (const [key, value] of Object.entries(extraHeaders)) {
+      const lower = key.toLowerCase();
+      if (lower === "range" || lower === "if-range" || lower === "accept-encoding") {
+        continue;
+      }
+      deduped.set(lower, [key, value]);
+    }
+  }
+  const out: Record<string, string> = {};
+  for (const [key, value] of deduped.values()) {
+    out[key] = value;
+  }
+  out["Range"] = rangeValue;
+  out["Accept-Encoding"] = "identity";
+  return out;
+}
+
 /**
  * Probe DASH init/index byte ranges from an upstream HTTP(S) URL over IPv4
  * using a strictly bounded byte-range GET (bytes=0-16383).
@@ -1033,15 +1060,11 @@ export async function probeRemoteDashRanges(
   extraHeaders?: Record<string, string>,
 ): Promise<DashByteRanges | null> {
   const MAX_HEADER_PROBE = 16384;
-  const headers: Record<string, string> = {
-    ...(extraHeaders || {}),
-    Range: `bytes=0-${MAX_HEADER_PROBE - 1}`,
-    "Accept-Encoding": "identity",
-  };
+  const probeHeaders = buildProbeHeaders(extraHeaders, `bytes=0-${MAX_HEADER_PROBE - 1}`);
 
   const res = await fetchFn(url, {
     method: "GET",
-    headers,
+    headers: probeHeaders,
     timeoutMs: 8_000,
     signal: AbortSignal.timeout(8_000),
     httpsOnly: true,
@@ -1055,11 +1078,15 @@ export async function probeRemoteDashRanges(
     return null;
   }
   let validPrefixEnd: number | null = null;
+  let knownTotal: number | null = null;
   if (res.status === 206) {
     const cr = parseStrictPartialContentRange(res.headers.get("content-range"));
-    if (!cr || cr.start !== 0) {
+    if (!cr || cr.start !== 0 || cr.end > MAX_HEADER_PROBE - 1) {
       await res.body?.cancel().catch(() => {});
       return null;
+    }
+    if (cr.total !== null) {
+      knownTotal = cr.total;
     }
     const cl = res.headers.get("content-length");
     const expectedLen = cr.end - cr.start + 1;
@@ -1068,36 +1095,49 @@ export async function probeRemoteDashRanges(
       return null;
     }
     validPrefixEnd = cr.end;
+  } else {
+    const cl = res.headers.get("content-length");
+    if (cl !== null && /^\d+$/.test(cl.trim())) {
+      knownTotal = Number(cl.trim());
+    }
   }
 
-  const buf = await readBoundedBytes(res, MAX_HEADER_PROBE);
+  const buf = await readBoundedBytes(res, MAX_HEADER_PROBE + 1);
   if (buf.byteLength < 16) return null;
-  if (validPrefixEnd !== null && buf.byteLength !== Math.min(MAX_HEADER_PROBE, validPrefixEnd + 1)) {
+  if (validPrefixEnd !== null && buf.byteLength !== validPrefixEnd + 1) {
     return null;
   }
+  if (res.status === 200 && knownTotal === null && buf.byteLength <= MAX_HEADER_PROBE) {
+    knownTotal = buf.byteLength;
+  }
+  const prefixBuf = buf.byteLength > MAX_HEADER_PROBE ? buf.subarray(0, MAX_HEADER_PROBE) : buf;
 
-  const attachHashes = (ranges: DashByteRanges | null): DashByteRanges | null => {
+  const attachHashes = (ranges: DashByteRanges | null, totalBound: number | null = knownTotal): DashByteRanges | null => {
     if (!ranges) return null;
-    if (ranges.initEnd < buf.byteLength) {
-      ranges.initHash = sha256Hex(buf.subarray(ranges.initStart, ranges.initEnd + 1));
+    if (totalBound !== null && (ranges.initEnd >= totalBound || ranges.indexEnd >= totalBound)) {
+      return null;
     }
-    if (ranges.indexEnd < buf.byteLength) {
-      ranges.indexHash = sha256Hex(buf.subarray(ranges.indexStart, ranges.indexEnd + 1));
+    if (ranges.initEnd < prefixBuf.byteLength) {
+      ranges.initHash = sha256Hex(prefixBuf.subarray(ranges.initStart, ranges.initEnd + 1));
+    }
+    if (ranges.indexEnd < prefixBuf.byteLength) {
+      ranges.indexHash = sha256Hex(prefixBuf.subarray(ranges.indexStart, ranges.indexEnd + 1));
     }
     return ranges;
   };
 
   if (mimeType.includes("webm")) {
-    const parsed = parseWebmDashRanges(buf);
+    const parsed = parseWebmDashRanges(prefixBuf);
     if (parsed.ranges) return attachHashes(parsed.ranges);
     if (parsed.cuesOffset !== undefined && parsed.initEnd !== undefined) {
+      if (knownTotal !== null && parsed.cuesOffset >= knownTotal) {
+        return null;
+      }
+      const cuesMaxEnd = parsed.cuesOffset + 31;
+      const cuesHeaders = buildProbeHeaders(extraHeaders, `bytes=${parsed.cuesOffset}-${cuesMaxEnd}`);
       const cuesRes = await fetchFn(url, {
         method: "GET",
-        headers: {
-          ...(extraHeaders || {}),
-          Range: `bytes=${parsed.cuesOffset}-${parsed.cuesOffset + 31}`,
-          "Accept-Encoding": "identity",
-        },
+        headers: cuesHeaders,
         timeoutMs: 8_000,
         signal: AbortSignal.timeout(8_000),
         httpsOnly: true,
@@ -1109,10 +1149,18 @@ export async function probeRemoteDashRanges(
         const rawCl = cuesRes.headers.get("content-length");
         const expectedLen = cr ? cr.end - cr.start + 1 : 0;
         const clOk = rawCl === null || (/^\d+$/.test(rawCl.trim()) && Number(rawCl.trim()) === expectedLen);
-        if (cr && cr.start === parsed.cuesOffset && clOk) {
-          const hdrBuf = await readBoundedBytes(cuesRes, 32);
-          if (hdrBuf.byteLength === Math.min(32, expectedLen)) {
-            return attachHashes(parseCuesElementHeaderAt(hdrBuf, parsed.cuesOffset, parsed.initEnd));
+        const totalOk =
+          !cr ||
+          cr.total === null ||
+          knownTotal === null ||
+          cr.total === knownTotal;
+        if (cr && cr.start === parsed.cuesOffset && cr.end <= cuesMaxEnd && totalOk && clOk) {
+          const hdrBuf = await readBoundedBytes(cuesRes, 33);
+          if (hdrBuf.byteLength === expectedLen) {
+            return attachHashes(
+              parseCuesElementHeaderAt(hdrBuf, parsed.cuesOffset, parsed.initEnd),
+              cr.total ?? knownTotal,
+            );
           }
           return null;
         }
@@ -1122,7 +1170,7 @@ export async function probeRemoteDashRanges(
     return null;
   }
 
-  return attachHashes(parseMp4DashRanges(buf));
+  return attachHashes(parseMp4DashRanges(prefixBuf));
 }
 
 /**
@@ -1145,13 +1193,10 @@ export async function verifyRemoteDashRangeDigests(
   const fetchExactRangeHash = async (start: number, end: number): Promise<string | null> => {
     const len = end - start + 1;
     if (len <= 0 || len > MAX_DASH_HEADER_PROBE_BYTES) return null;
+    const digestHeaders = buildProbeHeaders(extraHeaders, `bytes=${start}-${end}`);
     const res = await fetchFn(url, {
       method: "GET",
-      headers: {
-        ...(extraHeaders || {}),
-        Range: `bytes=${start}-${end}`,
-        "Accept-Encoding": "identity",
-      },
+      headers: digestHeaders,
       timeoutMs: 8_000,
       signal: AbortSignal.timeout(8_000),
       httpsOnly: true,

@@ -355,10 +355,31 @@ async function doSingleIpv4Request(
       }
     });
 
+    req.on("upgrade", (_res, socket) => {
+      clearTimeout(headerTimer);
+      options.signal?.removeEventListener("abort", onAbort);
+      socket.destroy();
+      req.destroy();
+      if (!settled) {
+        settled = true;
+        reject(new Error("HTTP 101 protocol upgrade is not supported by ipv4Fetch"));
+      }
+    });
+
     req.on("response", (res) => {
       clearTimeout(headerTimer);
 
       const status = res.statusCode ?? 500;
+      if (status < 200) {
+        options.signal?.removeEventListener("abort", onAbort);
+        res.destroy();
+        req.destroy();
+        if (!settled) {
+          settled = true;
+          reject(new Error(`Unsupported informational HTTP status ${status} in ipv4Fetch`));
+        }
+        return;
+      }
       const statusText = res.statusMessage ?? "";
       const resHeaders = new Headers();
       for (const [k, v] of Object.entries(res.headers)) {
@@ -372,7 +393,7 @@ async function doSingleIpv4Request(
 
       const location = resHeaders.get("location");
 
-      if (method === "HEAD" || status === 101 || status === 204 || status === 205 || status === 304) {
+      if (method === "HEAD" || status === 204 || status === 205 || status === 304) {
         res.resume();
         options.signal?.removeEventListener("abort", onAbort);
         settled = true;
