@@ -1,7 +1,7 @@
 import type { EphemeralStore } from "../cache/ephemeral-store.ts";
 import type { VideoResolver } from "../media/video-resolver.ts";
 
-export const APP_VERSION = "0.2.0";
+export const APP_VERSION = "0.2.1";
 
 export function handleStats(
   resolver: VideoResolver,
