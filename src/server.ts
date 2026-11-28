@@ -60,7 +60,10 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
     fetchFn,
     fetchRawFn,
     logger,
-    overrides.mediaProxyOptions,
+    {
+      canPersistFeedFamilies: () => ephemeralStore.hasExclusiveLock(),
+      ...overrides.mediaProxyOptions,
+    },
   );
   const videoRoutes = new VideoRoutes(resolver, fetchFn, logger);
   const playbackRoute = new VideoPlaybackRoute(config, resolver, ephemeralStore, fetchRawFn, logger);

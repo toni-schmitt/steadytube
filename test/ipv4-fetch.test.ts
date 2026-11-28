@@ -1,4 +1,6 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import dns from "node:dns/promises";
+import http from "node:http";
 import net from "node:net";
 import zlib from "node:zlib";
 import {
@@ -112,10 +114,118 @@ describe("ipv4-fetch", () => {
     await expect(resolveIpv4("2001:4860:4860::8888")).rejects.toThrow(/IPv6/);
   });
 
-  test("freshConnection option completes HTTP and gzip requests without keep-alive reuse", async () => {
-    const res = await ipv4Fetch(`${baseUrl}/gzip`, { freshConnection: true, alternateIpv4: true });
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe("hello-ipv4-gzip");
+  test("freshConnection opens a new TCP socket per request and completes gzip requests", async () => {
+    const portServer = http.createServer((req, res) => {
+      if (req.url === "/port") {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end(String(req.socket.remotePort ?? 0));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((resolve) => portServer.listen(0, "127.0.0.1", resolve));
+    try {
+      const { port } = portServer.address() as net.AddressInfo;
+      const clientPorts: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const portRes = await ipv4Fetch(`http://127.0.0.1:${port}/port`, { freshConnection: true });
+        expect(portRes.status).toBe(200);
+        clientPorts.push(await portRes.text());
+      }
+      expect(new Set(clientPorts).size).toBe(3);
+
+      const gzRes = await ipv4Fetch(`${baseUrl}/gzip`, { freshConnection: true, alternateIpv4: true });
+      expect(gzRes.status).toBe(200);
+      expect(await gzRes.text()).toBe("hello-ipv4-gzip");
+    } finally {
+      portServer.close();
+    }
+  });
+
+  test("resolveIpv4 selects alternate A records, rotates on primary failure/timeout, and does not rotate on alternate or non-timeout abort", async () => {
+    const hangServer = http.createServer((_req, _res) => {
+      // Intentionally never respond so timeout/abort paths are exercised deterministically.
+    });
+    await new Promise<void>((resolve) => hangServer.listen(0, "127.0.0.1", resolve));
+
+    const closedProbe = net.createServer();
+    await new Promise<void>((resolve) => closedProbe.listen(0, "127.0.0.1", resolve));
+    const closedPort = (closedProbe.address() as net.AddressInfo).port;
+    await new Promise<void>((resolve) => closedProbe.close(() => resolve()));
+
+    const hangPort = (hangServer.address() as net.AddressInfo).port;
+    const records = new Map<string, string[]>([
+      ["dual-ok.example", ["93.184.216.34", "93.184.216.35"]],
+      ["dual-private-alt.example", ["93.184.216.34", "127.0.0.1"]],
+      ["dual-refused.example", ["127.0.0.1", "93.184.216.35"]],
+      ["dual-timeout.example", ["127.0.0.1", "93.184.216.35"]],
+      ["dual-abort.example", ["127.0.0.1", "93.184.216.35"]],
+      ["triple-alt.example", ["93.184.216.34", "127.0.0.1", "93.184.216.36"]],
+    ]);
+    const resolveSpy = spyOn(dns, "resolve4").mockImplementation((async (hostname: string) => {
+      const ips = records.get(hostname);
+      if (!ips) throw new Error(`Unexpected DNS lookup for ${hostname}`);
+      return [...ips];
+    }) as typeof dns.resolve4);
+
+    try {
+      clearIpv4DnsCache();
+
+      // 1) Multi-record alternate selection + publicIpv4Only enforcement on alternate
+      expect(await resolveIpv4("dual-ok.example", { publicIpv4Only: true })).toBe("93.184.216.34");
+      expect(await resolveIpv4("dual-ok.example", { publicIpv4Only: true, alternate: true })).toBe("93.184.216.35");
+      expect(await resolveIpv4("dual-private-alt.example", { publicIpv4Only: true })).toBe("93.184.216.34");
+      await expect(
+        resolveIpv4("dual-private-alt.example", { publicIpv4Only: true, alternate: true }),
+      ).rejects.toThrow(/private\/reserved IPv4/);
+
+      // 2) Primary socket error rotates sticky IP A -> B so non-alternate retry dials B (not A)
+      await expect(
+        ipv4Fetch(`http://dual-refused.example:${closedPort}/`, { timeoutMs: 2000 }),
+      ).rejects.toThrow();
+      expect(await resolveIpv4("dual-refused.example")).toBe("93.184.216.35");
+
+      // 3) Primary TimeoutError abort rotates sticky IP A -> B
+      await expect(
+        ipv4Fetch(`http://dual-timeout.example:${hangPort}/`, {
+          timeoutMs: 2000,
+          signal: AbortSignal.timeout(40),
+        }),
+      ).rejects.toThrow();
+      expect(await resolveIpv4("dual-timeout.example")).toBe("93.184.216.35");
+
+      // 4) Non-timeout AbortError does NOT rotate sticky IP
+      const abortCtrl = new AbortController();
+      const abortTimer = setTimeout(() => abortCtrl.abort(new DOMException("Canceled", "AbortError")), 30);
+      try {
+        await expect(
+          ipv4Fetch(`http://dual-abort.example:${hangPort}/`, {
+            timeoutMs: 2000,
+            signal: abortCtrl.signal,
+          }),
+        ).rejects.toThrow();
+      } finally {
+        clearTimeout(abortTimer);
+      }
+      expect(await resolveIpv4("dual-abort.example")).toBe("127.0.0.1");
+
+      // 5) Alternate-IP timeout does NOT rotate the sticky IP (prevents double rotation)
+      expect(await resolveIpv4("triple-alt.example")).toBe("93.184.216.34");
+      await expect(
+        ipv4Fetch(`http://triple-alt.example:${hangPort}/`, {
+          timeoutMs: 2000,
+          alternateIpv4: true,
+          signal: AbortSignal.timeout(40),
+        }),
+      ).rejects.toThrow();
+      expect(await resolveIpv4("triple-alt.example")).toBe("93.184.216.34");
+    } finally {
+      resolveSpy.mockRestore();
+      clearIpv4DnsCache();
+      hangServer.closeAllConnections();
+      hangServer.close();
+    }
   });
 
   test("follows redirects over IPv4 and preserves Host header", async () => {

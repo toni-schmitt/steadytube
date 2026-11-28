@@ -318,7 +318,7 @@ async function doSingleIpv4Request(
     let onBodyAbort: (() => void) | null = null;
 
     const onAbort = () => {
-      if (isTimeoutSignal(options.signal)) {
+      if (!options.alternateIpv4 && isTimeoutSignal(options.signal)) {
         rotateIpv4OnError(url.hostname, ipv4);
       }
       if (onBodyAbort) {
@@ -362,7 +362,9 @@ async function doSingleIpv4Request(
       const timeoutErr = new Error(
         `IPv4 request timed out after ${options.timeoutMs}ms: ${url.host}${url.pathname}`,
       );
-      rotateIpv4OnError(url.hostname, ipv4);
+      if (!options.alternateIpv4) {
+        rotateIpv4OnError(url.hostname, ipv4);
+      }
       req.destroy(timeoutErr);
       if (!settled) {
         settled = true;
@@ -373,7 +375,7 @@ async function doSingleIpv4Request(
     req.on("error", (err) => {
       clearTimeout(headerTimer);
       options.signal?.removeEventListener("abort", onAbort);
-      if (!options.signal?.aborted || isTimeoutSignal(options.signal)) {
+      if (!options.alternateIpv4 && (!options.signal?.aborted || isTimeoutSignal(options.signal))) {
         rotateIpv4OnError(url.hostname, ipv4);
       }
       if (!settled) {
@@ -564,6 +566,9 @@ async function doSingleIpv4Request(
 
           res.on("aborted", () => {
             cleanup();
+            if (!options.alternateIpv4 && !options.signal?.aborted) {
+              rotateIpv4OnError(url.hostname, ipv4);
+            }
             if (sourceStream !== res) sourceStream.destroy();
             if (!closed) {
               closed = true;
@@ -582,6 +587,9 @@ async function doSingleIpv4Request(
           res.on("close", () => {
             if (!closed && !res.complete) {
               cleanup();
+              if (!options.alternateIpv4 && !options.signal?.aborted) {
+                rotateIpv4OnError(url.hostname, ipv4);
+              }
               if (sourceStream !== res) sourceStream.destroy();
               closed = true;
               try {
