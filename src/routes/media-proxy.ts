@@ -374,6 +374,7 @@ export class MediaProxyRoutes {
 
             // Up to 2 attempts for transient network/5xx errors during 200-feed bursts
             for (let attempt = 0; attempt < 2; attempt++) {
+              const attemptStartedAt = Date.now();
               if (sharedSignal.aborted) {
                 throw getAbortError(sharedSignal);
               }
@@ -404,6 +405,12 @@ export class MediaProxyRoutes {
                 }
                 if (res.status >= 500 && attempt === 0) {
                   await res.body?.cancel().catch(() => {});
+                  this.logger.debug("RSS feed upstream attempt failed; retrying", {
+                    kind,
+                    id,
+                    status: res.status,
+                    elapsedMs: Date.now() - attemptStartedAt,
+                  });
                   await sleepWithAbort(250, sharedSignal);
                   continue;
                 }
@@ -414,6 +421,12 @@ export class MediaProxyRoutes {
               } catch (err) {
                 if (sharedSignal.aborted) throw err;
                 if (attempt === 0) {
+                  this.logger.debug("RSS feed upstream attempt failed; retrying", {
+                    kind,
+                    id,
+                    error: err instanceof Error ? err.message : String(err),
+                    elapsedMs: Date.now() - attemptStartedAt,
+                  });
                   await sleepWithAbort(250, sharedSignal);
                   continue;
                 }
