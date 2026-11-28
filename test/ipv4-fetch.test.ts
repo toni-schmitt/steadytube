@@ -108,7 +108,14 @@ describe("ipv4-fetch", () => {
   test("resolveIpv4 accepts IPv4 & localhost and rejects IPv6 literals", async () => {
     expect(await resolveIpv4("127.0.0.1")).toBe("127.0.0.1");
     expect(await resolveIpv4("localhost")).toBe("127.0.0.1");
+    expect(await resolveIpv4("localhost", { alternate: true })).toBe("127.0.0.1");
     await expect(resolveIpv4("2001:4860:4860::8888")).rejects.toThrow(/IPv6/);
+  });
+
+  test("freshConnection option completes HTTP and gzip requests without keep-alive reuse", async () => {
+    const res = await ipv4Fetch(`${baseUrl}/gzip`, { freshConnection: true, alternateIpv4: true });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("hello-ipv4-gzip");
   });
 
   test("follows redirects over IPv4 and preserves Host header", async () => {

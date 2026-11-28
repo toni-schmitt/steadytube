@@ -380,6 +380,229 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
     }
   });
 
+  test("RSS feed hedges slow/stalled attempts on a fresh connection + alternate IPv4 and aborts the loser", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-rss-hedge-"));
+    try {
+      const calls: Array<{
+        id: string;
+        freshConnection?: boolean;
+        alternateIpv4?: boolean;
+        signal?: AbortSignal | null;
+      }> = [];
+      let callCountById = new Map<string, number>();
+
+      const mockFetch = async (input: string | URL | Request, init?: any) => {
+        const id = new URL(input.toString()).searchParams.get("playlist_id")!;
+        const n = (callCountById.get(id) ?? 0) + 1;
+        callCountById.set(id, n);
+        calls.push({
+          id,
+          freshConnection: init?.freshConnection,
+          alternateIpv4: init?.alternateIpv4,
+          signal: init?.signal,
+        });
+
+        if (id === "UULF_STALLED01") {
+          if (n === 1) {
+            // Simulate a silently hung upstream socket that only exits on abort
+            await new Promise<void>((_, reject) => {
+              init?.signal?.addEventListener(
+                "abort",
+                () => reject(new DOMException("Aborted", "AbortError")),
+                { once: true },
+              );
+            });
+          }
+          return new Response("<feed>hedged-ok</feed>", { status: 200 });
+        }
+
+        if (id === "UULF_SLOWOK001") {
+          if (n === 1) {
+            await new Promise((r) => setTimeout(r, 70));
+            return new Response("<feed>primary-ok</feed>", { status: 200 });
+          }
+          // Hedge hangs -> must be aborted once primary wins
+          await new Promise<void>((_, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("Aborted", "AbortError")),
+              { once: true },
+            );
+          });
+        }
+
+        if (id === "UULF_FAST50301") {
+          if (n === 1) return new Response("Service Unavailable", { status: 503 });
+          return new Response("<feed>retried-ok</feed>", { status: 200 });
+        }
+
+        if (id === "UULF_ABORT0001") {
+          await new Promise<void>((_, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("Aborted", "AbortError")),
+              { once: true },
+            );
+          });
+        }
+
+        return new Response("<feed/>", { status: 200 });
+      };
+
+      const cfg = makeTestConfig(tmpDir, false);
+      // Concurrency 1 proves hedging runs under the same semaphore permit and cannot deadlock.
+      cfg.rss.maxConcurrentUpstream = 1;
+      const app = createApp(cfg, {
+        logger: noopLogger,
+        fetchFn: mockFetch,
+        fetchRawFn: mockFetch,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo() { throw new Error("unused"); },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+        mediaProxyOptions: {
+          feedHedgeDelayMs: 35,
+          feedAttemptTimeoutMs: 5_000,
+          feedRetryBackoffMs: 10,
+          persistFeedFamilies: false,
+        },
+      });
+
+      // 1) Stalled primary is rescued by hedge on freshConnection + alternateIpv4, and stalled primary is aborted
+      const t0 = Date.now();
+      const stalledRes = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_STALLED01"));
+      expect(stalledRes.status).toBe(200);
+      expect(await stalledRes.text()).toBe("<feed>hedged-ok</feed>");
+      expect(Date.now() - t0).toBeLessThan(1500);
+      const stalledCalls = calls.filter((c) => c.id === "UULF_STALLED01");
+      expect(stalledCalls.length).toBe(2);
+      expect(stalledCalls[0]!.freshConnection).toBe(false);
+      expect(stalledCalls[0]!.alternateIpv4).toBe(false);
+      expect(stalledCalls[0]!.signal?.aborted).toBe(true);
+      expect(stalledCalls[1]!.freshConnection).toBe(true);
+      expect(stalledCalls[1]!.alternateIpv4).toBe(true);
+
+      // 2) Legitimately slow primary still wins after hedge fires, and hedge is aborted cleanly
+      const slowRes = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_SLOWOK001"));
+      expect(slowRes.status).toBe(200);
+      expect(await slowRes.text()).toBe("<feed>primary-ok</feed>");
+      const slowCalls = calls.filter((c) => c.id === "UULF_SLOWOK001");
+      expect(slowCalls.length).toBe(2);
+      expect(slowCalls[1]!.signal?.aborted).toBe(true);
+
+      // 3) Fast 503 retries on freshConnection + alternateIpv4
+      const fast503Res = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_FAST50301"));
+      expect(fast503Res.status).toBe(200);
+      expect(await fast503Res.text()).toBe("<feed>retried-ok</feed>");
+      const fast503Calls = calls.filter((c) => c.id === "UULF_FAST50301");
+      expect(fast503Calls.length).toBe(2);
+      expect(fast503Calls[1]!.freshConnection).toBe(true);
+      expect(fast503Calls[1]!.alternateIpv4).toBe(true);
+
+      // 4) Client abort before hedge delay cancels primary and never fires hedge
+      const abortCtrl = new AbortController();
+      const abortReq = app.fetch(
+        new Request("http://127.0.0.1:8787/feed/playlist/UULF_ABORT0001", { signal: abortCtrl.signal }),
+      );
+      await new Promise((r) => setTimeout(r, 10));
+      abortCtrl.abort();
+      expect((await abortReq).status).toBe(499);
+      await new Promise((r) => setTimeout(r, 50));
+      const abortCalls = calls.filter((c) => c.id === "UULF_ABORT0001");
+      expect(abortCalls.length).toBe(1);
+      expect(abortCalls[0]!.signal?.aborted).toBe(true);
+
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("RSS prefetch prioritizes known-slow feeds first and persists feed families across restarts", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-rss-persist-"));
+    let now = Date.now();
+    try {
+      const ids = [
+        "UULFaaaaaaaaaa",
+        "UULFbbbbbbbbbb",
+        "UULFcccccccccc",
+        "UULFdddddddddd",
+        "UULFslowfeed99",
+      ];
+      const upstream: string[] = [];
+      let simulateSlow = true;
+
+      const makeMockFetch = () => async (input: string | URL | Request) => {
+        const id = new URL(input.toString()).searchParams.get("playlist_id")!;
+        upstream.push(id);
+        if (simulateSlow && id === "UULFslowfeed99") {
+          // Advance fake clock inside fetch so the feed records a 3.2 s upstream duration immediately.
+          now += 3200;
+          setSystemTime(new Date(now));
+        } else {
+          now += 20;
+          setSystemTime(new Date(now));
+        }
+        return new Response("<feed/>", { status: 200 });
+      };
+
+      const makeApp = () => {
+        const cfg = makeTestConfig(tmpDir, false);
+        cfg.rss.maxConcurrentUpstream = 4; // maxPromotedSlow = 1
+        return createApp(cfg, {
+          logger: noopLogger,
+          fetchFn: makeMockFetch(),
+          fetchRawFn: makeMockFetch(),
+          innertube: makeMockInnertube(),
+          ytDlp: {
+            async isBgutilAvailable() { return false; },
+            async extractVideoInfo() { throw new Error("unused"); },
+            async downloadFormat() { throw new Error("unused"); },
+          },
+        });
+      };
+
+      // First run: learn all 5 feeds (with UULFslowfeed99 last and slow), then stop to persist to cacheDir.
+      setSystemTime(new Date(now));
+      const app1 = makeApp();
+      for (const id of ids) {
+        expect((await app1.fetch(new Request(`http://127.0.0.1:8787/feed/playlist/${id}`))).status).toBe(200);
+      }
+      expect(upstream).toEqual(ids);
+      app1.stop();
+      expect(fs.existsSync(path.join(tmpDir, "rss-families.json"))).toBe(true);
+
+      // Second run (simulated daemon restart): EphemeralStore ignores rss-families.json,
+      // and the VERY FIRST refresh immediately prefetches UULFslowfeed99 FIRST, followed by b, c, d in order!
+      simulateSlow = false;
+      upstream.length = 0;
+      now += 10 * 60_000;
+      setSystemTime(new Date(now));
+      const app2 = makeApp();
+      expect(app2.ephemeralStore.getStats().fileCount).toBe(0);
+
+      expect((await app2.fetch(new Request(`http://127.0.0.1:8787/feed/playlist/${ids[0]}`))).status).toBe(200);
+      // Wait briefly for prefetch workers to dispatch all remembered feeds
+      for (let i = 0; i < 20 && upstream.length < ids.length; i++) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      expect(upstream).toEqual([
+        "UULFaaaaaaaaaa", // Triggering request started first
+        "UULFslowfeed99", // Known-slow feed promoted to front of prefetch queue
+        "UULFbbbbbbbbbb",
+        "UULFcccccccccc",
+        "UULFdddddddddd",
+      ]);
+
+      app2.stop();
+    } finally {
+      setSystemTime();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   test("silently escalates Tier 1 -> Tier 2 on immediate bot-check and serves DASH + Range 206", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-tier2-"));
     try {
