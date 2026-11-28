@@ -380,6 +380,595 @@ describe("Router, 3-Tier Escalation, and Media Proxies", () => {
     }
   });
 
+  test("RSS feed hedges slow/stalled attempts on a fresh connection + alternate IPv4 and aborts the loser", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-rss-hedge-"));
+    try {
+      const calls: Array<{
+        id: string;
+        freshConnection?: boolean;
+        alternateIpv4?: boolean;
+        signal?: AbortSignal | null;
+      }> = [];
+      const callCountById = new Map<string, number>();
+      let activeUpstream = 0;
+      let peakActiveUpstream = 0;
+
+      const waitAbort = (signal?: AbortSignal | null) =>
+        new Promise<never>((_, reject) => {
+          if (signal?.aborted) {
+            reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => reject(signal.reason ?? new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+
+      const mockFetch = async (input: string | URL | Request, init?: any) => {
+        const id = new URL(input.toString()).searchParams.get("playlist_id")!;
+        const n = (callCountById.get(id) ?? 0) + 1;
+        callCountById.set(id, n);
+        calls.push({
+          id,
+          freshConnection: init?.freshConnection,
+          alternateIpv4: init?.alternateIpv4,
+          signal: init?.signal,
+        });
+        activeUpstream++;
+        peakActiveUpstream = Math.max(peakActiveUpstream, activeUpstream);
+        try {
+          if (id === "UULF_STALLED01") {
+            if (n === 1) await waitAbort(init?.signal);
+            return new Response("<feed>hedged-ok</feed>", { status: 200 });
+          }
+
+          if (id === "UULF_SLOWOK001") {
+            if (n === 1) {
+              await new Promise((r) => setTimeout(r, 70));
+              return new Response("<feed>primary-ok</feed>", { status: 200 });
+            }
+            await waitAbort(init?.signal);
+          }
+
+          if (id === "UULF_FAST50301") {
+            if (n === 1) return new Response("Service Unavailable", { status: 503 });
+            return new Response("<feed>retried-ok</feed>", { status: 200 });
+          }
+
+          if (id === "UULF_SOCKETERR") {
+            if (n === 1) throw new Error("ECONNREFUSED");
+            return new Response("<feed>socket-retried-ok</feed>", { status: 200 });
+          }
+
+          if (id === "UULF_BOTH50301") {
+            await new Promise((r) => setTimeout(r, 60));
+            return new Response("maintenance window", { status: 503 });
+          }
+
+          if (id === "UULF_RACE42901") {
+            if (n === 1) {
+              await new Promise((r) => setTimeout(r, 80));
+              if (init?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+              return new Response("<feed>primary-beat-429</feed>", { status: 200 });
+            }
+            return new Response("Too Many Requests", { status: 429 });
+          }
+
+          if (id === "UULF_RACE40401") {
+            if (n === 1) {
+              await new Promise((r) => setTimeout(r, 80));
+              if (init?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+              return new Response("<feed>primary-beat-404</feed>", { status: 200 });
+            }
+            return new Response("Not Found", { status: 404 });
+          }
+
+          if (id === "UULF_ABORT0001") {
+            await waitAbort(init?.signal);
+          }
+
+          return new Response("<feed>follow-up-ok</feed>", { status: 200 });
+        } finally {
+          activeUpstream--;
+        }
+      };
+
+      const cfg = makeTestConfig(tmpDir, false);
+      // Concurrency 2 gives 1 primary permit + 1 spare permit for hedging without exceeding the cap.
+      cfg.rss.maxConcurrentUpstream = 2;
+      const app = createApp(cfg, {
+        logger: noopLogger,
+        fetchFn: mockFetch,
+        fetchRawFn: mockFetch,
+        innertube: makeMockInnertube(),
+        ytDlp: {
+          async isBgutilAvailable() { return false; },
+          async extractVideoInfo() { throw new Error("unused"); },
+          async downloadFormat() { throw new Error("unused"); },
+        },
+        mediaProxyOptions: {
+          feedHedgeDelayMs: 35,
+          feedAttemptTimeoutMs: 5_000,
+          feedRetryBackoffMs: 10,
+          persistFeedFamilies: false,
+        },
+      });
+
+      // 1) Stalled primary is rescued by hedge on freshConnection + alternateIpv4, and stalled primary is aborted
+      const t0 = Date.now();
+      const stalledRes = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_STALLED01"));
+      expect(stalledRes.status).toBe(200);
+      expect(await stalledRes.text()).toBe("<feed>hedged-ok</feed>");
+      expect(Date.now() - t0).toBeLessThan(1500);
+      const stalledCalls = calls.filter((c) => c.id === "UULF_STALLED01");
+      expect(stalledCalls.length).toBe(2);
+      expect(stalledCalls[0]!.freshConnection).toBe(false);
+      expect(stalledCalls[0]!.alternateIpv4).toBe(false);
+      expect(stalledCalls[0]!.signal?.aborted).toBe(true);
+      expect(stalledCalls[1]!.freshConnection).toBe(true);
+      expect(stalledCalls[1]!.alternateIpv4).toBe(true);
+
+      // 2) Legitimately slow primary still wins after hedge fires, and hedge is aborted cleanly
+      const slowRes = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_SLOWOK001"));
+      expect(slowRes.status).toBe(200);
+      expect(await slowRes.text()).toBe("<feed>primary-ok</feed>");
+      const slowCalls = calls.filter((c) => c.id === "UULF_SLOWOK001");
+      expect(slowCalls.length).toBe(2);
+      expect(slowCalls[1]!.signal?.aborted).toBe(true);
+
+      // 3) Fast 503 retries on freshConnection + alternateIpv4 (HTTP 5xx did not rotate sticky IPv4)
+      const fast503Res = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_FAST50301"));
+      expect(fast503Res.status).toBe(200);
+      expect(await fast503Res.text()).toBe("<feed>retried-ok</feed>");
+      const fast503Calls = calls.filter((c) => c.id === "UULF_FAST50301");
+      expect(fast503Calls.length).toBe(2);
+      expect(fast503Calls[1]!.freshConnection).toBe(true);
+      expect(fast503Calls[1]!.alternateIpv4).toBe(true);
+
+      // 4) Fast socket error retries on freshConnection with alternateIpv4: false (ipv4Fetch already rotated A -> B)
+      const sockErrRes = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_SOCKETERR"));
+      expect(sockErrRes.status).toBe(200);
+      expect(await sockErrRes.text()).toBe("<feed>socket-retried-ok</feed>");
+      const sockErrCalls = calls.filter((c) => c.id === "UULF_SOCKETERR");
+      expect(sockErrCalls.length).toBe(2);
+      expect(sockErrCalls[1]!.freshConnection).toBe(true);
+      expect(sockErrCalls[1]!.alternateIpv4).toBe(false);
+
+      // 5) Both hedged attempts failing with 503 preserves the error body and leaks zero semaphore slots
+      const both503Res = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_BOTH50301"));
+      expect(both503Res.status).toBe(503);
+      expect(await both503Res.text()).toBe("maintenance window");
+      expect(calls.filter((c) => c.id === "UULF_BOTH50301").length).toBe(2);
+      const followUpRes = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_FOLLOWUP1"));
+      expect(followUpRes.status).toBe(200);
+
+      // 6) Competing 429 or 404 from a hedge must not cancel a primary returning 200 or poison negative cache
+      const race429Res = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_RACE42901"));
+      expect(race429Res.status).toBe(200);
+      expect(await race429Res.text()).toBe("<feed>primary-beat-429</feed>");
+
+      const race404Res = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_RACE40401"));
+      expect(race404Res.status).toBe(200);
+      expect(await race404Res.text()).toBe("<feed>primary-beat-404</feed>");
+      const race404Cached = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_RACE40401"));
+      expect(race404Cached.status).toBe(200);
+      expect(calls.filter((c) => c.id === "UULF_RACE40401").length).toBe(2);
+
+      // 7) Client abort before hedge delay cancels primary and never fires hedge
+      const abortCtrl = new AbortController();
+      const abortReq = app.fetch(
+        new Request("http://127.0.0.1:8787/feed/playlist/UULF_ABORT0001", { signal: abortCtrl.signal }),
+      );
+      await new Promise((r) => setTimeout(r, 10));
+      abortCtrl.abort();
+      expect((await abortReq).status).toBe(499);
+      await new Promise((r) => setTimeout(r, 50));
+      const abortCalls = calls.filter((c) => c.id === "UULF_ABORT0001");
+      expect(abortCalls.length).toBe(1);
+      expect(abortCalls[0]!.signal?.aborted).toBe(true);
+
+      expect(peakActiveUpstream).toBeLessThanOrEqual(2);
+      app.stop();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("RSS hedging respects maxConcurrentUpstream cap, rotates sticky IPv4 after 3 hedge wins, and records winning attempt latency", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-rss-cap-"));
+    try {
+      // Part A: maxConcurrentUpstream = 1 never runs 2 simultaneous requests; retries sequentially after timeout
+      {
+        let active = 0;
+        let peak = 0;
+        let attempt = 0;
+        const cap1Cfg = makeTestConfig(tmpDir, false);
+        cap1Cfg.rss.maxConcurrentUpstream = 1;
+        const app = createApp(cap1Cfg, {
+          logger: noopLogger,
+          fetchFn: async (_input, init) => {
+            attempt++;
+            active++;
+            peak = Math.max(peak, active);
+            try {
+              if (attempt === 1) {
+                await new Promise<void>((_, reject) => {
+                  init?.signal?.addEventListener(
+                    "abort",
+                    () => reject(init.signal?.reason ?? new DOMException("Aborted", "AbortError")),
+                    { once: true },
+                  );
+                });
+              }
+              return new Response("<feed>seq-retry-ok</feed>", { status: 200 });
+            } finally {
+              active--;
+            }
+          },
+          fetchRawFn: async () => new Response("", { status: 404 }),
+          innertube: makeMockInnertube(),
+          ytDlp: {
+            async isBgutilAvailable() { return false; },
+            async extractVideoInfo() { throw new Error("unused"); },
+            async downloadFormat() { throw new Error("unused"); },
+          },
+          mediaProxyOptions: {
+            feedHedgeDelayMs: 20,
+            feedAttemptTimeoutMs: 70,
+            feedRetryBackoffMs: 10,
+            persistFeedFamilies: false,
+          },
+        });
+
+        const res = await app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_CAP1ONLY1"));
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("<feed>seq-retry-ok</feed>");
+        expect(peak).toBe(1);
+        expect(attempt).toBe(2);
+        app.stop();
+      }
+
+      // Part B: Saturated pool (8 slow feeds on 4 slots) never exceeds cap or launches hedges while all slots are busy
+      {
+        let active = 0;
+        let peak = 0;
+        let totalCalls = 0;
+        const releaseBatch1: Array<() => void> = [];
+        const releaseBatch2: Array<() => void> = [];
+        const cap4Cfg = makeTestConfig(tmpDir, false);
+        cap4Cfg.rss.maxConcurrentUpstream = 4;
+        const app = createApp(cap4Cfg, {
+          logger: noopLogger,
+          fetchFn: async () => {
+            const callNum = ++totalCalls;
+            active++;
+            peak = Math.max(peak, active);
+            try {
+              await new Promise<void>((resolve) => {
+                if (callNum <= 4) releaseBatch1.push(resolve);
+                else releaseBatch2.push(resolve);
+              });
+              return new Response("<feed>slow-batch</feed>", { status: 200 });
+            } finally {
+              active--;
+            }
+          },
+          fetchRawFn: async () => new Response("", { status: 404 }),
+          innertube: makeMockInnertube(),
+          ytDlp: {
+            async isBgutilAvailable() { return false; },
+            async extractVideoInfo() { throw new Error("unused"); },
+            async downloadFormat() { throw new Error("unused"); },
+          },
+          mediaProxyOptions: {
+            feedHedgeDelayMs: 25,
+            feedAttemptTimeoutMs: 5_000,
+            feedRetryBackoffMs: 10,
+            persistFeedFamilies: false,
+          },
+        });
+
+        const pending = Array.from({ length: 8 }, (_, i) =>
+          app.fetch(new Request(`http://127.0.0.1:8787/feed/playlist/UULF_SATURAT0${i}`)),
+        );
+        // Wait past feedHedgeDelayMs while batch 1 occupies all 4 slots and batch 2 is queued
+        await new Promise((r) => setTimeout(r, 50));
+        expect(totalCalls).toBe(4);
+        expect(peak).toBe(4);
+        for (const release of releaseBatch1) release();
+
+        // Wait past feedHedgeDelayMs while batch 2 occupies all 4 slots (queue now empty, still no spare capacity)
+        await new Promise((r) => setTimeout(r, 50));
+        expect(totalCalls).toBe(8);
+        expect(peak).toBe(4);
+        for (const release of releaseBatch2) release();
+
+        const responses = await Promise.all(pending);
+        expect(responses.every((r) => r.status === 200)).toBe(true);
+        expect(peak).toBeLessThanOrEqual(4);
+        expect(totalCalls).toBe(8);
+        app.stop();
+      }
+
+      // Part B2: When saturated at hedge delay, a stalled feed launches its hedge as soon as a slot frees up
+      {
+        let active = 0;
+        let peak = 0;
+        const counts = new Map<string, number>();
+        const cap2Cfg = makeTestConfig(tmpDir, false);
+        cap2Cfg.rss.maxConcurrentUpstream = 2;
+        const app = createApp(cap2Cfg, {
+          logger: noopLogger,
+          fetchFn: async (input, init) => {
+            const id = new URL(input.toString()).searchParams.get("playlist_id")!;
+            const n = (counts.get(id) ?? 0) + 1;
+            counts.set(id, n);
+            active++;
+            peak = Math.max(peak, active);
+            try {
+              if (id === "UULF_WAITSPARE") {
+                if (n === 1) {
+                  await new Promise<void>((_, reject) => {
+                    init?.signal?.addEventListener(
+                      "abort",
+                      () => reject(init.signal?.reason ?? new DOMException("Aborted", "AbortError")),
+                      { once: true },
+                    );
+                  });
+                }
+                return new Response("<feed>spare-hedge-ok</feed>", { status: 200 });
+              }
+              await new Promise((r) => setTimeout(r, 60));
+              return new Response("<feed>blocker-ok</feed>", { status: 200 });
+            } finally {
+              active--;
+            }
+          },
+          fetchRawFn: async () => new Response("", { status: 404 }),
+          innertube: makeMockInnertube(),
+          ytDlp: {
+            async isBgutilAvailable() { return false; },
+            async extractVideoInfo() { throw new Error("unused"); },
+            async downloadFormat() { throw new Error("unused"); },
+          },
+          mediaProxyOptions: {
+            feedHedgeDelayMs: 25,
+            feedAttemptTimeoutMs: 5_000,
+            feedRetryBackoffMs: 10,
+            persistFeedFamilies: false,
+          },
+        });
+
+        const t0 = Date.now();
+        const [stalledRes, blockerRes] = await Promise.all([
+          app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_WAITSPARE")),
+          app.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULF_BLOCKER01")),
+        ]);
+        expect(stalledRes.status).toBe(200);
+        expect(await stalledRes.text()).toBe("<feed>spare-hedge-ok</feed>");
+        expect(blockerRes.status).toBe(200);
+        expect(Date.now() - t0).toBeLessThan(1500);
+        expect(peak).toBeLessThanOrEqual(2);
+        expect(counts.get("UULF_WAITSPARE")).toBe(2);
+        app.stop();
+      }
+
+      // Part C: 3 consecutive hedge wins abort the 3rd hung primary with TimeoutError (rotates sticky IPv4)
+      // and record winning attempt latency (not the hedge wait) in rss-families.json
+      {
+        const primaryAbortNames: string[] = [];
+        const counts = new Map<string, number>();
+        const rotDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-rss-rot-"));
+        try {
+          const cfg = makeTestConfig(rotDir, false);
+          cfg.rss.maxConcurrentUpstream = 4;
+          const app = createApp(cfg, {
+            logger: noopLogger,
+            fetchFn: async (input, init) => {
+              const id = new URL(input.toString()).searchParams.get("playlist_id")!;
+              const n = (counts.get(id) ?? 0) + 1;
+              counts.set(id, n);
+              if (n === 1) {
+                await new Promise<void>((_, reject) => {
+                  init?.signal?.addEventListener(
+                    "abort",
+                    () => {
+                      const reason = init.signal?.reason;
+                      primaryAbortNames.push(reason instanceof Error ? reason.name : "unknown");
+                      reject(reason ?? new DOMException("Aborted", "AbortError"));
+                    },
+                    { once: true },
+                  );
+                });
+              }
+              return new Response("<feed>fast-hedge</feed>", { status: 200 });
+            },
+            fetchRawFn: async () => new Response("", { status: 404 }),
+            innertube: makeMockInnertube(),
+            ytDlp: {
+              async isBgutilAvailable() { return false; },
+              async extractVideoInfo() { throw new Error("unused"); },
+              async downloadFormat() { throw new Error("unused"); },
+            },
+            mediaProxyOptions: {
+              feedHedgeDelayMs: 30,
+              feedAttemptTimeoutMs: 5_000,
+              feedRetryBackoffMs: 10,
+              persistFeedFamilies: true,
+            },
+          });
+
+          for (const id of ["UULF_HEDGEWIN1", "UULF_HEDGEWIN2", "UULF_HEDGEWIN3"]) {
+            const res = await app.fetch(new Request(`http://127.0.0.1:8787/feed/playlist/${id}`));
+            expect(res.status).toBe(200);
+          }
+          expect(primaryAbortNames).toEqual(["AbortError", "AbortError", "TimeoutError"]);
+          app.stop();
+
+          const persisted = JSON.parse(
+            fs.readFileSync(path.join(rotDir, "rss-families.json"), "utf8"),
+          ) as { families: Record<string, Array<{ id: string; slowMs?: number }>> };
+          for (const entry of persisted.families["UULF"] ?? []) {
+            expect(entry.slowMs ?? 0).toBeLessThan(25);
+          }
+        } finally {
+          fs.rmSync(rotDir, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("RSS feed families persistence coordinates with cache lock, merges on write, and writes mode 0600", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-rss-lock-"));
+    try {
+      const makeApp = () =>
+        createApp(makeTestConfig(tmpDir, false), {
+          logger: noopLogger,
+          fetchFn: async () => new Response("<feed/>", { status: 200 }),
+          fetchRawFn: async () => new Response("", { status: 404 }),
+          innertube: makeMockInnertube(),
+          ytDlp: {
+            async isBgutilAvailable() { return false; },
+            async extractVideoInfo() { throw new Error("unused"); },
+            async downloadFormat() { throw new Error("unused"); },
+          },
+        });
+
+      const primary = makeApp();
+      const standby = makeApp();
+      expect(primary.ephemeralStore.hasExclusiveLock()).toBe(true);
+      expect(standby.ephemeralStore.hasExclusiveLock()).toBe(false);
+
+      expect((await primary.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULFprimary001"))).status).toBe(200);
+      expect((await standby.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULFstandby001"))).status).toBe(200);
+
+      // Primary stops and writes rss-families.json with 0600 permissions.
+      primary.stop();
+      const familiesPath = path.join(tmpDir, "rss-families.json");
+      expect(fs.existsSync(familiesPath)).toBe(true);
+      expect(fs.statSync(familiesPath).mode & 0o777).toBe(0o600);
+
+      // Standby without lock must NOT overwrite primary's saved feed history on shutdown.
+      standby.stop();
+      const afterStandby = JSON.parse(fs.readFileSync(familiesPath, "utf8")) as {
+        families: Record<string, Array<{ id: string }>>;
+      };
+      expect((afterStandby.families["UULF"] ?? []).map((e) => e.id)).toEqual(["UULFprimary001"]);
+
+      // A new owner merges with existing disk entries rather than dropping prior history.
+      const nextOwner = makeApp();
+      expect(nextOwner.ephemeralStore.hasExclusiveLock()).toBe(true);
+      // Simulate an entry added to disk before nextOwner flushes (e.g. takeover reconciliation).
+      const onDisk = JSON.parse(fs.readFileSync(familiesPath, "utf8")) as {
+        version: 1;
+        families: Record<string, Array<{ id: string; requestedAt: number; slowMs?: number }>>;
+      };
+      onDisk.families["UULF"]!.push({ id: "UULFdiskmerge1", requestedAt: Date.now(), slowMs: 2100 });
+      fs.writeFileSync(familiesPath, JSON.stringify(onDisk), { mode: 0o600 });
+
+      expect((await nextOwner.fetch(new Request("http://127.0.0.1:8787/feed/playlist/UULFnextown001"))).status).toBe(200);
+      nextOwner.stop();
+
+      const merged = JSON.parse(fs.readFileSync(familiesPath, "utf8")) as {
+        families: Record<string, Array<{ id: string; slowMs?: number }>>;
+      };
+      const mergedIds = (merged.families["UULF"] ?? []).map((e) => e.id);
+      expect(mergedIds).toContain("UULFprimary001");
+      expect(mergedIds).toContain("UULFdiskmerge1");
+      expect(mergedIds).toContain("UULFnextown001");
+      expect(merged.families["UULF"]?.find((e) => e.id === "UULFdiskmerge1")?.slowMs).toBe(2100);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("RSS prefetch prioritizes known-slow feeds first and persists feed families across restarts", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-rss-persist-"));
+    let now = Date.now();
+    try {
+      const ids = [
+        "UULFaaaaaaaaaa",
+        "UULFbbbbbbbbbb",
+        "UULFcccccccccc",
+        "UULFdddddddddd",
+        "UULFslowfeed99",
+      ];
+      const upstream: string[] = [];
+      let simulateSlow = true;
+
+      const makeMockFetch = () => async (input: string | URL | Request) => {
+        const id = new URL(input.toString()).searchParams.get("playlist_id")!;
+        upstream.push(id);
+        if (simulateSlow && id === "UULFslowfeed99") {
+          // Advance fake clock inside fetch so the feed records a 3.2 s upstream duration immediately.
+          now += 3200;
+          setSystemTime(new Date(now));
+        } else {
+          now += 20;
+          setSystemTime(new Date(now));
+        }
+        return new Response("<feed/>", { status: 200 });
+      };
+
+      const makeApp = () => {
+        const cfg = makeTestConfig(tmpDir, false);
+        cfg.rss.maxConcurrentUpstream = 4; // maxPromotedSlow = 1
+        return createApp(cfg, {
+          logger: noopLogger,
+          fetchFn: makeMockFetch(),
+          fetchRawFn: makeMockFetch(),
+          innertube: makeMockInnertube(),
+          ytDlp: {
+            async isBgutilAvailable() { return false; },
+            async extractVideoInfo() { throw new Error("unused"); },
+            async downloadFormat() { throw new Error("unused"); },
+          },
+        });
+      };
+
+      // First run: learn all 5 feeds (with UULFslowfeed99 last and slow), then stop to persist to cacheDir.
+      setSystemTime(new Date(now));
+      const app1 = makeApp();
+      for (const id of ids) {
+        expect((await app1.fetch(new Request(`http://127.0.0.1:8787/feed/playlist/${id}`))).status).toBe(200);
+      }
+      expect(upstream).toEqual(ids);
+      app1.stop();
+      expect(fs.existsSync(path.join(tmpDir, "rss-families.json"))).toBe(true);
+
+      // Second run (simulated daemon restart): EphemeralStore ignores rss-families.json,
+      // and the VERY FIRST refresh immediately prefetches UULFslowfeed99 FIRST, followed by b, c, d in order!
+      simulateSlow = false;
+      upstream.length = 0;
+      now += 10 * 60_000;
+      setSystemTime(new Date(now));
+      const app2 = makeApp();
+      expect(app2.ephemeralStore.getStats().fileCount).toBe(0);
+
+      expect((await app2.fetch(new Request(`http://127.0.0.1:8787/feed/playlist/${ids[0]}`))).status).toBe(200);
+      // Wait briefly for prefetch workers to dispatch all remembered feeds
+      for (let i = 0; i < 20 && upstream.length < ids.length; i++) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      expect(upstream).toEqual([
+        "UULFaaaaaaaaaa", // Triggering request started first
+        "UULFslowfeed99", // Known-slow feed promoted to front of prefetch queue
+        "UULFbbbbbbbbbb",
+        "UULFcccccccccc",
+        "UULFdddddddddd",
+      ]);
+
+      app2.stop();
+    } finally {
+      setSystemTime();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   test("silently escalates Tier 1 -> Tier 2 on immediate bot-check and serves DASH + Range 206", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fast-tube-tier2-"));
     try {

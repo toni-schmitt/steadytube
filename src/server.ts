@@ -6,7 +6,7 @@ import { createYtDlpRunner, type YtDlpRunner } from "./media/ytdlp.ts";
 import { VideoResolver } from "./media/video-resolver.ts";
 import { ipv4Fetch, ipv4FetchRaw, type FetchLike } from "./net/ipv4-fetch.ts";
 import { BrowseRoutes } from "./routes/browse.ts";
-import { MediaProxyRoutes } from "./routes/media-proxy.ts";
+import { MediaProxyRoutes, type MediaProxyOptions } from "./routes/media-proxy.ts";
 import { createRequestHandler } from "./routes/router.ts";
 import { VideoRoutes } from "./routes/video.ts";
 import { VideoPlaybackRoute } from "./routes/videoplayback.ts";
@@ -18,6 +18,7 @@ export interface AppOverrides {
   fetchFn?: FetchLike;
   fetchRawFn?: FetchLike;
   deferCacheScan?: boolean;
+  mediaProxyOptions?: MediaProxyOptions;
 }
 
 export interface RunningApp {
@@ -54,7 +55,16 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
   const ytDlp = overrides.ytDlp ?? createYtDlpRunner(config, logger);
   const resolver = new VideoResolver(config, ytDlp, innertube, ephemeralStore, fetchRawFn, logger);
 
-  const mediaProxy = new MediaProxyRoutes(config, fetchFn, fetchRawFn, logger);
+  const mediaProxy = new MediaProxyRoutes(
+    config,
+    fetchFn,
+    fetchRawFn,
+    logger,
+    {
+      canPersistFeedFamilies: () => ephemeralStore.hasExclusiveLock(),
+      ...overrides.mediaProxyOptions,
+    },
+  );
   const videoRoutes = new VideoRoutes(resolver, fetchFn, logger);
   const playbackRoute = new VideoPlaybackRoute(config, resolver, ephemeralStore, fetchRawFn, logger);
   const browseRoutes = new BrowseRoutes(innertube, logger);
@@ -89,6 +99,7 @@ export function createApp(config: AppConfig, overrides: AppOverrides = {}): Runn
     resolver,
     fetch: handler,
     stop() {
+      mediaProxy.stop();
       resolver.stop();
       if (resolver.hasActiveDiskWork()) {
         // Keep the cache lock held until ALL active disk jobs actually settle,

@@ -134,7 +134,7 @@ If you install the [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgu
 | Purpose | Path (macOS) |
 | --- | --- |
 | Config file (optional) | `~/.config/steadytube/config.json` |
-| Temporary video cache (auto-cleaned) | `~/Library/Caches/steadytube/` |
+| Temporary video cache (auto-cleaned) & remembered RSS feed list (`rss-families.json`) | `~/Library/Caches/steadytube/` |
 | Logs | `~/Library/Logs/steadytube/daemon.log` |
 
 **Check status:**

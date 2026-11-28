@@ -37,6 +37,15 @@ const httpsAgent = new https.Agent({
   keepAliveMsecs: 30_000,
 });
 
+const httpFreshAgent = new http.Agent({ keepAlive: false });
+const httpsFreshAgent = new https.Agent({ keepAlive: false });
+
+function isTimeoutSignal(signal: AbortSignal | null | undefined): boolean {
+  if (!signal?.aborted) return false;
+  const reason = signal.reason;
+  return reason instanceof Error && reason.name === "TimeoutError";
+}
+
 export function clearIpv4DnsCache(): void {
   dnsCache.clear();
   inflightDns.clear();
@@ -88,7 +97,7 @@ function pruneDnsCache(now: number): void {
 
 export async function resolveIpv4(
   hostname: string,
-  options: { publicIpv4Only?: boolean } = {},
+  options: { publicIpv4Only?: boolean; alternate?: boolean } = {},
 ): Promise<string> {
   const cleanHost = hostname.replace(/^\[|\]$/g, "");
   const checkPublic = (ip: string): string => {
@@ -111,8 +120,10 @@ export async function resolveIpv4(
   const now = Date.now();
   const cached = dnsCache.get(cleanHost);
   if (cached && now < cached.expiresAt && cached.ips.length > 0) {
-    // Sticky IPv4 per hostname so keep-alive TLS sockets are reused across bursts (e.g. 200+ RSS feeds)
-    const ip = cached.ips[cached.activeIndex % cached.ips.length]!;
+    // Sticky IPv4 per hostname so keep-alive TLS sockets are reused across bursts (e.g. 200+ RSS feeds);
+    // retries/hedges can request an alternate cached IPv4 when multiple A records exist.
+    const offset = options.alternate && cached.ips.length > 1 ? 1 : 0;
+    const ip = cached.ips[(cached.activeIndex + offset) % cached.ips.length]!;
     return checkPublic(ip);
   }
 
@@ -145,7 +156,8 @@ export async function resolveIpv4(
   }
 
   const validIps = await lookupPromise;
-  return checkPublic(validIps[0]!);
+  const idx = options.alternate && validIps.length > 1 ? 1 : 0;
+  return checkPublic(validIps[idx]!);
 }
 
 async function normalizeBody(body: BodyInit | null | undefined): Promise<Buffer | null> {
@@ -193,6 +205,10 @@ export interface Ipv4FetchOptions extends RequestInit {
   allowedHost?: (hostname: string) => boolean;
   /** Optional hard upper bound on response body bytes (errors stream and destroys socket if exceeded). */
   maxBodyBytes?: number;
+  /** Disable keep-alive socket reuse for this request (useful for retries and hedged attempts). */
+  freshConnection?: boolean;
+  /** Prefer an alternate cached IPv4 address when multiple A records exist. */
+  alternateIpv4?: boolean;
 }
 
 export type FetchLike = (
@@ -228,6 +244,8 @@ async function doSingleIpv4Request(
     httpsOnly: boolean;
     allowedHost?: (hostname: string) => boolean;
     maxBodyBytes?: number;
+    freshConnection?: boolean;
+    alternateIpv4?: boolean;
   },
 ): Promise<{
   status: number;
@@ -258,7 +276,10 @@ async function doSingleIpv4Request(
   let ipv4: string;
   try {
     ipv4 = await Promise.race([
-      resolveIpv4(url.hostname, { publicIpv4Only: options.publicIpv4Only }),
+      resolveIpv4(url.hostname, {
+        publicIpv4Only: options.publicIpv4Only,
+        alternate: options.alternateIpv4,
+      }),
       new Promise<never>((_, reject) => {
         dnsTimer = setTimeout(
           () =>
@@ -297,6 +318,9 @@ async function doSingleIpv4Request(
     let onBodyAbort: (() => void) | null = null;
 
     const onAbort = () => {
+      if (!options.alternateIpv4 && isTimeoutSignal(options.signal)) {
+        rotateIpv4OnError(url.hostname, ipv4);
+      }
       if (onBodyAbort) {
         onBodyAbort();
         return;
@@ -320,7 +344,9 @@ async function doSingleIpv4Request(
       path: `${url.pathname}${url.search}`,
       method,
       headers: reqHeaders,
-      agent: isHttps ? httpsAgent : httpAgent,
+      agent: options.freshConnection
+        ? (isHttps ? httpsFreshAgent : httpFreshAgent)
+        : (isHttps ? httpsAgent : httpAgent),
       ...(isHttps ? { servername: url.hostname } : {}),
     };
 
@@ -336,6 +362,9 @@ async function doSingleIpv4Request(
       const timeoutErr = new Error(
         `IPv4 request timed out after ${options.timeoutMs}ms: ${url.host}${url.pathname}`,
       );
+      if (!options.alternateIpv4) {
+        rotateIpv4OnError(url.hostname, ipv4);
+      }
       req.destroy(timeoutErr);
       if (!settled) {
         settled = true;
@@ -346,7 +375,7 @@ async function doSingleIpv4Request(
     req.on("error", (err) => {
       clearTimeout(headerTimer);
       options.signal?.removeEventListener("abort", onAbort);
-      if (!options.signal?.aborted) {
+      if (!options.alternateIpv4 && (!options.signal?.aborted || isTimeoutSignal(options.signal))) {
         rotateIpv4OnError(url.hostname, ipv4);
       }
       if (!settled) {
@@ -515,7 +544,7 @@ async function doSingleIpv4Request(
             }
           });
 
-          sourceStream.on("error", (err) => {
+          const onStreamError = (err: Error) => {
             cleanup();
             if (sourceStream !== res) sourceStream.destroy();
             res.destroy();
@@ -528,10 +557,18 @@ async function doSingleIpv4Request(
                 // Already closed
               }
             }
-          });
+          };
+
+          sourceStream.on("error", onStreamError);
+          if (sourceStream !== res) {
+            res.on("error", onStreamError);
+          }
 
           res.on("aborted", () => {
             cleanup();
+            if (!options.alternateIpv4 && !options.signal?.aborted) {
+              rotateIpv4OnError(url.hostname, ipv4);
+            }
             if (sourceStream !== res) sourceStream.destroy();
             if (!closed) {
               closed = true;
@@ -550,6 +587,9 @@ async function doSingleIpv4Request(
           res.on("close", () => {
             if (!closed && !res.complete) {
               cleanup();
+              if (!options.alternateIpv4 && !options.signal?.aborted) {
+                rotateIpv4OnError(url.hostname, ipv4);
+              }
               if (sourceStream !== res) sourceStream.destroy();
               closed = true;
               try {
@@ -602,6 +642,8 @@ export async function ipv4Fetch(
   const httpsOnly = init.httpsOnly ?? false;
   const allowedHost = init.allowedHost;
   const maxBodyBytes = init.maxBodyBytes;
+  const freshConnection = init.freshConnection ?? false;
+  const alternateIpv4 = init.alternateIpv4 ?? false;
 
   // Per Fetch spec, explicit `init.headers` replaces `input.headers` rather than merging on top
   // (preventing deleted headers such as stripped `Cookie` from resurfacing via `input.headers`).
@@ -625,6 +667,8 @@ export async function ipv4Fetch(
       httpsOnly,
       allowedHost,
       maxBodyBytes,
+      freshConnection,
+      alternateIpv4,
     });
 
     const isRedirect =

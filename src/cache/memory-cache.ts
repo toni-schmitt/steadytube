@@ -144,6 +144,7 @@ export class TtlLruCache<K, V> {
 export class Semaphore {
   private active = 0;
   private readonly queue: Array<() => void> = [];
+  private readonly spareWaiters = new Set<() => void>();
   private readonly maxQueueSize: number;
 
   constructor(private readonly maxConcurrency: number, maxQueueSize = Infinity) {
@@ -175,6 +176,53 @@ export class Semaphore {
       released = true;
       this.release();
     };
+  }
+
+  /**
+   * Non-blocking permit acquisition that succeeds only when capacity is genuinely
+   * spare (no normal waiters queued), so opportunistic work like hedges never
+   * exceeds maxConcurrency or jumps ahead of queued requests.
+   */
+  tryAcquireSparePermit(): (() => void) | null {
+    if (this.queue.length > 0 || this.active >= this.maxConcurrency) {
+      return null;
+    }
+    this.active++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.release();
+    };
+  }
+
+  /**
+   * Resolves true once spare capacity opens (no queued waiters and active < maxConcurrency),
+   * or false if `signal` aborts first.
+   */
+  waitForSpareCapacity(signal?: AbortSignal): Promise<boolean> {
+    if (this.queue.length === 0 && this.active < this.maxConcurrency) {
+      return Promise.resolve(true);
+    }
+    if (signal?.aborted) {
+      return Promise.resolve(false);
+    }
+    return new Promise<boolean>((resolve) => {
+      const cleanup = () => {
+        this.spareWaiters.delete(onSpare);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const onSpare = () => {
+        cleanup();
+        resolve(true);
+      };
+      const onAbort = () => {
+        cleanup();
+        resolve(false);
+      };
+      this.spareWaiters.add(onSpare);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   private acquire(timeoutMs?: number, signal?: AbortSignal): Promise<void> {
@@ -237,6 +285,14 @@ export class Semaphore {
   private release(): void {
     this.active--;
     const next = this.queue.shift();
-    if (next) next();
+    if (next) {
+      next();
+      return;
+    }
+    if (this.active < this.maxConcurrency && this.spareWaiters.size > 0) {
+      const waiters = [...this.spareWaiters];
+      this.spareWaiters.clear();
+      for (const wake of waiters) wake();
+    }
   }
 }
