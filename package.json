@@ -1,6 +1,6 @@
 {
   "name": "steadytube",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local IPv4 Invidious bridge for stock FreeTube — reliable 4K playback without IP bans or SABR loops",
   "type": "module",
   "private": false,
